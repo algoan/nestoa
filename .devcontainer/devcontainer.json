@@ -1,0 +1,28 @@
+{
+  "name": "Claude Code Sandbox",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "24.15.0"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "1.95.0"
+    }
+  },
+  "remoteUser": "vscode",
+  "mounts": [],
+  "remoteEnv": {},
+  "onCreateCommand": "sudo apt-get update && sudo apt-get install -y python3-full",
+  "postCreateCommand": "bash .devcontainer/setup-claude.sh",
+  "postStartCommand": "bash .devcontainer/setup-claude.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode-remote.remote-containers",
+        "esbenp.prettier-vscode",
+        "mermaidchart.vscode-mermaid-chart",
+        "streetsidesoftware.code-spell-checker"
+      ]
+    }
+  }
+}
