@@ -1,4 +1,4 @@
-# Nestjs OpenAPI generator
+# Nestoa - Nestjs OpenAPI generator
 
 Deterministic, static OpenAPI generation for NestJS / TypeScript codebases —
 designed to be wired into a CI/CD pipeline the same way prettier and oxlint
