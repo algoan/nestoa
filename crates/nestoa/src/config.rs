@@ -26,6 +26,12 @@ pub struct Config {
     #[serde(default)]
     pub base_path: Option<String>,
 
+    /// Auto-detect `app.setGlobalPrefix(...)` from the bootstrap file (e.g.
+    /// `src/main.ts`) and use it as the base path when `basePath` is not set.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub detect_global_prefix: bool,
+
     /// OpenAPI document metadata.
     #[serde(default)]
     pub info: Info,
@@ -99,6 +105,10 @@ fn default_version() -> String {
     "0.0.0".into()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -107,6 +117,7 @@ impl Default for Config {
             output: default_output(),
             format: None,
             base_path: None,
+            detect_global_prefix: true,
             info: Info {
                 title: default_title(),
                 version: default_version(),

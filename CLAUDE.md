@@ -36,8 +36,9 @@ NESTOA_BINARY=$PWD/target/debug/nestoa node npm/nestoa/bin/nestoa.js . -o /tmp/o
 
 The pipeline is a straight line orchestrated in `crates/nestoa/src/main.rs`; each stage is one module:
 
-1. **`config.rs`** — loads `nestoa.config.{json,yaml,yml}` from the project root (or `--config`). Defines `include`/`exclude` globs, `output`, `basePath`, `info`, and crucially `decoratorAliases`.
+1. **`config.rs`** — loads `nestoa.config.{json,yaml,yml}` from the project root (or `--config`). Defines `include`/`exclude` globs, `output`, `basePath`, `detectGlobalPrefix`, `info`, and crucially `decoratorAliases`.
 2. **`discover.rs`** — walks `include` paths (walkdir + globset + ignore) collecting `.ts` files.
+   - **`globalprefix.rs`** — recovers the NestJS global prefix from the bootstrap file's `app.setGlobalPrefix(...)` call (string literal, local string `const`, or `node-config-ts` member resolved against `config/default.json`). Fills `basePath` when it is unset and `detectGlobalPrefix` is on; an explicit `basePath` always wins.
 3. **`parse.rs`** — swc-backed parser. `ParsingContext` owns the shared `source_map`; source text and file start positions are captured alongside the AST because JSDoc lookups need byte offsets into the original source.
 4. **`symbols.rs`** — `Project` builds a cross-file symbol table of every exported class/interface/type-alias/enum, resolving `import`, `export *`, and barrel files so types can be looked up across modules.
 5. **`routes.rs`** — `Extractor` finds `@Controller` classes, walks members for HTTP-verb decorators (`@Get`/`@Post`/…/`@All`, `@HttpCode`), maps each parameter to its OpenAPI location (`@Param`/`@Query`/`@Body`/`@Headers` + config aliases), and `to_openapi()` assembles the final document.

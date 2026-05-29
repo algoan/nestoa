@@ -1,5 +1,6 @@
 mod config;
 mod discover;
+mod globalprefix;
 mod jsdoc;
 mod parse;
 mod routes;
@@ -87,6 +88,16 @@ fn main() -> Result<()> {
             file_starts.insert(file.clone(), fm.start_pos);
         }
         project.add(parsed);
+    }
+
+    // Recover the NestJS global prefix from the bootstrap file (e.g.
+    // `app.setGlobalPrefix(...)` in main.ts) unless the user pinned `basePath`
+    // explicitly or opted out.
+    if cfg.base_path.is_none() && cfg.detect_global_prefix {
+        if let Some(prefix) = globalprefix::detect_global_prefix(&project, &project_root) {
+            eprintln!("nestoa: detected global prefix \"{}\" from bootstrap", prefix);
+            cfg.base_path = Some(prefix);
+        }
     }
 
     let mut components = ComponentSchemas::default();

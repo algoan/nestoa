@@ -36,6 +36,16 @@ Optional `nestoa.config.json` (or `.yaml` / `.yml`) at the project root:
 without modifying its source — the right-hand side picks one of the known
 handlers (`body`, `query`, `param`, `header`, `user`, `ignore`).
 
+### Global prefix
+
+When `basePath` is not set, nestoa recovers the NestJS global prefix from the
+bootstrap file by reading the `app.setGlobalPrefix(...)` call. The argument is
+resolved when it is a string literal, a local `const` bound to a string, or a
+[`node-config-ts`](https://www.npmjs.com/package/node-config-ts) member access
+(e.g. `config.globalPrefix`, looked up in `config/default.json`). An explicit
+`basePath` always wins, and the detection can be turned off with
+`"detectGlobalPrefix": false`.
+
 ## How it works
 
 1. **Parse** every `.ts` file in the `include` paths with the swc parser.
