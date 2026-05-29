@@ -1,0 +1,5 @@
+/target
+**/node_modules
+npm/nestoa/bin/nestoa
+npm/nestoa/bin/nestoa.exe
+npm/platforms
