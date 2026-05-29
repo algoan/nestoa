@@ -36,6 +36,25 @@ pub struct Config {
     #[serde(default)]
     pub info: Info,
 
+    /// Resolve TypeScript `compilerOptions.paths` aliases (e.g. workspace
+    /// packages like `@algoan/core` that map to in-repo `libs/*/src`). Reads the
+    /// project's `tsconfig.json`, following `extends`. Defaults to true.
+    #[serde(default = "default_true")]
+    pub resolve_tsconfig_paths: bool,
+
+    /// Explicit tsconfig file to read `paths` from (relative to the project root
+    /// or absolute). Defaults to `tsconfig.json` in the project root.
+    #[serde(default)]
+    pub tsconfig: Option<PathBuf>,
+
+    /// node_modules package names (glob patterns) whose TypeScript declarations
+    /// should be parsed so their exported types resolve to real schemas instead
+    /// of `x-unresolved`. For example `["@algoan/*"]` pulls in the typings of
+    /// every `@algoan` package referenced by a route. Empty by default, so no
+    /// third-party packages are inlined unless explicitly opted in.
+    #[serde(default)]
+    pub resolve_packages: Vec<String>,
+
     /// Extra decorator-name aliases mapped to known handlers. Lets users wire in
     /// custom decorators without modifying the tool. For example, mapping a
     /// project-specific `@MyAuthUser` to the `user` parameter kind tells the
@@ -118,6 +137,9 @@ impl Default for Config {
             format: None,
             base_path: None,
             detect_global_prefix: true,
+            resolve_tsconfig_paths: true,
+            tsconfig: None,
+            resolve_packages: Vec::new(),
             info: Info {
                 title: default_title(),
                 version: default_version(),

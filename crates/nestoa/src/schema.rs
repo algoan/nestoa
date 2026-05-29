@@ -167,6 +167,18 @@ impl<'a> SchemaCtx<'a> {
                     }
                 }
             }
+            // Namespace-qualified type, e.g. `Enums.AccountType` where `Enums`
+            // is a TS namespace (`import * as Enums` / `export * as Enums`).
+            if let Some((decl_file, sym)) =
+                self.project.resolve_namespace_member(file, &parent, &member)
+            {
+                let schema_name = sanitize_name(&member);
+                if self.components.mark_seen(&schema_name) {
+                    let resolved = self.symbol_to_schema(&decl_file, &sym);
+                    self.components.insert(&schema_name, resolved);
+                }
+                return json!({ "$ref": format!("#/components/schemas/{}", schema_name) });
+            }
             // Unknown — fall through and return placeholder.
             return json!({ "x-unresolved": format!("{}.{}", parent, member) });
         }
@@ -433,6 +445,19 @@ impl<'a> SchemaCtx<'a> {
             Symbol::Class(c) => {
                 let mut props: IndexMap<String, Value> = IndexMap::new();
                 let mut required: Vec<String> = Vec::new();
+                // A `class X extends Y` carries Y's members too. Mirror the
+                // interface-`extends` handling: emit Y as an allOf branch.
+                let mut all_of: Vec<Value> = Vec::new();
+                if let Some(super_expr) = &c.class.super_class {
+                    if let Expr::Ident(id) = &**super_expr {
+                        let dummy_ref = TsTypeRef {
+                            span: c.class.span,
+                            type_name: TsEntityName::Ident(id.clone()),
+                            type_params: c.class.super_type_params.clone(),
+                        };
+                        all_of.push(self.type_ref_schema(file, &dummy_ref));
+                    }
+                }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
                         let name = match &p.key {
@@ -482,7 +507,13 @@ impl<'a> SchemaCtx<'a> {
                         attach_doc_to_map(&mut obj, &doc);
                     }
                 }
-                Value::Object(obj)
+                let object_schema = Value::Object(obj);
+                if all_of.is_empty() {
+                    object_schema
+                } else {
+                    all_of.push(object_schema);
+                    json!({ "allOf": all_of })
+                }
             }
         }
     }
@@ -579,6 +610,64 @@ fn callee_name(e: &Expr) -> String {
 fn attach_doc(schema: &mut Value, doc: &JsDoc) {
     if let Value::Object(m) = schema {
         attach_doc_to_map(m, doc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::ParsingContext;
+    use std::collections::HashMap;
+
+    fn project_from(files: &[(&str, &str)]) -> (Project, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nestoa-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let parser = ParsingContext::default();
+        let mut project = Project::default();
+        for (rel, body) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            project.add(parser.parse_file(&path).unwrap());
+        }
+        (project, dir)
+    }
+
+    #[test]
+    fn class_extends_emits_allof_with_base_ref() {
+        let (project, dir) = project_from(&[
+            ("base.ts", "export class Base { a?: string; }"),
+            (
+                "derived.ts",
+                "import { Base } from './base';\nexport class Derived extends Base { b?: number; }",
+            ),
+        ]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+        };
+        let derived_file = dir.join("derived.ts");
+        let (decl_file, sym) = project.resolve(&derived_file, "Derived").expect("resolve Derived");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        let all_of = schema.get("allOf").and_then(|v| v.as_array()).expect("allOf");
+        assert_eq!(
+            all_of[0].get("$ref").and_then(|v| v.as_str()),
+            Some("#/components/schemas/Base")
+        );
+        let own = all_of.last().unwrap();
+        assert!(own
+            .get("properties")
+            .and_then(|p| p.get("b"))
+            .is_some());
+        // The base class is collected into components for the $ref to point at.
+        assert!(ctx.components.schemas.contains_key("Base"));
     }
 }
 

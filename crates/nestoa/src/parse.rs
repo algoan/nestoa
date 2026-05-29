@@ -31,11 +31,12 @@ impl ParsingContext {
             .load_file(path)
             .with_context(|| format!("loading {}", path.display()))?;
         let _ = FileName::Real(path.to_path_buf());
+        let is_dts = path.to_string_lossy().ends_with(".d.ts");
         let lexer = Lexer::new(
             Syntax::Typescript(TsSyntax {
                 tsx: path.extension().and_then(|s| s.to_str()) == Some("tsx"),
                 decorators: true,
-                dts: false,
+                dts: is_dts,
                 no_early_errors: true,
                 disallow_ambiguous_jsx_like: false,
             }),

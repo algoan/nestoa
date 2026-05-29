@@ -94,6 +94,10 @@ pub struct RequestBody {
 pub struct Extractor<'a> {
     pub config: &'a Config,
     pub project: &'a Project,
+    /// The originally-discovered source files. Controllers are only looked for
+    /// here, so package declarations pulled into the symbol table for type
+    /// resolution cannot introduce phantom routes.
+    pub entry_files: &'a [PathBuf],
     pub sources: &'a HashMap<PathBuf, String>,
     pub file_starts: &'a HashMap<PathBuf, BytePos>,
     pub components: &'a mut ComponentSchemas,
@@ -102,8 +106,11 @@ pub struct Extractor<'a> {
 impl<'a> Extractor<'a> {
     pub fn extract_all(&mut self) -> Vec<Route> {
         let mut routes = Vec::new();
-        let files: Vec<PathBuf> = self.project.files.keys().cloned().collect();
+        let files: Vec<PathBuf> = self.entry_files.to_vec();
         for file in &files {
+            if !self.project.files.contains_key(file) {
+                continue;
+            }
             let parsed = &self.project.files[file];
             for item in &parsed.module.body {
                 let class_decl = match item {
