@@ -127,9 +127,9 @@ impl<'a> Extractor<'a> {
                     _ => None,
                 };
                 if let Some(cd) = class_decl {
-                    if let Some(base_path) = controller_base_path(&cd.class) {
+                    if let Some(base_paths) = controller_base_paths(&cd.class) {
                         let class_tag = strip_suffix_ci(&cd.ident.sym, "Controller").to_string();
-                        self.extract_class(file, &cd.class, &base_path, &class_tag, &mut routes);
+                        self.extract_class(file, &cd.class, &base_paths, &class_tag, &mut routes);
                     }
                 }
             }
@@ -141,7 +141,7 @@ impl<'a> Extractor<'a> {
         &mut self,
         file: &Path,
         class: &Class,
-        base_path: &str,
+        base_paths: &[String],
         tag: &str,
         out: &mut Vec<Route>,
     ) {
@@ -154,14 +154,14 @@ impl<'a> Extractor<'a> {
                 continue;
             }
             // Find HTTP verb decorator.
-            let mut http: Option<(HttpMethod, Option<String>)> = None;
+            let mut http: Option<(HttpMethod, Vec<String>)> = None;
             let mut deprecated = false;
             let mut http_code: Option<u16> = None;
             for d in &m.function.decorators {
                 let name = decorator_name(d);
                 if let Some(method) = HttpMethod::from_decorator(&name) {
-                    let path = path_arg(d);
-                    http = Some((method, path));
+                    let paths = path_args(d);
+                    http = Some((method, paths));
                     continue;
                 }
                 if name == "HttpCode" {
@@ -170,12 +170,25 @@ impl<'a> Extractor<'a> {
                     }
                 }
             }
-            let Some((method, sub_path)) = http else {
+            let Some((method, sub_paths)) = http else {
                 continue;
             };
             let mut interceptor_names = class_interceptors.clone();
             interceptor_names.extend(collect_interceptors(&m.function.decorators));
-            let full_path = join_paths(self.config.base_path.as_deref(), base_path, sub_path.as_deref());
+            // A controller and/or a route may declare multiple paths; the
+            // effective routes are the cross product. A route with no path
+            // argument contributes a single `None` sub-path.
+            let sub_opts: Vec<Option<&str>> = if sub_paths.is_empty() {
+                vec![None]
+            } else {
+                sub_paths.iter().map(|s| Some(s.as_str())).collect()
+            };
+            let mut full_paths: Vec<String> = Vec::with_capacity(base_paths.len() * sub_opts.len());
+            for base in base_paths {
+                for sub in &sub_opts {
+                    full_paths.push(join_paths(self.config.base_path.as_deref(), base, *sub));
+                }
+            }
 
             // JSDoc on the method
             let mut method_doc = JsDoc::default();
@@ -251,9 +264,9 @@ impl<'a> Extractor<'a> {
                 _ => 200,
             });
 
-            out.push(Route {
+            let template = Route {
                 method,
-                path: full_path,
+                path: String::new(),
                 summary: method_doc.summary.clone(),
                 description: method_doc.description.clone(),
                 deprecated,
@@ -262,7 +275,21 @@ impl<'a> Extractor<'a> {
                 response: response_value,
                 status_code,
                 tags: vec![tag.to_string()],
-            });
+            };
+            let last = full_paths.len() - 1;
+            for (i, full_path) in full_paths.into_iter().enumerate() {
+                if i == last {
+                    out.push(Route {
+                        path: full_path,
+                        ..template
+                    });
+                    break;
+                }
+                out.push(Route {
+                    path: full_path,
+                    ..template.clone()
+                });
+            }
         }
     }
 
@@ -399,46 +426,71 @@ fn collect_interceptors(decorators: &[swc_ecma_ast::Decorator]) -> Vec<String> {
     names
 }
 
-fn controller_base_path(class: &Class) -> Option<String> {
+/// Returns the controller's base path(s), or `None` if the class is not a
+/// `@Controller`. A bare `@Controller()` yields a single empty path. NestJS
+/// allows an array of paths (`@Controller(['a', 'b'])`), each of which becomes
+/// a distinct mount point.
+fn controller_base_paths(class: &Class) -> Option<Vec<String>> {
     for d in &class.decorators {
         if decorator_name(d) == "Controller" {
-            return Some(path_arg(d).unwrap_or_default());
+            let paths = path_args(d);
+            return Some(if paths.is_empty() {
+                vec![String::new()]
+            } else {
+                paths
+            });
         }
     }
     None
 }
 
-fn path_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
+/// Extracts the path(s) from a decorator's first argument. Handles a string
+/// literal, an array of string literals (NestJS multi-path form), and the
+/// `@Controller({ path: ... })` object form (where `path` may itself be a
+/// string or an array). Non-literal entries are skipped.
+fn path_args(d: &swc_ecma_ast::Decorator) -> Vec<String> {
     let call = match &*d.expr {
         Expr::Call(c) => c,
-        _ => return None,
+        _ => return Vec::new(),
     };
-    let first = call.args.first()?;
-    match first {
-        ExprOrSpread { expr, .. } => match expr.as_ref() {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-            Expr::Object(o) => {
-                // Support `@Controller({ path: 'foo' })`
-                for prop in &o.props {
-                    if let swc_ecma_ast::PropOrSpread::Prop(p) = prop {
-                        if let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref() {
-                            let k = match &kv.key {
-                                PropName::Ident(i) => i.sym.to_string(),
-                                PropName::Str(s) => s.value.to_string_lossy().into_owned(),
-                                _ => continue,
-                            };
-                            if k == "path" {
-                                if let Expr::Lit(Lit::Str(s)) = kv.value.as_ref() {
-                                    return Some(s.value.to_string_lossy().into_owned());
-                                }
-                            }
+    match call.args.first() {
+        Some(ExprOrSpread { expr, .. }) => expr_to_paths(expr.as_ref()),
+        None => Vec::new(),
+    }
+}
+
+fn expr_to_paths(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => vec![s.value.to_string_lossy().into_owned()],
+        Expr::Array(arr) => arr
+            .elems
+            .iter()
+            .flatten()
+            .filter(|el| el.spread.is_none())
+            .filter_map(|el| match el.expr.as_ref() {
+                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect(),
+        Expr::Object(o) => {
+            // Support `@Controller({ path: 'foo' })` (path may be an array too).
+            for prop in &o.props {
+                if let swc_ecma_ast::PropOrSpread::Prop(p) = prop {
+                    if let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref() {
+                        let k = match &kv.key {
+                            PropName::Ident(i) => i.sym.to_string(),
+                            PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+                            _ => continue,
+                        };
+                        if k == "path" {
+                            return expr_to_paths(kv.value.as_ref());
                         }
                     }
                 }
-                None
             }
-            _ => None,
-        },
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -651,6 +703,85 @@ mod tests {
     fn strips_controller_suffix() {
         assert_eq!(strip_suffix_ci("AccountController", "Controller"), "Account");
         assert_eq!(strip_suffix_ci("Account", "Controller"), "Account");
+    }
+
+    /// Build a `Project` from one in-memory controller file and extract routes.
+    fn extract_paths(name: &str, body: &str) -> Vec<(HttpMethod, String)> {
+        use crate::config::Config;
+        use crate::parse::ParsingContext;
+        use crate::schema::ComponentSchemas;
+
+        let dir = std::env::temp_dir().join(format!("nestoa-routes-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let path = dir.join("ctrl.ts");
+        std::fs::write(&path, body).unwrap();
+
+        let parser = ParsingContext::default();
+        let mut project = Project::default();
+        project.add(parser.parse_file(&path).unwrap());
+
+        let config = Config::default();
+        let entry = vec![path];
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let routes = {
+            let mut ex = Extractor {
+                config: &config,
+                project: &project,
+                entry_files: &entry,
+                sources: &sources,
+                file_starts: &file_starts,
+                components: &mut components,
+            };
+            ex.extract_all()
+        };
+        routes.into_iter().map(|r| (r.method, r.path)).collect()
+    }
+
+    #[test]
+    fn expands_multi_path_controller_and_route_cross_product() {
+        let routes = extract_paths(
+            "multi",
+            r#"
+            @Controller([
+                'organizations/:organizationId/service-accounts',
+                'organizations/:organizationId/projects/:projectId/service-accounts',
+            ])
+            export class ServiceAccountsController {
+                @Get([':analysisId/incomes', ':analysisId/expenses'])
+                findAll() {}
+            }
+            "#,
+        );
+        let paths: Vec<String> = routes.iter().map(|(_, p)| p.clone()).collect();
+        assert_eq!(paths.len(), 4, "2 base paths x 2 sub paths");
+        assert!(paths.contains(
+            &"/organizations/{organizationId}/service-accounts/{analysisId}/incomes".to_string()
+        ));
+        assert!(paths.contains(
+            &"/organizations/{organizationId}/service-accounts/{analysisId}/expenses".to_string()
+        ));
+        assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/incomes".to_string()));
+        assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/expenses".to_string()));
+    }
+
+    #[test]
+    fn single_path_controller_still_yields_one_route() {
+        let routes = extract_paths(
+            "single",
+            r#"
+            @Controller('users')
+            export class UsersController {
+                @Get(':id')
+                findOne() {}
+            }
+            "#,
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].1, "/users/{id}");
     }
 }
 
