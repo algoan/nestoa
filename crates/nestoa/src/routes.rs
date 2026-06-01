@@ -860,11 +860,8 @@ mod tests {
         assert_eq!(path_keys, vec!["/accounts", "/users"]);
 
         // Methods within a path are alphabetical (get before post).
-        let method_keys: Vec<&String> = doc["paths"]["/users"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect();
+        let method_keys: Vec<&String> =
+            doc["paths"]["/users"].as_object().unwrap().keys().collect();
         assert_eq!(method_keys, vec!["get", "post"]);
 
         // Component schemas are alphabetical.
