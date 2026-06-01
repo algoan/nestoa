@@ -37,10 +37,6 @@ jobs:
   lint:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
-    # Non-blocking for now: the codebase is not yet fmt/clippy clean. Surface
-    # the findings without failing CI. Remove `continue-on-error` once the tree
-    # is clean to turn these into hard gates.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

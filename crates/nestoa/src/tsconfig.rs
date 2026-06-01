@@ -9,6 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+/// `(pattern, targets)` pairs straight from `compilerOptions.paths`.
+type PathEntries = Vec<(String, Vec<String>)>;
+
 /// A resolved set of path aliases plus the base directory their targets are
 /// relative to.
 #[derive(Debug, Default)]
@@ -16,7 +19,7 @@ pub struct TsPaths {
     /// Absolute directory that `paths` targets are resolved against.
     base_url: PathBuf,
     /// `(pattern, targets)` pairs straight from `compilerOptions.paths`.
-    entries: Vec<(String, Vec<String>)>,
+    entries: PathEntries,
 }
 
 impl TsPaths {
@@ -116,7 +119,7 @@ pub fn load_tsconfig_paths(project_root: &Path, explicit: Option<&Path>) -> Opti
 fn collect(
     path: &Path,
     visited: &mut std::collections::HashSet<PathBuf>,
-) -> Option<(PathBuf, Vec<(String, Vec<String>)>)> {
+) -> Option<(PathBuf, PathEntries)> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(path.clone()) {
         return None;
@@ -126,30 +129,30 @@ fn collect(
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let co = json.get("compilerOptions");
 
-    if let Some(paths) = co.and_then(|c| c.get("paths")).and_then(|p| p.as_object()) {
-        if !paths.is_empty() {
-            let base_rel = co
-                .and_then(|c| c.get("baseUrl"))
-                .and_then(|b| b.as_str())
-                .unwrap_or(".");
-            let base_url = dir.join(base_rel);
-            let base_url = base_url.canonicalize().unwrap_or(base_url);
-            let entries = paths
-                .iter()
-                .map(|(k, v)| {
-                    let targets = v
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|t| t.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (k.clone(), targets)
-                })
-                .collect();
-            return Some((base_url, entries));
-        }
+    if let Some(paths) = co.and_then(|c| c.get("paths")).and_then(|p| p.as_object())
+        && !paths.is_empty()
+    {
+        let base_rel = co
+            .and_then(|c| c.get("baseUrl"))
+            .and_then(|b| b.as_str())
+            .unwrap_or(".");
+        let base_url = dir.join(base_rel);
+        let base_url = base_url.canonicalize().unwrap_or(base_url);
+        let entries = paths
+            .iter()
+            .map(|(k, v)| {
+                let targets = v
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (k.clone(), targets)
+            })
+            .collect();
+        return Some((base_url, entries));
     }
 
     // No `paths` here — follow `extends`.

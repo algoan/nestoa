@@ -127,10 +127,8 @@ impl<'a> SchemaCtx<'a> {
                 } else {
                     json!({ "oneOf": non_null })
                 };
-                if nullable {
-                    if let Value::Object(map) = &mut schema {
-                        map.insert("nullable".into(), Value::Bool(true));
-                    }
+                if nullable && let Value::Object(map) = &mut schema {
+                    map.insert("nullable".into(), Value::Bool(true));
                 }
                 schema
             }
@@ -207,104 +205,99 @@ impl<'a> SchemaCtx<'a> {
         // the file that type came from. The env is cleared for the recursion
         // because bound types come from the concrete side and never reference
         // the interceptor's own parameters (avoids param->param loops).
-        if r.type_params.is_none() {
-            if let Some(env) = self.type_env {
-                if let Some(binding) = env.get(&name) {
-                    let origin = binding.origin_file.clone();
-                    let ty = binding.ty.clone();
-                    let saved = self.type_env.take();
-                    let schema = self.ts_type_to_schema(&origin, &ty);
-                    self.type_env = saved;
-                    return schema;
-                }
-            }
+        if r.type_params.is_none()
+            && let Some(env) = self.type_env
+            && let Some(binding) = env.get(&name)
+        {
+            let origin = binding.origin_file.clone();
+            let ty = binding.ty.clone();
+            let saved = self.type_env.take();
+            let schema = self.ts_type_to_schema(&origin, &ty);
+            self.type_env = saved;
+            return schema;
         }
         // Built-in generic handling
         match name.as_str() {
             "Promise" | "Observable" => {
-                if let Some(args) = &r.type_params {
-                    if let Some(first) = args.params.first() {
-                        return self.ts_type_to_schema(file, first);
-                    }
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    return self.ts_type_to_schema(file, first);
                 }
                 return json!({});
             }
             "Array" | "ReadonlyArray" => {
-                if let Some(args) = &r.type_params {
-                    if let Some(first) = args.params.first() {
-                        return json!({ "type": "array", "items": self.ts_type_to_schema(file, first) });
-                    }
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    return json!({ "type": "array", "items": self.ts_type_to_schema(file, first) });
                 }
                 return json!({ "type": "array" });
             }
             "Partial" | "Required" | "Readonly" | "NonNullable" => {
-                if let Some(args) = &r.type_params {
-                    if let Some(first) = args.params.first() {
-                        return self.ts_type_to_schema(file, first);
-                    }
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    return self.ts_type_to_schema(file, first);
                 }
             }
             "Omit" | "Pick" => {
-                if let Some(args) = &r.type_params {
-                    if let Some(first) = args.params.first() {
-                        let mut base = self.ts_type_to_schema(file, first);
-                        // If base ended up as a $ref, inline a clone of the referenced
-                        // schema so we can mutate its property set.
-                        if let Some(refname) = base
-                            .get("$ref")
-                            .and_then(|v| v.as_str())
-                            .and_then(|r| r.strip_prefix("#/components/schemas/"))
-                            .map(|s| s.to_string())
-                        {
-                            if let Some(inlined) = self.components.schemas.get(&refname).cloned() {
-                                base = inlined;
-                            }
-                        }
-                        if name == "Omit" {
-                            if let (Some(second), Value::Object(obj)) =
-                                (args.params.get(1), &mut base)
-                            {
-                                let to_remove = collect_string_keys(second);
-                                if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                                    for k in &to_remove {
-                                        props.remove(k);
-                                    }
-                                }
-                                if let Some(Value::Array(req)) = obj.get_mut("required") {
-                                    req.retain(|v| match v.as_str() {
-                                        Some(s) => !to_remove.iter().any(|k| k == s),
-                                        None => true,
-                                    });
-                                }
-                            }
-                        } else if name == "Pick" {
-                            if let (Some(second), Value::Object(obj)) =
-                                (args.params.get(1), &mut base)
-                            {
-                                let keep = collect_string_keys(second);
-                                if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                                    props.retain(|k, _| keep.iter().any(|x| x == k));
-                                }
-                                if let Some(Value::Array(req)) = obj.get_mut("required") {
-                                    req.retain(|v| match v.as_str() {
-                                        Some(s) => keep.iter().any(|k| k == s),
-                                        None => true,
-                                    });
-                                }
-                            }
-                        }
-                        return base;
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    let mut base = self.ts_type_to_schema(file, first);
+                    // If base ended up as a $ref, inline a clone of the referenced
+                    // schema so we can mutate its property set.
+                    if let Some(refname) = base
+                        .get("$ref")
+                        .and_then(|v| v.as_str())
+                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                        .map(|s| s.to_string())
+                        && let Some(inlined) = self.components.schemas.get(&refname).cloned()
+                    {
+                        base = inlined;
                     }
+                    if name == "Omit" {
+                        if let (Some(second), Value::Object(obj)) = (args.params.get(1), &mut base)
+                        {
+                            let to_remove = collect_string_keys(second);
+                            if let Some(Value::Object(props)) = obj.get_mut("properties") {
+                                for k in &to_remove {
+                                    props.remove(k);
+                                }
+                            }
+                            if let Some(Value::Array(req)) = obj.get_mut("required") {
+                                req.retain(|v| match v.as_str() {
+                                    Some(s) => !to_remove.iter().any(|k| k == s),
+                                    None => true,
+                                });
+                            }
+                        }
+                    } else if name == "Pick"
+                        && let (Some(second), Value::Object(obj)) = (args.params.get(1), &mut base)
+                    {
+                        let keep = collect_string_keys(second);
+                        if let Some(Value::Object(props)) = obj.get_mut("properties") {
+                            props.retain(|k, _| keep.iter().any(|x| x == k));
+                        }
+                        if let Some(Value::Array(req)) = obj.get_mut("required") {
+                            req.retain(|v| match v.as_str() {
+                                Some(s) => keep.iter().any(|k| k == s),
+                                None => true,
+                            });
+                        }
+                    }
+                    return base;
                 }
             }
             "Record" => {
-                if let Some(args) = &r.type_params {
-                    if let Some(value_t) = args.params.get(1) {
-                        return json!({
-                            "type": "object",
-                            "additionalProperties": self.ts_type_to_schema(file, value_t),
-                        });
-                    }
+                if let Some(args) = &r.type_params
+                    && let Some(value_t) = args.params.get(1)
+                {
+                    return json!({
+                        "type": "object",
+                        "additionalProperties": self.ts_type_to_schema(file, value_t),
+                    });
                 }
                 return json!({ "type": "object" });
             }
@@ -394,10 +387,9 @@ impl<'a> SchemaCtx<'a> {
                             .unwrap_or_else(|| json!({}));
                         if let (Some(src), Some(file_start)) =
                             (self.sources.get(file), self.file_starts.get(file))
+                            && let Some(doc) = jsdoc_before(src, *file_start, p.span)
                         {
-                            if let Some(doc) = jsdoc_before(src, *file_start, p.span) {
-                                attach_doc(&mut schema, &doc);
-                            }
+                            attach_doc(&mut schema, &doc);
                         }
                         props.insert(name.clone(), schema);
                         if !p.optional {
@@ -419,10 +411,9 @@ impl<'a> SchemaCtx<'a> {
                 }
                 if let (Some(src), Some(file_start)) =
                     (self.sources.get(file), self.file_starts.get(file))
+                    && let Some(doc) = jsdoc_before(src, *file_start, i.span)
                 {
-                    if let Some(doc) = jsdoc_before(src, *file_start, i.span) {
-                        attach_doc_to_map(&mut object, &doc);
-                    }
+                    attach_doc_to_map(&mut object, &doc);
                 }
                 let object_schema = Value::Object(object);
                 if all_of.is_empty() {
@@ -475,10 +466,9 @@ impl<'a> SchemaCtx<'a> {
                 obj.insert("enum".into(), Value::Array(values));
                 if let (Some(src), Some(file_start)) =
                     (self.sources.get(file), self.file_starts.get(file))
+                    && let Some(doc) = jsdoc_before(src, *file_start, e.span)
                 {
-                    if let Some(doc) = jsdoc_before(src, *file_start, e.span) {
-                        attach_doc_to_map(&mut obj, &doc);
-                    }
+                    attach_doc_to_map(&mut obj, &doc);
                 }
                 Value::Object(obj)
             }
@@ -488,15 +478,15 @@ impl<'a> SchemaCtx<'a> {
                 // A `class X extends Y` carries Y's members too. Mirror the
                 // interface-`extends` handling: emit Y as an allOf branch.
                 let mut all_of: Vec<Value> = Vec::new();
-                if let Some(super_expr) = &c.class.super_class {
-                    if let Expr::Ident(id) = &**super_expr {
-                        let dummy_ref = TsTypeRef {
-                            span: c.class.span,
-                            type_name: TsEntityName::Ident(id.clone()),
-                            type_params: c.class.super_type_params.clone(),
-                        };
-                        all_of.push(self.type_ref_schema(file, &dummy_ref));
-                    }
+                if let Some(super_expr) = &c.class.super_class
+                    && let Expr::Ident(id) = &**super_expr
+                {
+                    let dummy_ref = TsTypeRef {
+                        span: c.class.span,
+                        type_name: TsEntityName::Ident(id.clone()),
+                        type_params: c.class.super_type_params.clone(),
+                    };
+                    all_of.push(self.type_ref_schema(file, &dummy_ref));
                 }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
@@ -514,10 +504,9 @@ impl<'a> SchemaCtx<'a> {
                             .unwrap_or_else(|| json!({}));
                         if let (Some(src), Some(file_start)) =
                             (self.sources.get(file), self.file_starts.get(file))
+                            && let Some(doc) = jsdoc_before(src, *file_start, p.span)
                         {
-                            if let Some(doc) = jsdoc_before(src, *file_start, p.span) {
-                                attach_doc(&mut schema, &doc);
-                            }
+                            attach_doc(&mut schema, &doc);
                         }
                         // class-validator `@IsOptional()` decorator implies optional.
                         let has_is_optional = p
@@ -544,10 +533,9 @@ impl<'a> SchemaCtx<'a> {
                 }
                 if let (Some(src), Some(file_start)) =
                     (self.sources.get(file), self.file_starts.get(file))
+                    && let Some(doc) = jsdoc_before(src, *file_start, c.class.span)
                 {
-                    if let Some(doc) = jsdoc_before(src, *file_start, c.class.span) {
-                        attach_doc_to_map(&mut obj, &doc);
-                    }
+                    attach_doc_to_map(&mut obj, &doc);
                 }
                 let object_schema = Value::Object(obj);
                 if all_of.is_empty() {
@@ -659,6 +647,26 @@ fn attach_doc(schema: &mut Value, doc: &JsDoc) {
     }
 }
 
+fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
+    let combined = match (&doc.summary, &doc.description) {
+        (Some(s), Some(d)) => Some(format!("{s}\n\n{d}")),
+        (Some(s), None) => Some(s.clone()),
+        (None, Some(d)) => Some(d.clone()),
+        (None, None) => None,
+    };
+    if let Some(c) = combined
+        && !m.contains_key("description")
+    {
+        m.insert("description".into(), Value::String(c));
+    }
+    if doc.deprecated {
+        m.insert("deprecated".into(), Value::Bool(true));
+    }
+    if let Some(ex) = &doc.example {
+        m.insert("example".into(), Value::String(ex.clone()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,25 +725,5 @@ mod tests {
         assert!(own.get("properties").and_then(|p| p.get("b")).is_some());
         // The base class is collected into components for the $ref to point at.
         assert!(ctx.components.schemas.contains_key("Base"));
-    }
-}
-
-fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
-    let combined = match (&doc.summary, &doc.description) {
-        (Some(s), Some(d)) => Some(format!("{s}\n\n{d}")),
-        (Some(s), None) => Some(s.clone()),
-        (None, Some(d)) => Some(d.clone()),
-        (None, None) => None,
-    };
-    if let Some(c) = combined {
-        if !m.contains_key("description") {
-            m.insert("description".into(), Value::String(c));
-        }
-    }
-    if doc.deprecated {
-        m.insert("deprecated".into(), Value::Bool(true));
-    }
-    if let Some(ex) = &doc.example {
-        m.insert("example".into(), Value::String(ex.clone()));
     }
 }

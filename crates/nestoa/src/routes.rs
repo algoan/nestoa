@@ -128,11 +128,11 @@ impl<'a> Extractor<'a> {
                     )) => Some(c),
                     _ => None,
                 };
-                if let Some(cd) = class_decl {
-                    if let Some(base_paths) = controller_base_paths(&cd.class) {
-                        let class_tag = strip_suffix_ci(&cd.ident.sym, "Controller").to_string();
-                        self.extract_class(file, &cd.class, &base_paths, &class_tag, &mut routes);
-                    }
+                if let Some(cd) = class_decl
+                    && let Some(base_paths) = controller_base_paths(&cd.class)
+                {
+                    let class_tag = strip_suffix_ci(&cd.ident.sym, "Controller").to_string();
+                    self.extract_class(file, &cd.class, &base_paths, &class_tag, &mut routes);
                 }
             }
         }
@@ -168,10 +168,10 @@ impl<'a> Extractor<'a> {
                     http = Some((method, paths));
                     continue;
                 }
-                if name == "HttpCode" {
-                    if let Some(p) = numeric_arg(d) {
-                        http_code = Some(p);
-                    }
+                if name == "HttpCode"
+                    && let Some(p) = numeric_arg(d)
+                {
+                    http_code = Some(p);
                 }
             }
             let Some((method, sub_paths)) = http else {
@@ -196,10 +196,10 @@ impl<'a> Extractor<'a> {
 
             // JSDoc on the method
             let mut method_doc = JsDoc::default();
-            if let (Some(src), Some(start)) = (self.sources.get(file), self.file_starts.get(file)) {
-                if let Some(doc) = jsdoc_before(src, *start, m.span) {
-                    method_doc = doc;
-                }
+            if let (Some(src), Some(start)) = (self.sources.get(file), self.file_starts.get(file))
+                && let Some(doc) = jsdoc_before(src, *start, m.span)
+            {
+                method_doc = doc;
             }
             if method_doc.deprecated {
                 deprecated = true;
@@ -340,7 +340,6 @@ impl<'a> Extractor<'a> {
             .as_ref()
             .map(|t| ctx.ts_type_to_schema(file, t))
             .unwrap_or_else(|| json!({}));
-        drop(ctx);
         let description = method_doc.params.get(&pat_info.name).cloned();
         match location {
             DecoratorKind::Body => Some(ParsedParam::Body(RequestBody {
@@ -475,16 +474,16 @@ fn expr_to_paths(expr: &Expr) -> Vec<String> {
         Expr::Object(o) => {
             // Support `@Controller({ path: 'foo' })` (path may be an array too).
             for prop in &o.props {
-                if let swc_ecma_ast::PropOrSpread::Prop(p) = prop {
-                    if let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref() {
-                        let k = match &kv.key {
-                            PropName::Ident(i) => i.sym.to_string(),
-                            PropName::Str(s) => s.value.to_string_lossy().into_owned(),
-                            _ => continue,
-                        };
-                        if k == "path" {
-                            return expr_to_paths(kv.value.as_ref());
-                        }
+                if let swc_ecma_ast::PropOrSpread::Prop(p) = prop
+                    && let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref()
+                {
+                    let k = match &kv.key {
+                        PropName::Ident(i) => i.sym.to_string(),
+                        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+                        _ => continue,
+                    };
+                    if k == "path" {
+                        return expr_to_paths(kv.value.as_ref());
                     }
                 }
             }
@@ -679,6 +678,29 @@ pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchema
     Value::Object(root)
 }
 
+fn default_status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        500 => "Internal Server Error",
+        _ => "Response",
+    }
+}
+
+// Avoid dead-code warning on TsTypeRef helper used elsewhere.
+#[allow(dead_code)]
+fn _silence_unused(_: &TsEntityName, _: &TsTypeRef) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,26 +808,3 @@ mod tests {
         assert_eq!(routes[0].1, "/users/{id}");
     }
 }
-
-fn default_status_text(code: u16) -> &'static str {
-    match code {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        409 => "Conflict",
-        422 => "Unprocessable Entity",
-        500 => "Internal Server Error",
-        _ => "Response",
-    }
-}
-
-// Avoid dead-code warning on TsTypeRef helper used elsewhere.
-#[allow(dead_code)]
-fn _silence_unused(_: &TsEntityName, _: &TsTypeRef) {}

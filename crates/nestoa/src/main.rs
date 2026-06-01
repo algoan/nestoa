@@ -203,14 +203,15 @@ fn main() -> Result<()> {
     // Recover the NestJS global prefix from the bootstrap file (e.g.
     // `app.setGlobalPrefix(...)` in main.ts) unless the user pinned `basePath`
     // explicitly or opted out.
-    if cfg.base_path.is_none() && cfg.detect_global_prefix {
-        if let Some(prefix) = globalprefix::detect_global_prefix(&project, &project_root) {
-            eprintln!(
-                "nestoa: detected global prefix \"{}\" from bootstrap",
-                prefix
-            );
-            cfg.base_path = Some(prefix);
-        }
+    if cfg.base_path.is_none()
+        && cfg.detect_global_prefix
+        && let Some(prefix) = globalprefix::detect_global_prefix(&project, &project_root)
+    {
+        eprintln!(
+            "nestoa: detected global prefix \"{}\" from bootstrap",
+            prefix
+        );
+        cfg.base_path = Some(prefix);
     }
 
     let mut components = ComponentSchemas::default();
@@ -239,10 +240,10 @@ fn main() -> Result<()> {
     } else {
         cfg.output.clone()
     };
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).ok();
-        }
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).ok();
     }
 
     let body = match cfg.output_format() {

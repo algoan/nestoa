@@ -60,12 +60,12 @@ pub fn request_body_transform(
     body: &mut RequestBody,
 ) {
     for name in interceptor_names {
-        if let Some(cfg) = config.interceptors.get(name) {
-            if let Some(RequestBodyTransform::SingleOrArray) = cfg.request_body {
-                let single = body.schema.clone();
-                let array = json!({ "type": "array", "items": single.clone() });
-                body.schema = json!({ "oneOf": [single, array] });
-            }
+        if let Some(cfg) = config.interceptors.get(name)
+            && let Some(RequestBodyTransform::SingleOrArray) = cfg.request_body
+        {
+            let single = body.schema.clone();
+            let array = json!({ "type": "array", "items": single.clone() });
+            body.schema = json!({ "oneOf": [single, array] });
         }
     }
 }
@@ -182,12 +182,11 @@ pub fn rewrite_response(
 /// single component. Falls back to the normal lowering for everything else
 /// (arrays, type literals, built-ins such as `Omit`, unions, …).
 fn lower_inline(ctx: &mut SchemaCtx, file: &Path, ty: &TsType) -> Value {
-    if let TsType::TsTypeRef(r) = ty {
-        if let Some(name) = ref_ident(&r.type_name) {
-            if let Some((decl_file, sym)) = ctx.project.resolve(file, &name) {
-                return ctx.symbol_to_schema(&decl_file, &sym);
-            }
-        }
+    if let TsType::TsTypeRef(r) = ty
+        && let Some(name) = ref_ident(&r.type_name)
+        && let Some((decl_file, sym)) = ctx.project.resolve(file, &name)
+    {
+        return ctx.symbol_to_schema(&decl_file, &sym);
     }
     ctx.ts_type_to_schema(file, ty)
 }
@@ -195,13 +194,13 @@ fn lower_inline(ctx: &mut SchemaCtx, file: &Path, ty: &TsType) -> Value {
 /// The `(In, Out)` type arguments of a class's `implements NestInterceptor<In, Out>`.
 fn nest_interceptor_args(class: &Class) -> Option<(TsType, TsType)> {
     for imp in &class.implements {
-        if let Expr::Ident(id) = &*imp.expr {
-            if &*id.sym == "NestInterceptor" {
-                let args = imp.type_args.as_ref()?;
-                let in_ty = args.params.first()?;
-                let out_ty = args.params.get(1)?;
-                return Some(((**in_ty).clone(), (**out_ty).clone()));
-            }
+        if let Expr::Ident(id) = &*imp.expr
+            && &*id.sym == "NestInterceptor"
+        {
+            let args = imp.type_args.as_ref()?;
+            let in_ty = args.params.first()?;
+            let out_ty = args.params.get(1)?;
+            return Some(((**in_ty).clone(), (**out_ty).clone()));
         }
     }
     None
@@ -220,16 +219,13 @@ fn type_param_names(class: &Class) -> HashSet<String> {
 
 /// Peel `Promise<...>` / `Observable<...>` wrappers off a handler return type.
 fn unwrap_async(ty: &TsType) -> &TsType {
-    if let TsType::TsTypeRef(r) = ty {
-        if let Some(name) = ref_ident(&r.type_name) {
-            if name == "Promise" || name == "Observable" {
-                if let Some(args) = &r.type_params {
-                    if let Some(first) = args.params.first() {
-                        return unwrap_async(first);
-                    }
-                }
-            }
-        }
+    if let TsType::TsTypeRef(r) = ty
+        && let Some(name) = ref_ident(&r.type_name)
+        && (name == "Promise" || name == "Observable")
+        && let Some(args) = &r.type_params
+        && let Some(first) = args.params.first()
+    {
+        return unwrap_async(first);
     }
     ty
 }

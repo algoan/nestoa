@@ -135,20 +135,20 @@ impl Project {
         if let Some(sym) = fs.declared.get(name) {
             return Some((file.to_path_buf(), sym.clone()));
         }
-        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name)) {
-            if let Some(target) = self.resolve_module(file, &binding.specifier) {
-                let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
-                if let Some(found) = self.resolve_inner(&target, &next_name, visited) {
-                    return Some(found);
-                }
+        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
+            && let Some(target) = self.resolve_module(file, &binding.specifier)
+        {
+            let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
+            if let Some(found) = self.resolve_inner(&target, &next_name, visited) {
+                return Some(found);
             }
         }
         // `export * from './other'` — search each one.
         for spec in &fs.star_re_exports {
-            if let Some(target) = self.resolve_module(file, spec) {
-                if let Some(found) = self.resolve_inner(&target, name, visited) {
-                    return Some(found);
-                }
+            if let Some(target) = self.resolve_module(file, spec)
+                && let Some(found) = self.resolve_inner(&target, name, visited)
+            {
+                return Some(found);
             }
         }
         None
@@ -164,17 +164,17 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
                 ModuleDecl::Import(i) => collect_import(i, &mut fs),
                 ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_decl(decl, &mut fs),
                 ModuleDecl::ExportDefaultDecl(ExportDefaultDecl { decl, .. }) => {
-                    if let DefaultDecl::Class(cd) = decl {
-                        if let Some(ident) = &cd.ident {
-                            fs.declared.insert(
-                                ident.sym.to_string(),
-                                Symbol::Class(Arc::new(ClassDecl {
-                                    ident: ident.clone(),
-                                    declare: false,
-                                    class: cd.class.clone(),
-                                })),
-                            );
-                        }
+                    if let DefaultDecl::Class(cd) = decl
+                        && let Some(ident) = &cd.ident
+                    {
+                        fs.declared.insert(
+                            ident.sym.to_string(),
+                            Symbol::Class(Arc::new(ClassDecl {
+                                ident: ident.clone(),
+                                declare: false,
+                                class: cd.class.clone(),
+                            })),
+                        );
                     }
                 }
                 ModuleDecl::ExportAll(ea) => {
@@ -398,10 +398,10 @@ fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String>
     } else {
         format!("./{}", subpath)
     };
-    if let Some(v) = exports.get(&key) {
-        if let Some(found) = dts_from_exports_value(v) {
-            return Some(found);
-        }
+    if let Some(v) = exports.get(&key)
+        && let Some(found) = dts_from_exports_value(v)
+    {
+        return Some(found);
     }
     // Wildcard match: `./foo/*` with a `*` in the target path.
     if let serde_json::Value::Object(map) = exports {
@@ -411,10 +411,9 @@ fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String>
                 if let Some(rest) = subpath
                     .strip_prefix(prefix)
                     .and_then(|r| r.strip_prefix('/'))
+                    && let Some(tmpl) = dts_from_exports_value(v)
                 {
-                    if let Some(tmpl) = dts_from_exports_value(v) {
-                        return Some(tmpl.replace('*', rest));
-                    }
+                    return Some(tmpl.replace('*', rest));
                 }
             }
         }
@@ -425,10 +424,10 @@ fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String>
 /// Resolve a subpath via the legacy `typesVersions` map.
 fn types_from_versions(json: &serde_json::Value, subpath: &str) -> Option<String> {
     let star = json.get("typesVersions")?.get("*")?;
-    if let Some(arr) = star.get(subpath).and_then(|v| v.as_array()) {
-        if let Some(first) = arr.first().and_then(|v| v.as_str()) {
-            return Some(first.to_string());
-        }
+    if let Some(arr) = star.get(subpath).and_then(|v| v.as_array())
+        && let Some(first) = arr.first().and_then(|v| v.as_str())
+    {
+        return Some(first.to_string());
     }
     None
 }
@@ -458,15 +457,12 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
         types_from_exports(&json, &subpath)
             .or_else(|| types_from_versions(&json, &subpath))
             .or_else(|| {
-                for cand in [
+                [
                     format!("{}.d.ts", subpath),
                     format!("{}/index.d.ts", subpath),
-                ] {
-                    if pkg_dir.join(&cand).is_file() {
-                        return Some(cand);
-                    }
-                }
-                None
+                ]
+                .into_iter()
+                .find(|cand| pkg_dir.join(cand).is_file())
             })?
     };
 

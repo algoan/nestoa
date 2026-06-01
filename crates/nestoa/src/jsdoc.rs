@@ -29,7 +29,7 @@ impl JsDoc {
             let line = line.trim_end();
             if let Some(rest) = line.strip_prefix('@') {
                 if let Some((tag_name, tag_body)) = current_tag.take() {
-                    doc.consume_tag(&tag_name, &tag_body.join("\n").trim());
+                    doc.consume_tag(&tag_name, tag_body.join("\n").trim());
                 }
                 let mut parts = rest.splitn(2, char::is_whitespace);
                 let name = parts.next().unwrap_or("").to_string();
@@ -84,24 +84,6 @@ impl JsDoc {
             _ => {}
         }
         self.tags.push((name.to_string(), body.to_string()));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_summary_and_param() {
-        let raw = "\n * Do the thing\n *\n * @param id the identifier\n * @deprecated use other instead\n ";
-        let doc = JsDoc::parse(raw);
-        assert_eq!(doc.summary.as_deref(), Some("Do the thing"));
-        assert!(doc.deprecated);
-        assert_eq!(doc.deprecated_reason.as_deref(), Some("use other instead"));
-        assert_eq!(
-            doc.params.get("id").map(|s| s.as_str()),
-            Some("the identifier")
-        );
     }
 }
 
@@ -201,4 +183,22 @@ pub fn jsdoc_before(source: &str, file_start: BytePos, span: Span) -> Option<JsD
         return None;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_summary_and_param() {
+        let raw = "\n * Do the thing\n *\n * @param id the identifier\n * @deprecated use other instead\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.summary.as_deref(), Some("Do the thing"));
+        assert!(doc.deprecated);
+        assert_eq!(doc.deprecated_reason.as_deref(), Some("use other instead"));
+        assert_eq!(
+            doc.params.get("id").map(|s| s.as_str()),
+            Some("the identifier")
+        );
+    }
 }

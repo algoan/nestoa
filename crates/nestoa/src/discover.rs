@@ -46,10 +46,10 @@ fn push_if_ts(path: &Path, root: &Path, exclude: &globset::GlobSet, out: &mut Ve
     if ext != "ts" && ext != "tsx" {
         return;
     }
-    if let Ok(rel) = path.strip_prefix(root) {
-        if exclude.is_match(rel) {
-            return;
-        }
+    if let Ok(rel) = path.strip_prefix(root)
+        && exclude.is_match(rel)
+    {
+        return;
     }
     if exclude.is_match(path) {
         return;

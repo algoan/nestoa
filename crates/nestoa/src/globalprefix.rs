@@ -49,20 +49,16 @@ struct PrefixCallFinder {
 
 impl Visit for PrefixCallFinder {
     fn visit_call_expr(&mut self, call: &swc_ecma_ast::CallExpr) {
-        if self.arg.is_none() {
-            if let Callee::Expr(callee) = &call.callee {
-                if let Expr::Member(MemberExpr {
-                    prop: MemberProp::Ident(p),
-                    ..
-                }) = callee.as_ref()
-                {
-                    if p.sym.to_string() == "setGlobalPrefix" {
-                        if let Some(first) = call.args.first() {
-                            self.arg = Some((*first.expr).clone());
-                        }
-                    }
-                }
-            }
+        if self.arg.is_none()
+            && let Callee::Expr(callee) = &call.callee
+            && let Expr::Member(MemberExpr {
+                prop: MemberProp::Ident(p),
+                ..
+            }) = callee.as_ref()
+            && p.sym == "setGlobalPrefix"
+            && let Some(first) = call.args.first()
+        {
+            self.arg = Some((*first.expr).clone());
         }
         call.visit_children_with(self);
     }
@@ -77,7 +73,7 @@ fn resolve_prefix_expr(
     match expr {
         Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
         Expr::Tpl(_) => static_tpl(expr),
-        Expr::Ident(i) => resolve_local_const(&i.sym.to_string(), parsed),
+        Expr::Ident(i) => resolve_local_const(i.sym.as_ref(), parsed),
         Expr::Member(_) => resolve_config_member(expr, parsed, project, project_root),
         _ => None,
     }
@@ -108,7 +104,7 @@ fn resolve_local_const(name: &str, parsed: &ParsedFile) -> Option<String> {
         };
         for d in &var.decls {
             let Pat::Ident(bi) = &d.name else { continue };
-            if bi.id.sym.to_string() != name {
+            if bi.id.sym != name {
                 continue;
             }
             let Some(init) = &d.init else { continue };
