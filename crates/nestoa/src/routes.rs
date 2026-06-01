@@ -10,7 +10,9 @@ use swc_ecma_ast::{
 };
 
 use crate::config::{Config, DecoratorAlias};
-use crate::interceptors::{interceptor_class_names, request_body_transform, rewrite_response};
+use crate::interceptors::{
+    interceptor_class_names, request_body_transform, response_override, rewrite_response,
+};
 use crate::jsdoc::{jsdoc_before, JsDoc};
 use crate::schema::{decorator_name, ComponentSchemas, SchemaCtx};
 use crate::symbols::Project;
@@ -264,6 +266,9 @@ impl<'a> Extractor<'a> {
                 _ => 200,
             });
 
+            // Per-path response is filled in below: an interceptor may override
+            // it for only some of the route's sibling paths (e.g. a signing
+            // interceptor that rewrites the body solely on the `/jws` variant).
             let template = Route {
                 method,
                 path: String::new(),
@@ -272,21 +277,16 @@ impl<'a> Extractor<'a> {
                 deprecated,
                 parameters: params,
                 request_body,
-                response: response_value,
+                response: None,
                 status_code,
                 tags: vec![tag.to_string()],
             };
-            let last = full_paths.len() - 1;
-            for (i, full_path) in full_paths.into_iter().enumerate() {
-                if i == last {
-                    out.push(Route {
-                        path: full_path,
-                        ..template
-                    });
-                    break;
-                }
+            for full_path in full_paths {
+                let response = response_override(self.config, &interceptor_names, &full_path)
+                    .or_else(|| response_value.clone());
                 out.push(Route {
                     path: full_path,
+                    response,
                     ..template.clone()
                 });
             }

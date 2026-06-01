@@ -66,6 +66,33 @@ pub fn request_body_transform(config: &Config, interceptor_names: &[String], bod
     }
 }
 
+/// A configured response-schema override for the given route path, if any of the
+/// route's interceptors declares one whose `whenPathEndsWith` matches the path
+/// (or has no suffix condition). This covers interceptors whose transform is
+/// runtime control flow the type signature can't express — e.g. a signing
+/// interceptor that only rewrites the body when the URL ends in `/jws`, leaving
+/// the sibling route (same interceptor, different array path) untouched.
+///
+/// Later interceptors in the list win, mirroring `rewrite_response`'s ordering.
+/// Returned schema is cloned from config and inlined verbatim.
+pub fn response_override(config: &Config, interceptor_names: &[String], path: &str) -> Option<Value> {
+    let mut found = None;
+    for name in interceptor_names {
+        let Some(cfg) = config.interceptors.get(name) else {
+            continue;
+        };
+        let Some(ov) = &cfg.response else { continue };
+        let matches = match &ov.when_path_ends_with {
+            Some(suffix) => path.ends_with(suffix.as_str()),
+            None => true,
+        };
+        if matches {
+            found = Some(ov.schema.clone());
+        }
+    }
+    found
+}
+
 /// Compute the response schema after applying the route's interceptors, or
 /// `None` to keep the handler's declared return type unchanged.
 ///
@@ -500,6 +527,7 @@ mod tests {
             crate::config::InterceptorConfig {
                 ignore: true,
                 request_body: None,
+                response: None,
             },
         );
         let (routes, _components) = extract(&config, &project, &[paths[2].clone()]);
@@ -508,6 +536,104 @@ mod tests {
         // Untransformed: the declared DataToPaginate<Project> is emitted as a $ref.
         let refstr = resp.get("$ref").and_then(|v| v.as_str()).unwrap_or("");
         assert_eq!(refstr, "#/components/schemas/DataToPaginate");
+    }
+
+    fn jws_controller() -> String {
+        r#"
+            import { Project } from './project.dto';
+
+            @Controller('analyses')
+            export class AnalysisController {
+                @Get([':id', ':id/jws'])
+                @UseInterceptors(new SignResponseInterceptor('role'))
+                public async findById(): Promise<Project> {
+                    return null as any;
+                }
+            }
+        "#
+        .to_string()
+    }
+
+    #[test]
+    fn response_override_applies_only_to_matching_path() {
+        let (project, _dir, paths) = build(
+            "jws",
+            &[
+                ("project.dto.ts", PROJECT_DTO),
+                ("analysis.controller.ts", &jws_controller()),
+            ],
+        );
+        let mut config = Config::default();
+        config.interceptors.insert(
+            "SignResponseInterceptor".to_string(),
+            crate::config::InterceptorConfig {
+                ignore: false,
+                request_body: None,
+                response: Some(crate::config::ResponseOverride {
+                    when_path_ends_with: Some("/jws".to_string()),
+                    schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "protected": { "type": "string" },
+                            "payload": { "type": "string" },
+                            "signature": { "type": "string" }
+                        },
+                        "required": ["protected", "payload", "signature"]
+                    }),
+                }),
+            },
+        );
+        let (routes, _components) = extract(&config, &project, &[paths[1].clone()]);
+
+        let jws = routes
+            .iter()
+            .find(|r| r.path.ends_with("/jws"))
+            .expect("jws route present");
+        let plain = routes
+            .iter()
+            .find(|r| !r.path.ends_with("/jws"))
+            .expect("plain sibling present");
+
+        // The /jws sibling carries the configured JWS envelope.
+        let jws_resp = jws.response.as_ref().expect("jws response schema");
+        let props = jws_resp.get("properties").expect("jws object with properties");
+        assert!(props.get("protected").is_some());
+        assert!(props.get("payload").is_some());
+        assert!(props.get("signature").is_some());
+
+        // The plain sibling keeps the handler's declared Project shape untouched.
+        let plain_resp = plain.response.as_ref().expect("plain response schema");
+        let refstr = plain_resp.get("$ref").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(refstr, "#/components/schemas/Project");
+    }
+
+    #[test]
+    fn response_override_without_suffix_applies_to_all_paths() {
+        let (project, _dir, paths) = build(
+            "jws_all",
+            &[
+                ("project.dto.ts", PROJECT_DTO),
+                ("analysis.controller.ts", &jws_controller()),
+            ],
+        );
+        let mut config = Config::default();
+        config.interceptors.insert(
+            "SignResponseInterceptor".to_string(),
+            crate::config::InterceptorConfig {
+                ignore: false,
+                request_body: None,
+                response: Some(crate::config::ResponseOverride {
+                    when_path_ends_with: None,
+                    schema: json!({ "type": "string" }),
+                }),
+            },
+        );
+        let (routes, _components) = extract(&config, &project, &[paths[1].clone()]);
+        assert_eq!(routes.len(), 2);
+        for route in &routes {
+            let resp = route.response.as_ref().expect("response schema");
+            assert_eq!(resp.get("type").and_then(|v| v.as_str()), Some("string"));
+        }
     }
 
     #[test]

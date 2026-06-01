@@ -82,6 +82,28 @@ pub struct InterceptorConfig {
     /// Request-body reshaping not expressed in `NestInterceptor<In, Out>`.
     #[serde(default)]
     pub request_body: Option<RequestBodyTransform>,
+    /// Response-body override for interceptors whose wire shape cannot be
+    /// recovered from `NestInterceptor<In, Out>` — typically because the
+    /// transform is runtime control flow (e.g. signing the body only when the
+    /// request path ends in `/jws`). The supplied schema replaces the route's
+    /// response, optionally gated on a path suffix so sibling routes that share
+    /// the same interceptor (array-valued `@Get([':id', ':id/jws'])`) keep their
+    /// untransformed shape.
+    #[serde(default)]
+    pub response: Option<ResponseOverride>,
+}
+
+/// A response-schema override applied by an interceptor. See `InterceptorConfig::response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponseOverride {
+    /// Only apply the override to routes whose path ends with this suffix (e.g.
+    /// `/jws`). When omitted, the override applies to every route carrying the
+    /// interceptor.
+    #[serde(default)]
+    pub when_path_ends_with: Option<String>,
+    /// The OpenAPI schema emitted as the route's response body. Inlined verbatim.
+    pub schema: serde_json::Value,
 }
 
 /// How an interceptor reshapes the incoming request body.
@@ -243,6 +265,27 @@ mod tests {
             cfg.interceptors["MultiStatusInterceptor"].request_body,
             Some(RequestBodyTransform::SingleOrArray)
         );
+    }
+
+    #[test]
+    fn parses_response_override() {
+        let cfg: Config = serde_json::from_str(
+            r#"{ "interceptors": {
+                "SignResponseInterceptor": {
+                    "response": {
+                        "whenPathEndsWith": "/jws",
+                        "schema": { "type": "object", "properties": { "signature": { "type": "string" } } }
+                    }
+                }
+            } }"#,
+        )
+        .expect("valid response override config parses");
+        let ov = cfg.interceptors["SignResponseInterceptor"]
+            .response
+            .as_ref()
+            .expect("response override present");
+        assert_eq!(ov.when_path_ends_with.as_deref(), Some("/jws"));
+        assert_eq!(ov.schema["type"], "object");
     }
 
     #[test]
