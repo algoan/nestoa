@@ -4,9 +4,9 @@ members = ["crates/nestoa"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2026"
 license = "MIT"
-repository = "https://github.com/your-org/nestoa"
+repository = "https://github.com/algoan/nestoa"
 
 [profile.release]
 lto = "thin"
