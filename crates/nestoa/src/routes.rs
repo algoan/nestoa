@@ -653,9 +653,18 @@ pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchema
         entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
 
+    // Sort paths, and the HTTP methods within each path, alphabetically. Routes
+    // are collected in source/file order, so without this the output would drift
+    // when the codebase is refactored (files moved, controllers reordered) even
+    // though the API itself is unchanged. Sorting keeps the document idempotent.
+    let mut sorted_paths: Vec<(String, Map<String, Value>)> = paths.into_iter().collect();
+    sorted_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut paths_json: Map<String, Value> = Map::new();
-    for (p, ops) in paths {
-        paths_json.insert(p, Value::Object(ops));
+    for (p, ops) in sorted_paths {
+        let mut sorted_ops: Vec<(String, Value)> = ops.into_iter().collect();
+        sorted_ops.sort_by(|a, b| a.0.cmp(&b.0));
+        paths_json.insert(p, Value::Object(sorted_ops.into_iter().collect()));
     }
 
     let mut info = Map::new();
@@ -670,7 +679,11 @@ pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchema
     root.insert("info".into(), Value::Object(info));
     root.insert("paths".into(), Value::Object(paths_json));
     if !components.schemas.is_empty() {
-        let schemas: Map<String, Value> = components.schemas.into_iter().collect();
+        // Schemas are collected in type-encounter order, which also follows file
+        // order; sort them for the same refactor-stability reason as paths.
+        let mut schema_pairs: Vec<(String, Value)> = components.schemas.into_iter().collect();
+        schema_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let schemas: Map<String, Value> = schema_pairs.into_iter().collect();
         let mut comp = Map::new();
         comp.insert("schemas".into(), Value::Object(schemas));
         root.insert("components".into(), Value::Object(comp));
