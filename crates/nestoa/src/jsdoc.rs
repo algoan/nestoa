@@ -51,7 +51,10 @@ impl JsDoc {
             // First non-empty line becomes the summary; the rest becomes the
             // longer description if it differs.
             let mut iter = joined.split("\n\n");
-            doc.summary = iter.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            doc.summary = iter
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let rest = iter.collect::<Vec<_>>().join("\n\n").trim().to_string();
             if !rest.is_empty() {
                 doc.description = Some(rest);
@@ -95,7 +98,10 @@ mod tests {
         assert_eq!(doc.summary.as_deref(), Some("Do the thing"));
         assert!(doc.deprecated);
         assert_eq!(doc.deprecated_reason.as_deref(), Some("use other instead"));
-        assert_eq!(doc.params.get("id").map(|s| s.as_str()), Some("the identifier"));
+        assert_eq!(
+            doc.params.get("id").map(|s| s.as_str()),
+            Some("the identifier")
+        );
     }
 }
 

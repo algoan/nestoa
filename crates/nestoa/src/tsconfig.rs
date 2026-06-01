@@ -69,10 +69,19 @@ fn match_pattern(pattern: &str, specifier: &str) -> Option<String> {
 /// Try a candidate path as-is and with the usual TypeScript extensions.
 fn resolve_file_with_exts(candidate: &Path) -> Option<PathBuf> {
     if candidate.is_file() {
-        return Some(candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf()));
+        return Some(
+            candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.to_path_buf()),
+        );
     }
     for ext in [
-        ".ts", ".tsx", ".d.ts", "/index.ts", "/index.tsx", "/index.d.ts",
+        ".ts",
+        ".tsx",
+        ".d.ts",
+        "/index.ts",
+        "/index.tsx",
+        "/index.d.ts",
     ] {
         let mut p = candidate.as_os_str().to_os_string();
         p.push(ext);
@@ -249,7 +258,10 @@ mod tests {
 
     #[test]
     fn matches_exact_and_wildcard_patterns() {
-        assert_eq!(match_pattern("@algoan/core", "@algoan/core"), Some(String::new()));
+        assert_eq!(
+            match_pattern("@algoan/core", "@algoan/core"),
+            Some(String::new())
+        );
         assert_eq!(match_pattern("@algoan/core", "@algoan/other"), None);
         assert_eq!(
             match_pattern("@algoan/raw/*", "@algoan/raw/budget-insight"),
@@ -277,7 +289,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("svc")).unwrap();
         std::fs::create_dir_all(dir.join("libs/core/src")).unwrap();
-        std::fs::write(dir.join("libs/core/src/index.ts"), "export interface Core { a: string; }").unwrap();
+        std::fs::write(
+            dir.join("libs/core/src/index.ts"),
+            "export interface Core { a: string; }",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("tsconfig.base.json"),
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@algoan/core": ["libs/core/src/index.ts"] } } }"#,
@@ -292,7 +308,11 @@ mod tests {
         let paths = load_tsconfig_paths(&dir.join("svc"), None).expect("load");
         assert_eq!(paths.len(), 1);
         let resolved = paths.resolve("@algoan/core").expect("resolve alias");
-        assert!(resolved.ends_with("libs/core/src/index.ts"), "got {:?}", resolved);
+        assert!(
+            resolved.ends_with("libs/core/src/index.ts"),
+            "got {:?}",
+            resolved
+        );
         assert!(paths.resolve("@algoan/missing").is_none());
     }
 }

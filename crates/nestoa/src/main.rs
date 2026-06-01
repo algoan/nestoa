@@ -19,12 +19,16 @@ use swc_common::BytePos;
 
 use crate::config::{Config, OutputFormat};
 use crate::parse::ParsingContext;
-use crate::routes::{to_openapi, Extractor};
+use crate::routes::{Extractor, to_openapi};
 use crate::schema::ComponentSchemas;
-use crate::symbols::{package_name, resolve_module_path, resolve_package_types, Project};
+use crate::symbols::{Project, package_name, resolve_module_path, resolve_package_types};
 
 #[derive(Parser, Debug)]
-#[command(name = "nestoa", version, about = "Static OpenAPI generator for NestJS / TypeScript")]
+#[command(
+    name = "nestoa",
+    version,
+    about = "Static OpenAPI generator for NestJS / TypeScript"
+)]
 struct Cli {
     /// Project root to analyse (defaults to the current directory).
     #[arg(default_value = ".")]
@@ -83,15 +87,13 @@ fn expand_packages(
             } else {
                 // Workspace alias (tsconfig paths) wins over a node_modules copy;
                 // fall back to an allowlisted package's declarations.
-                project
-                    .resolve_alias(&spec)
-                    .or_else(|| {
-                        if allow.is_match(package_name(&spec)) {
-                            resolve_package_types(&file, &spec)
-                        } else {
-                            None
-                        }
-                    })
+                project.resolve_alias(&spec).or_else(|| {
+                    if allow.is_match(package_name(&spec)) {
+                        resolve_package_types(&file, &spec)
+                    } else {
+                        None
+                    }
+                })
             };
             let Some(target) = target else { continue };
             if project.files.contains_key(&target) {
@@ -159,9 +161,10 @@ fn main() -> Result<()> {
         if let Ok(s) = std::fs::read_to_string(file) {
             sources.insert(file.clone(), s);
         }
-        if let Some(fm) = parser.source_map.get_source_file(&swc_common::FileName::Real(
-            file.clone(),
-        )) {
+        if let Some(fm) = parser
+            .source_map
+            .get_source_file(&swc_common::FileName::Real(file.clone()))
+        {
             file_starts.insert(file.clone(), fm.start_pos);
         }
         project.add(parsed);
@@ -170,7 +173,8 @@ fn main() -> Result<()> {
     // Load tsconfig `paths` aliases so workspace package imports (e.g.
     // `@algoan/core` -> `libs/core/src`) resolve to in-repo source.
     if cfg.resolve_tsconfig_paths {
-        project.tsconfig_paths = tsconfig::load_tsconfig_paths(&project_root, cfg.tsconfig.as_deref());
+        project.tsconfig_paths =
+            tsconfig::load_tsconfig_paths(&project_root, cfg.tsconfig.as_deref());
         if let Some(p) = &project.tsconfig_paths {
             eprintln!("nestoa: loaded {} tsconfig path alias(es)", p.len());
         }
@@ -179,7 +183,10 @@ fn main() -> Result<()> {
     // Pull in TypeScript declarations from allowlisted node_modules packages and
     // tsconfig-aliased workspace libs so their exported types resolve to real
     // schemas instead of `x-unresolved`.
-    let has_aliases = project.tsconfig_paths.as_ref().is_some_and(|p| p.has_entries());
+    let has_aliases = project
+        .tsconfig_paths
+        .as_ref()
+        .is_some_and(|p| p.has_entries());
     if !cfg.resolve_packages.is_empty() || has_aliases {
         match build_package_allowlist(&cfg.resolve_packages) {
             Ok(allow) => expand_packages(
@@ -198,7 +205,10 @@ fn main() -> Result<()> {
     // explicitly or opted out.
     if cfg.base_path.is_none() && cfg.detect_global_prefix {
         if let Some(prefix) = globalprefix::detect_global_prefix(&project, &project_root) {
-            eprintln!("nestoa: detected global prefix \"{}\" from bootstrap", prefix);
+            eprintln!(
+                "nestoa: detected global prefix \"{}\" from bootstrap",
+                prefix
+            );
             cfg.base_path = Some(prefix);
         }
     }

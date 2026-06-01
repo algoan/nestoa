@@ -182,7 +182,10 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
                         .push(ea.src.value.to_string_lossy().into_owned());
                 }
                 ModuleDecl::ExportNamed(en) => {
-                    let src = en.src.as_ref().map(|s| s.value.to_string_lossy().into_owned());
+                    let src = en
+                        .src
+                        .as_ref()
+                        .map(|s| s.value.to_string_lossy().into_owned());
                     for spec in &en.specifiers {
                         match spec {
                             ExportSpecifier::Named(n) => {
@@ -229,12 +232,16 @@ fn collect_decl(decl: &Decl, fs: &mut FileSymbols) {
                 .insert(c.ident.sym.to_string(), Symbol::Class(Arc::new(c.clone())));
         }
         Decl::TsInterface(i) => {
-            fs.declared
-                .insert(i.id.sym.to_string(), Symbol::Interface(Arc::new(*i.clone())));
+            fs.declared.insert(
+                i.id.sym.to_string(),
+                Symbol::Interface(Arc::new(*i.clone())),
+            );
         }
         Decl::TsTypeAlias(t) => {
-            fs.declared
-                .insert(t.id.sym.to_string(), Symbol::TypeAlias(Arc::new(*t.clone())));
+            fs.declared.insert(
+                t.id.sym.to_string(),
+                Symbol::TypeAlias(Arc::new(*t.clone())),
+            );
         }
         Decl::TsEnum(e) => {
             fs.declared
@@ -304,7 +311,12 @@ pub fn resolve_module_path(current_file: &Path, specifier: &str) -> Option<PathB
     let base = current_file.parent()?;
     let candidate = base.join(specifier);
     for ext in [
-        ".ts", ".tsx", ".d.ts", "/index.ts", "/index.tsx", "/index.d.ts",
+        ".ts",
+        ".tsx",
+        ".d.ts",
+        "/index.ts",
+        "/index.tsx",
+        "/index.d.ts",
     ] {
         let mut p = candidate.clone().into_os_string();
         p.push(ext);
@@ -323,12 +335,21 @@ pub fn resolve_module_path(current_file: &Path, specifier: &str) -> Option<PathB
 /// `"@algoan/aggregator-raw-data/budget-insight"` -> `("@algoan/aggregator-raw-data", "budget-insight")`.
 /// `"lodash"` -> `("lodash", "")`.
 pub fn split_package_specifier(specifier: &str) -> (String, String) {
-    let parts: Vec<&str> = specifier.splitn(if specifier.starts_with('@') { 3 } else { 2 }, '/').collect();
+    let parts: Vec<&str> = specifier
+        .splitn(if specifier.starts_with('@') { 3 } else { 2 }, '/')
+        .collect();
     if specifier.starts_with('@') {
-        let pkg = format!("{}/{}", parts.first().copied().unwrap_or(""), parts.get(1).copied().unwrap_or(""));
+        let pkg = format!(
+            "{}/{}",
+            parts.first().copied().unwrap_or(""),
+            parts.get(1).copied().unwrap_or("")
+        );
         (pkg, parts.get(2).copied().unwrap_or("").to_string())
     } else {
-        (parts.first().copied().unwrap_or("").to_string(), parts.get(1).copied().unwrap_or("").to_string())
+        (
+            parts.first().copied().unwrap_or("").to_string(),
+            parts.get(1).copied().unwrap_or("").to_string(),
+        )
     }
 }
 
@@ -372,7 +393,11 @@ fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
 /// honouring exact keys and a trailing `/*` wildcard.
 fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String> {
     let exports = json.get("exports")?;
-    let key = if subpath.is_empty() { ".".to_string() } else { format!("./{}", subpath) };
+    let key = if subpath.is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{}", subpath)
+    };
     if let Some(v) = exports.get(&key) {
         if let Some(found) = dts_from_exports_value(v) {
             return Some(found);
@@ -383,7 +408,10 @@ fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String>
         for (k, v) in map {
             if let Some(prefix) = k.strip_suffix("/*") {
                 let prefix = prefix.trim_start_matches("./");
-                if let Some(rest) = subpath.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) {
+                if let Some(rest) = subpath
+                    .strip_prefix(prefix)
+                    .and_then(|r| r.strip_prefix('/'))
+                {
                     if let Some(tmpl) = dts_from_exports_value(v) {
                         return Some(tmpl.replace('*', rest));
                     }
@@ -415,14 +443,25 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
 
     let rel = if subpath.is_empty() {
         types_from_exports(&json, "")
-            .or_else(|| json.get("typings").and_then(|v| v.as_str()).map(str::to_string))
-            .or_else(|| json.get("types").and_then(|v| v.as_str()).map(str::to_string))
+            .or_else(|| {
+                json.get("typings")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                json.get("types")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "index.d.ts".to_string())
     } else {
         types_from_exports(&json, &subpath)
             .or_else(|| types_from_versions(&json, &subpath))
             .or_else(|| {
-                for cand in [format!("{}.d.ts", subpath), format!("{}/index.d.ts", subpath)] {
+                for cand in [
+                    format!("{}.d.ts", subpath),
+                    format!("{}/index.d.ts", subpath),
+                ] {
                     if pkg_dir.join(&cand).is_file() {
                         return Some(cand);
                     }
@@ -446,7 +485,10 @@ mod tests {
     fn splits_scoped_and_plain_specifiers() {
         assert_eq!(
             split_package_specifier("@algoan/aggregator-raw-data/budget-insight"),
-            ("@algoan/aggregator-raw-data".to_string(), "budget-insight".to_string())
+            (
+                "@algoan/aggregator-raw-data".to_string(),
+                "budget-insight".to_string()
+            )
         );
         assert_eq!(
             split_package_specifier("@algoan/aggregator-raw-data"),
@@ -476,8 +518,16 @@ mod tests {
             }"#,
         )
         .unwrap();
-        std::fs::write(pkg.join("dist/index.d.ts"), "export interface Root { a: string; }").unwrap();
-        std::fs::write(pkg.join("dist/sub/index.d.ts"), "export interface Sub { b: number; }").unwrap();
+        std::fs::write(
+            pkg.join("dist/index.d.ts"),
+            "export interface Root { a: string; }",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("dist/sub/index.d.ts"),
+            "export interface Sub { b: number; }",
+        )
+        .unwrap();
 
         // A consumer file sitting next to node_modules.
         let consumer = dir.join("src/file.ts");

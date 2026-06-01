@@ -208,10 +208,14 @@ impl Config {
         let candidates: Vec<PathBuf> = if let Some(p) = explicit {
             vec![cwd.join(p)]
         } else {
-            ["nestoa.config.json", "nestoa.config.yaml", "nestoa.config.yml"]
-                .iter()
-                .map(|n| cwd.join(n))
-                .collect()
+            [
+                "nestoa.config.json",
+                "nestoa.config.yaml",
+                "nestoa.config.yml",
+            ]
+            .iter()
+            .map(|n| cwd.join(n))
+            .collect()
         };
         for path in candidates {
             if path.is_file() {
@@ -290,9 +294,11 @@ mod tests {
 
     #[test]
     fn rejects_unknown_interceptor_key() {
-        let err = serde_json::from_str::<Config>(
-            r#"{ "interceptors": { "X": { "bogus": true } } }"#,
+        let err =
+            serde_json::from_str::<Config>(r#"{ "interceptors": { "X": { "bogus": true } } }"#);
+        assert!(
+            err.is_err(),
+            "deny_unknown_fields should reject unknown keys"
         );
-        assert!(err.is_err(), "deny_unknown_fields should reject unknown keys");
     }
 }

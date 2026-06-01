@@ -3,7 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use globset::{Glob, GlobSetBuilder};
 
-pub fn discover_files(root: &Path, includes: &[String], excludes: &[String]) -> Result<Vec<PathBuf>> {
+pub fn discover_files(
+    root: &Path,
+    includes: &[String],
+    excludes: &[String],
+) -> Result<Vec<PathBuf>> {
     let mut exclude = GlobSetBuilder::new();
     for pat in excludes {
         exclude.add(Glob::new(pat)?);
@@ -20,7 +24,10 @@ pub fn discover_files(root: &Path, includes: &[String], excludes: &[String]) -> 
             push_if_ts(&start, root, &exclude, &mut out);
             continue;
         }
-        for entry in walkdir::WalkDir::new(&start).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&start)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }

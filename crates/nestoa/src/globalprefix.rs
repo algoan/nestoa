@@ -200,9 +200,15 @@ mod tests {
         let root = temp_root("lit");
         let project = project_from(
             &root,
-            &[("src/main.ts", "async function bootstrap() { app.setGlobalPrefix('api'); }")],
+            &[(
+                "src/main.ts",
+                "async function bootstrap() { app.setGlobalPrefix('api'); }",
+            )],
         );
-        assert_eq!(detect_global_prefix(&project, &root).as_deref(), Some("api"));
+        assert_eq!(
+            detect_global_prefix(&project, &root).as_deref(),
+            Some("api")
+        );
     }
 
     #[test]
@@ -222,7 +228,11 @@ mod tests {
     fn detects_node_config_member() {
         let root = temp_root("nodeconfig");
         std::fs::create_dir_all(root.join("config")).unwrap();
-        std::fs::write(root.join("config/default.json"), r#"{ "globalPrefix": "v2" }"#).unwrap();
+        std::fs::write(
+            root.join("config/default.json"),
+            r#"{ "globalPrefix": "v2" }"#,
+        )
+        .unwrap();
         let project = project_from(
             &root,
             &[(

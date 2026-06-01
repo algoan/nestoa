@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use swc_common::BytePos;
 use swc_ecma_ast::{
     Class, ClassMember, Expr, ExprOrSpread, Lit, MethodKind, Param, Pat, PropName, TsEntityName,
@@ -13,8 +13,8 @@ use crate::config::{Config, DecoratorAlias};
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
-use crate::jsdoc::{jsdoc_before, JsDoc};
-use crate::schema::{decorator_name, ComponentSchemas, SchemaCtx};
+use crate::jsdoc::{JsDoc, jsdoc_before};
+use crate::schema::{ComponentSchemas, SchemaCtx, decorator_name};
 use crate::symbols::Project;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -117,9 +117,9 @@ impl<'a> Extractor<'a> {
             let parsed = &self.project.files[file];
             for item in &parsed.module.body {
                 let class_decl = match item {
-                    swc_ecma_ast::ModuleItem::ModuleDecl(
-                        swc_ecma_ast::ModuleDecl::ExportDecl(e),
-                    ) => match &e.decl {
+                    swc_ecma_ast::ModuleItem::ModuleDecl(swc_ecma_ast::ModuleDecl::ExportDecl(
+                        e,
+                    )) => match &e.decl {
                         swc_ecma_ast::Decl::Class(c) => Some(c),
                         _ => None,
                     },
@@ -151,7 +151,9 @@ impl<'a> Extractor<'a> {
         // before any method-level ones, so they lead the combined list.
         let class_interceptors = collect_interceptors(&class.decorators);
         for member in &class.body {
-            let ClassMember::Method(m) = member else { continue };
+            let ClassMember::Method(m) = member else {
+                continue;
+            };
             if !matches!(m.kind, MethodKind::Method) {
                 continue;
             }
@@ -194,9 +196,7 @@ impl<'a> Extractor<'a> {
 
             // JSDoc on the method
             let mut method_doc = JsDoc::default();
-            if let (Some(src), Some(start)) =
-                (self.sources.get(file), self.file_starts.get(file))
-            {
+            if let (Some(src), Some(start)) = (self.sources.get(file), self.file_starts.get(file)) {
                 if let Some(doc) = jsdoc_before(src, *start, m.span) {
                     method_doc = doc;
                 }
@@ -519,9 +519,7 @@ fn string_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
 }
 
 fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
-    if s.len() >= suffix.len()
-        && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-    {
+    if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
         &s[..s.len() - suffix.len()]
     } else {
         s
@@ -701,7 +699,10 @@ mod tests {
 
     #[test]
     fn strips_controller_suffix() {
-        assert_eq!(strip_suffix_ci("AccountController", "Controller"), "Account");
+        assert_eq!(
+            strip_suffix_ci("AccountController", "Controller"),
+            "Account"
+        );
         assert_eq!(strip_suffix_ci("Account", "Controller"), "Account");
     }
 
@@ -711,7 +712,8 @@ mod tests {
         use crate::parse::ParsingContext;
         use crate::schema::ComponentSchemas;
 
-        let dir = std::env::temp_dir().join(format!("nestoa-routes-{}-{}", std::process::id(), name));
+        let dir =
+            std::env::temp_dir().join(format!("nestoa-routes-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();

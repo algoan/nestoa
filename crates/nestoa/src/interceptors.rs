@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use swc_common::BytePos;
 use swc_ecma_ast::{Class, Decorator, Expr, TsArrayType, TsEntityName, TsType};
 
@@ -54,7 +54,11 @@ fn collect_arg_names(expr: &Expr, out: &mut Vec<String>) {
 }
 
 /// Apply any configured request-body reshaping for the route's interceptors.
-pub fn request_body_transform(config: &Config, interceptor_names: &[String], body: &mut RequestBody) {
+pub fn request_body_transform(
+    config: &Config,
+    interceptor_names: &[String],
+    body: &mut RequestBody,
+) {
     for name in interceptor_names {
         if let Some(cfg) = config.interceptors.get(name) {
             if let Some(RequestBodyTransform::SingleOrArray) = cfg.request_body {
@@ -75,7 +79,11 @@ pub fn request_body_transform(config: &Config, interceptor_names: &[String], bod
 ///
 /// Later interceptors in the list win, mirroring `rewrite_response`'s ordering.
 /// Returned schema is cloned from config and inlined verbatim.
-pub fn response_override(config: &Config, interceptor_names: &[String], path: &str) -> Option<Value> {
+pub fn response_override(
+    config: &Config,
+    interceptor_names: &[String],
+    path: &str,
+) -> Option<Value> {
     let mut found = None;
     for name in interceptor_names {
         let Some(cfg) = config.interceptors.get(name) else {
@@ -116,7 +124,12 @@ pub fn rewrite_response(
 
     for name in interceptor_names {
         // Side-effect interceptors the user has told us to ignore.
-        if config.interceptors.get(name).map(|c| c.ignore).unwrap_or(false) {
+        if config
+            .interceptors
+            .get(name)
+            .map(|c| c.ignore)
+            .unwrap_or(false)
+        {
             continue;
         }
         // Resolve the interceptor class (may live in node_modules / a workspace lib).
@@ -331,7 +344,11 @@ mod tests {
     }
 
     /// Run the route extractor and return the routes plus collected components.
-    fn extract(config: &Config, project: &Project, entry: &[PathBuf]) -> (Vec<Route>, ComponentSchemas) {
+    fn extract(
+        config: &Config,
+        project: &Project,
+        entry: &[PathBuf],
+    ) -> (Vec<Route>, ComponentSchemas) {
         let sources = HashMap::new();
         let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
@@ -466,8 +483,7 @@ mod tests {
 
     #[test]
     fn non_exported_local_interface_resolves_in_its_own_file() {
-        let (project, _dir, paths) =
-            build("nonexp", &[("pagination.d.ts", PAGINATION_DTS)]);
+        let (project, _dir, paths) = build("nonexp", &[("pagination.d.ts", PAGINATION_DTS)]);
         let resolved = project.resolve(&paths[0], "PaginatedData");
         assert!(matches!(resolved, Some((_, Symbol::Interface(_)))));
     }
@@ -493,7 +509,10 @@ mod tests {
 
         // Shape is the interceptor's PaginatedData, not the handler's DataToPaginate.
         let props = resp.get("properties").expect("object with properties");
-        assert!(props.get("pagination").is_some(), "pagination block present");
+        assert!(
+            props.get("pagination").is_some(),
+            "pagination block present"
+        );
         let items = props
             .get("resources")
             .and_then(|r| r.get("items"))
@@ -596,14 +615,19 @@ mod tests {
 
         // The /jws sibling carries the configured JWS envelope.
         let jws_resp = jws.response.as_ref().expect("jws response schema");
-        let props = jws_resp.get("properties").expect("jws object with properties");
+        let props = jws_resp
+            .get("properties")
+            .expect("jws object with properties");
         assert!(props.get("protected").is_some());
         assert!(props.get("payload").is_some());
         assert!(props.get("signature").is_some());
 
         // The plain sibling keeps the handler's declared Project shape untouched.
         let plain_resp = plain.response.as_ref().expect("plain response schema");
-        let refstr = plain_resp.get("$ref").and_then(|v| v.as_str()).unwrap_or("");
+        let refstr = plain_resp
+            .get("$ref")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert_eq!(refstr, "#/components/schemas/Project");
     }
 
@@ -644,7 +668,10 @@ mod tests {
                 ("pagination.d.ts", PAGINATION_DTS),
                 ("project.dto.ts", PROJECT_DTO),
                 // Handler returns a bare Project, which does not match `DataToPaginate<T>`.
-                ("projects.controller.ts", &paginated_controller("Promise<Project>")),
+                (
+                    "projects.controller.ts",
+                    &paginated_controller("Promise<Project>"),
+                ),
             ],
         );
         let config = Config::default();

@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
     TsTypeLit, TsTypeRef, TsUnionOrIntersectionType,
 };
 
-use crate::jsdoc::{jsdoc_before, JsDoc};
+use crate::jsdoc::{JsDoc, jsdoc_before};
 use crate::symbols::{Project, Symbol};
 
 /// Mutable container for the components/schemas section of the OpenAPI doc.
@@ -55,7 +55,9 @@ impl<'a> SchemaCtx<'a> {
         match ty {
             TsType::TsKeywordType(k) => keyword_schema(k.kind),
             TsType::TsLitType(l) => match &l.lit {
-                TsLit::Str(s) => json!({ "type": "string", "enum": [s.value.to_string_lossy().into_owned()] }),
+                TsLit::Str(s) => {
+                    json!({ "type": "string", "enum": [s.value.to_string_lossy().into_owned()] })
+                }
                 TsLit::Number(n) => json!({ "type": "number", "enum": [n.value] }),
                 TsLit::Bool(b) => json!({ "type": "boolean", "enum": [b.value] }),
                 _ => json!({}),
@@ -155,7 +157,9 @@ impl<'a> SchemaCtx<'a> {
                 for m in &e.members {
                     let mname = match &m.id {
                         swc_ecma_ast::TsEnumMemberId::Ident(i) => i.sym.to_string(),
-                        swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
+                        swc_ecma_ast::TsEnumMemberId::Str(s) => {
+                            s.value.to_string_lossy().into_owned()
+                        }
                     };
                     let value = match m.init.as_deref() {
                         Some(Expr::Lit(Lit::Str(s))) => {
@@ -183,8 +187,9 @@ impl<'a> SchemaCtx<'a> {
             }
             // Namespace-qualified type, e.g. `Enums.AccountType` where `Enums`
             // is a TS namespace (`import * as Enums` / `export * as Enums`).
-            if let Some((decl_file, sym)) =
-                self.project.resolve_namespace_member(file, &parent, &member)
+            if let Some((decl_file, sym)) = self
+                .project
+                .resolve_namespace_member(file, &parent, &member)
             {
                 let schema_name = sanitize_name(&member);
                 if self.components.mark_seen(&schema_name) {
@@ -461,7 +466,11 @@ impl<'a> SchemaCtx<'a> {
                 let mut obj = Map::new();
                 obj.insert(
                     "type".into(),
-                    Value::String(if is_string { "string".into() } else { "number".into() }),
+                    Value::String(if is_string {
+                        "string".into()
+                    } else {
+                        "number".into()
+                    }),
                 );
                 obj.insert("enum".into(), Value::Array(values));
                 if let (Some(src), Some(file_start)) =
@@ -493,7 +502,9 @@ impl<'a> SchemaCtx<'a> {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
                         let name = match &p.key {
                             swc_ecma_ast::PropName::Ident(i) => i.sym.to_string(),
-                            swc_ecma_ast::PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+                            swc_ecma_ast::PropName::Str(s) => {
+                                s.value.to_string_lossy().into_owned()
+                            }
                             _ => continue,
                         };
                         let mut schema = p
@@ -591,9 +602,7 @@ fn collect_string_keys(ty: &TsType) -> Vec<String> {
                     out.push(s.value.to_string_lossy().into_owned());
                 }
             }
-            TsType::TsUnionOrIntersectionType(
-                TsUnionOrIntersectionType::TsUnionType(u),
-            ) => {
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
                 for t in &u.types {
                     walk(t, out);
                 }
@@ -607,7 +616,13 @@ fn collect_string_keys(ty: &TsType) -> Vec<String> {
 
 pub fn sanitize_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -686,18 +701,20 @@ mod tests {
             type_env: None,
         };
         let derived_file = dir.join("derived.ts");
-        let (decl_file, sym) = project.resolve(&derived_file, "Derived").expect("resolve Derived");
+        let (decl_file, sym) = project
+            .resolve(&derived_file, "Derived")
+            .expect("resolve Derived");
         let schema = ctx.symbol_to_schema(&decl_file, &sym);
-        let all_of = schema.get("allOf").and_then(|v| v.as_array()).expect("allOf");
+        let all_of = schema
+            .get("allOf")
+            .and_then(|v| v.as_array())
+            .expect("allOf");
         assert_eq!(
             all_of[0].get("$ref").and_then(|v| v.as_str()),
             Some("#/components/schemas/Base")
         );
         let own = all_of.last().unwrap();
-        assert!(own
-            .get("properties")
-            .and_then(|p| p.get("b"))
-            .is_some());
+        assert!(own.get("properties").and_then(|p| p.get("b")).is_some());
         // The base class is collected into components for the $ref to point at.
         assert!(ctx.components.schemas.contains_key("Base"));
     }

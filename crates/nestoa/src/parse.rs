@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use swc_common::{sync::Lrc, FileName, SourceMap};
+use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module};
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
+use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
