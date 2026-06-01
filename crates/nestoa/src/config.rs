@@ -61,6 +61,36 @@ pub struct Config {
     /// tool to drop that parameter from the route signature.
     #[serde(default)]
     pub decorator_aliases: indexmap::IndexMap<String, DecoratorAlias>,
+
+    /// Per-interceptor handling, keyed by the interceptor class name as written
+    /// in `@UseInterceptors(...)`. The response shape is normally inferred from
+    /// the interceptor's `NestInterceptor<In, Out>` type arguments; this map
+    /// lets users silence pure side-effect interceptors (`ignore`) and declare
+    /// request-body reshaping that the type signature cannot express.
+    #[serde(default)]
+    pub interceptors: indexmap::IndexMap<String, InterceptorConfig>,
+}
+
+/// Per-interceptor handling. See `Config::interceptors`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterceptorConfig {
+    /// Pure side-effect interceptor (logging/tracing/scrubbing) that never
+    /// touches the wire shape — skip it entirely.
+    #[serde(default)]
+    pub ignore: bool,
+    /// Request-body reshaping not expressed in `NestInterceptor<In, Out>`.
+    #[serde(default)]
+    pub request_body: Option<RequestBodyTransform>,
+}
+
+/// How an interceptor reshapes the incoming request body.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestBodyTransform {
+    /// The client may send a single object or an array of them (the handler
+    /// sees an array). Emitted as `oneOf: [S, { type: array, items: S }]`.
+    SingleOrArray,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,6 +176,7 @@ impl Default for Config {
                 description: None,
             },
             decorator_aliases: indexmap::IndexMap::new(),
+            interceptors: indexmap::IndexMap::new(),
         }
     }
 }
@@ -191,5 +222,34 @@ impl Config {
             Some("yaml") | Some("yml") => OutputFormat::Yaml,
             _ => OutputFormat::Json,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_interceptors_config() {
+        let cfg: Config = serde_json::from_str(
+            r#"{ "interceptors": {
+                "LoggingInterceptor": { "ignore": true },
+                "MultiStatusInterceptor": { "requestBody": "single-or-array" }
+            } }"#,
+        )
+        .expect("valid interceptors config parses");
+        assert!(cfg.interceptors["LoggingInterceptor"].ignore);
+        assert_eq!(
+            cfg.interceptors["MultiStatusInterceptor"].request_body,
+            Some(RequestBodyTransform::SingleOrArray)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_interceptor_key() {
+        let err = serde_json::from_str::<Config>(
+            r#"{ "interceptors": { "X": { "bogus": true } } }"#,
+        );
+        assert!(err.is_err(), "deny_unknown_fields should reject unknown keys");
     }
 }

@@ -1,6 +1,7 @@
 mod config;
 mod discover;
 mod globalprefix;
+mod interceptors;
 mod jsdoc;
 mod parse;
 mod routes;

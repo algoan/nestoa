@@ -29,11 +29,25 @@ impl ComponentSchemas {
     }
 }
 
+/// A generic type parameter bound to a concrete type, carrying the file the
+/// concrete type came from so nested references in it resolve in the right
+/// scope. Populated by interceptor unification (see `interceptors.rs`).
+#[derive(Clone)]
+pub struct TypeBinding {
+    pub origin_file: std::path::PathBuf,
+    pub ty: TsType,
+}
+
+/// Map of type-parameter name -> bound concrete type.
+pub type TypeEnv = HashMap<String, TypeBinding>;
+
 pub struct SchemaCtx<'a> {
     pub project: &'a Project,
     pub sources: &'a HashMap<std::path::PathBuf, String>,
     pub file_starts: &'a HashMap<std::path::PathBuf, swc_common::BytePos>,
     pub components: &'a mut ComponentSchemas,
+    /// Active generic substitutions. `None` outside interceptor lowering.
+    pub type_env: Option<&'a TypeEnv>,
 }
 
 impl<'a> SchemaCtx<'a> {
@@ -183,6 +197,23 @@ impl<'a> SchemaCtx<'a> {
             return json!({ "x-unresolved": format!("{}.{}", parent, member) });
         }
         let name = entity_name(&r.type_name);
+        // Generic substitution: a bare reference to a bound interceptor type
+        // parameter (e.g. `T`) lowers to the bound concrete type, resolved in
+        // the file that type came from. The env is cleared for the recursion
+        // because bound types come from the concrete side and never reference
+        // the interceptor's own parameters (avoids param->param loops).
+        if r.type_params.is_none() {
+            if let Some(env) = self.type_env {
+                if let Some(binding) = env.get(&name) {
+                    let origin = binding.origin_file.clone();
+                    let ty = binding.ty.clone();
+                    let saved = self.type_env.take();
+                    let schema = self.ts_type_to_schema(&origin, &ty);
+                    self.type_env = saved;
+                    return schema;
+                }
+            }
+        }
         // Built-in generic handling
         match name.as_str() {
             "Promise" | "Observable" => {
@@ -652,6 +683,7 @@ mod tests {
             sources: &sources,
             file_starts: &file_starts,
             components: &mut components,
+            type_env: None,
         };
         let derived_file = dir.join("derived.ts");
         let (decl_file, sym) = project.resolve(&derived_file, "Derived").expect("resolve Derived");

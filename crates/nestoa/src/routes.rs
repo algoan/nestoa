@@ -10,6 +10,7 @@ use swc_ecma_ast::{
 };
 
 use crate::config::{Config, DecoratorAlias};
+use crate::interceptors::{interceptor_class_names, request_body_transform, rewrite_response};
 use crate::jsdoc::{jsdoc_before, JsDoc};
 use crate::schema::{decorator_name, ComponentSchemas, SchemaCtx};
 use crate::symbols::Project;
@@ -144,6 +145,9 @@ impl<'a> Extractor<'a> {
         tag: &str,
         out: &mut Vec<Route>,
     ) {
+        // `@UseInterceptors(...)` applied at the controller level — these run
+        // before any method-level ones, so they lead the combined list.
+        let class_interceptors = collect_interceptors(&class.decorators);
         for member in &class.body {
             let ClassMember::Method(m) = member else { continue };
             if !matches!(m.kind, MethodKind::Method) {
@@ -169,6 +173,8 @@ impl<'a> Extractor<'a> {
             let Some((method, sub_path)) = http else {
                 continue;
             };
+            let mut interceptor_names = class_interceptors.clone();
+            interceptor_names.extend(collect_interceptors(&m.function.decorators));
             let full_path = join_paths(self.config.base_path.as_deref(), base_path, sub_path.as_deref());
 
             // JSDoc on the method
@@ -196,19 +202,46 @@ impl<'a> Extractor<'a> {
                     }
                 }
             }
+            // Interceptors may accept a request body in a different shape than
+            // the handler's `@Body` parameter (e.g. single-object-or-array).
+            if let Some(body) = request_body.as_mut() {
+                request_body_transform(self.config, &interceptor_names, body);
+            }
 
-            // Response type
+            // Response type. An interceptor may reshape the wire response (e.g.
+            // pagination); when it does, the rewritten schema replaces the
+            // declared return type — and we skip lowering the declared type at
+            // all so its now-unreferenced components don't leak into the doc.
             let mut response_value: Option<Value> = None;
             if let Some(ret) = m.function.return_type.as_ref() {
-                let mut ctx = SchemaCtx {
-                    project: self.project,
-                    sources: self.sources,
-                    file_starts: self.file_starts,
-                    components: self.components,
+                let rewritten = if interceptor_names.is_empty() {
+                    None
+                } else {
+                    rewrite_response(
+                        self.project,
+                        self.config,
+                        file,
+                        &ret.type_ann,
+                        &interceptor_names,
+                        self.components,
+                        self.sources,
+                        self.file_starts,
+                    )
                 };
-                let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
-                if !schema.is_null() && schema != json!({}) {
-                    response_value = Some(schema);
+                if rewritten.is_some() {
+                    response_value = rewritten;
+                } else {
+                    let mut ctx = SchemaCtx {
+                        project: self.project,
+                        sources: self.sources,
+                        file_starts: self.file_starts,
+                        components: self.components,
+                        type_env: None,
+                    };
+                    let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
+                    if !schema.is_null() && schema != json!({}) {
+                        response_value = Some(schema);
+                    }
                 }
             }
 
@@ -273,6 +306,7 @@ impl<'a> Extractor<'a> {
             sources: self.sources,
             file_starts: self.file_starts,
             components: self.components,
+            type_env: None,
         };
         let schema = pat_info
             .ts_type
@@ -351,6 +385,18 @@ fn extract_pat(pat: &Pat) -> PatInfo {
             ts_type: None,
         },
     }
+}
+
+/// Collect interceptor class names from any `@UseInterceptors(...)` decorators
+/// in the given list, in source order.
+fn collect_interceptors(decorators: &[swc_ecma_ast::Decorator]) -> Vec<String> {
+    let mut names = Vec::new();
+    for d in decorators {
+        if decorator_name(d) == "UseInterceptors" {
+            names.extend(interceptor_class_names(d));
+        }
+    }
+    names
 }
 
 fn controller_base_path(class: &Class) -> Option<String> {
