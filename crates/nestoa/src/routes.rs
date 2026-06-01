@@ -820,4 +820,89 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].1, "/users/{id}");
     }
+
+    /// Minimal route with a 200 status and no body/params, for output-ordering tests.
+    fn route(method: HttpMethod, path: &str) -> Route {
+        Route {
+            method,
+            path: path.to_string(),
+            summary: None,
+            description: None,
+            deprecated: false,
+            parameters: vec![],
+            request_body: None,
+            response: None,
+            status_code: 200,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn to_openapi_sorts_paths_methods_and_schemas() {
+        use crate::schema::ComponentSchemas;
+        use serde_json::json;
+
+        // Feed routes, methods, and schemas in deliberately non-alphabetical order.
+        let routes = vec![
+            route(HttpMethod::Post, "/users"),
+            route(HttpMethod::Get, "/users"),
+            route(HttpMethod::Get, "/accounts"),
+        ];
+        let mut components = ComponentSchemas::default();
+        components.insert("Zebra", json!({"type": "object"}));
+        components.insert("Apple", json!({"type": "object"}));
+        components.insert("Mango", json!({"type": "object"}));
+
+        let doc = to_openapi(&Config::default(), &routes, components);
+
+        // Paths are alphabetical.
+        let path_keys: Vec<&String> = doc["paths"].as_object().unwrap().keys().collect();
+        assert_eq!(path_keys, vec!["/accounts", "/users"]);
+
+        // Methods within a path are alphabetical (get before post).
+        let method_keys: Vec<&String> = doc["paths"]["/users"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(method_keys, vec!["get", "post"]);
+
+        // Component schemas are alphabetical.
+        let schema_keys: Vec<&String> = doc["components"]["schemas"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(schema_keys, vec!["Apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn to_openapi_is_idempotent_under_input_reordering() {
+        use crate::schema::ComponentSchemas;
+        use serde_json::json;
+
+        // Build a document from routes and schemas supplied in arbitrary order.
+        let build = |routes: &[Route], schema_order: &[&str]| {
+            let mut components = ComponentSchemas::default();
+            for name in schema_order {
+                components.insert(name, json!({"type": "object"}));
+            }
+            to_openapi(&Config::default(), routes, components)
+        };
+
+        let forward = vec![
+            route(HttpMethod::Get, "/a"),
+            route(HttpMethod::Post, "/a"),
+            route(HttpMethod::Get, "/b"),
+            route(HttpMethod::Delete, "/b"),
+        ];
+        let mut shuffled = forward.clone();
+        shuffled.reverse();
+
+        // Same API surface, different route AND schema declaration order ->
+        // byte-identical output. This is the refactor-stability guarantee.
+        let a = serde_json::to_string(&build(&forward, &["Beta", "Alpha", "Gamma"])).unwrap();
+        let b = serde_json::to_string(&build(&shuffled, &["Gamma", "Beta", "Alpha"])).unwrap();
+        assert_eq!(a, b);
+    }
 }
