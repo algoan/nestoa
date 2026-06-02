@@ -674,14 +674,26 @@ pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchema
         info.insert("description".into(), Value::String(d.clone()));
     }
 
+    // Tree-shake the component schemas: keep only those reachable from the
+    // paths via `$ref`, following references transitively through other
+    // schemas. Types are collected eagerly while lowering (a DTO may pull in
+    // helper types that no route ultimately returns, or an interceptor may
+    // replace a declared return type), so without this the document accumulates
+    // orphaned schemas that bloat the output and confuse consumers.
+    let reachable = reachable_schemas(&paths_json, &components.schemas);
+
     let mut root = Map::new();
     root.insert("openapi".into(), Value::String("3.1.0".into()));
     root.insert("info".into(), Value::Object(info));
     root.insert("paths".into(), Value::Object(paths_json));
-    if !components.schemas.is_empty() {
-        // Schemas are collected in type-encounter order, which also follows file
-        // order; sort them for the same refactor-stability reason as paths.
-        let mut schema_pairs: Vec<(String, Value)> = components.schemas.into_iter().collect();
+    // Schemas are collected in type-encounter order, which also follows file
+    // order; sort them for the same refactor-stability reason as paths.
+    let mut schema_pairs: Vec<(String, Value)> = components
+        .schemas
+        .into_iter()
+        .filter(|(name, _)| reachable.contains(name))
+        .collect();
+    if !schema_pairs.is_empty() {
         schema_pairs.sort_by(|a, b| a.0.cmp(&b.0));
         let schemas: Map<String, Value> = schema_pairs.into_iter().collect();
         let mut comp = Map::new();
@@ -689,6 +701,61 @@ pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchema
         root.insert("components".into(), Value::Object(comp));
     }
     Value::Object(root)
+}
+
+/// Component-schema name referenced by a `$ref` of the form
+/// `#/components/schemas/<name>`, if it matches that shape.
+fn ref_target(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .and_then(|s| s.strip_prefix("#/components/schemas/"))
+}
+
+/// Collect every component-schema name referenced by a `$ref` anywhere within
+/// `value` (recursing through objects and arrays).
+fn collect_refs(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map {
+                if key == "$ref" {
+                    if let Some(name) = ref_target(v) {
+                        out.push(name.to_string());
+                    }
+                } else {
+                    collect_refs(v, out);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compute the set of component schemas reachable from the paths: start with
+/// every `$ref` used by an operation, then transitively follow `$ref`s found
+/// inside the referenced schemas. A missing target (dangling `$ref`) is simply
+/// skipped — tree-shaking never invents schemas.
+fn reachable_schemas(
+    paths: &Map<String, Value>,
+    schemas: &IndexMap<String, Value>,
+) -> std::collections::HashSet<String> {
+    let mut reachable = std::collections::HashSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    collect_refs(&Value::Object(paths.clone()), &mut queue);
+
+    while let Some(name) = queue.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        if let Some(schema) = schemas.get(&name) {
+            collect_refs(schema, &mut queue);
+        }
+    }
+    reachable
 }
 
 fn default_status_text(code: u16) -> &'static str {
@@ -837,16 +904,26 @@ mod tests {
         }
     }
 
+    /// Like `route`, but its response body `$ref`s the named component schema,
+    /// so the schema survives tree-shaking.
+    fn route_ref(method: HttpMethod, path: &str, schema_ref: &str) -> Route {
+        use serde_json::json;
+        let mut r = route(method, path);
+        r.response = Some(json!({"$ref": format!("#/components/schemas/{schema_ref}")}));
+        r
+    }
+
     #[test]
     fn to_openapi_sorts_paths_methods_and_schemas() {
         use crate::schema::ComponentSchemas;
         use serde_json::json;
 
         // Feed routes, methods, and schemas in deliberately non-alphabetical order.
+        // Each route references a schema so all three survive tree-shaking.
         let routes = vec![
-            route(HttpMethod::Post, "/users"),
-            route(HttpMethod::Get, "/users"),
-            route(HttpMethod::Get, "/accounts"),
+            route_ref(HttpMethod::Post, "/users", "Zebra"),
+            route_ref(HttpMethod::Get, "/users", "Apple"),
+            route_ref(HttpMethod::Get, "/accounts", "Mango"),
         ];
         let mut components = ComponentSchemas::default();
         components.insert("Zebra", json!({"type": "object"}));
@@ -888,9 +965,9 @@ mod tests {
         };
 
         let forward = vec![
-            route(HttpMethod::Get, "/a"),
-            route(HttpMethod::Post, "/a"),
-            route(HttpMethod::Get, "/b"),
+            route_ref(HttpMethod::Get, "/a", "Beta"),
+            route_ref(HttpMethod::Post, "/a", "Alpha"),
+            route_ref(HttpMethod::Get, "/b", "Gamma"),
             route(HttpMethod::Delete, "/b"),
         ];
         let mut shuffled = forward.clone();
@@ -901,5 +978,50 @@ mod tests {
         let a = serde_json::to_string(&build(&forward, &["Beta", "Alpha", "Gamma"])).unwrap();
         let b = serde_json::to_string(&build(&shuffled, &["Gamma", "Beta", "Alpha"])).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn to_openapi_prunes_unused_schemas() {
+        use crate::schema::ComponentSchemas;
+        use serde_json::json;
+
+        // `Used` is referenced by a route response; `Nested` is referenced only
+        // by `Used` (so it must survive transitively); `Orphan` is referenced by
+        // nobody and must be dropped.
+        let routes = vec![route_ref(HttpMethod::Get, "/things", "Used")];
+        let mut components = ComponentSchemas::default();
+        components.insert(
+            "Used",
+            json!({
+                "type": "object",
+                "properties": { "child": { "$ref": "#/components/schemas/Nested" } }
+            }),
+        );
+        components.insert("Nested", json!({"type": "object"}));
+        components.insert("Orphan", json!({"type": "object"}));
+
+        let doc = to_openapi(&Config::default(), &routes, components);
+
+        let schema_keys: Vec<&String> = doc["components"]["schemas"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(schema_keys, vec!["Nested", "Used"]);
+    }
+
+    #[test]
+    fn to_openapi_omits_components_when_all_schemas_unused() {
+        use crate::schema::ComponentSchemas;
+        use serde_json::json;
+
+        // A schema referenced by no route leaves the document with no
+        // `components` section at all, rather than an empty one.
+        let routes = vec![route(HttpMethod::Get, "/things")];
+        let mut components = ComponentSchemas::default();
+        components.insert("Orphan", json!({"type": "object"}));
+
+        let doc = to_openapi(&Config::default(), &routes, components);
+        assert!(doc.as_object().unwrap().get("components").is_none());
     }
 }
