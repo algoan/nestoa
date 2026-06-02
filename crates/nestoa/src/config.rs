@@ -219,15 +219,9 @@ impl Config {
         };
         for path in candidates {
             if path.is_file() {
-                let raw = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                let cfg: Config = if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    serde_json::from_str(&raw)
-                        .with_context(|| format!("parsing {}", path.display()))?
-                } else {
-                    serde_yaml::from_str(&raw)
-                        .with_context(|| format!("parsing {}", path.display()))?
-                };
+                let value = load_value(&path)?;
+                let cfg: Config = serde_json::from_value(value)
+                    .with_context(|| format!("parsing {}", path.display()))?;
                 return Ok(cfg);
             }
         }
@@ -248,6 +242,55 @@ impl Config {
             Some("yaml") | Some("yml") => OutputFormat::Yaml,
             _ => OutputFormat::Json,
         }
+    }
+}
+
+/// Read a config file into a JSON value, resolving an optional `extends` by
+/// deep-merging this config on top of the base it extends. `extends` is a path
+/// relative to the config file's own directory and may be chained (a base may
+/// itself extend another). The `extends` key is stripped from the result so it
+/// never reaches `Config`, which denies unknown fields. JSON and YAML configs
+/// are both parsed through `serde_json::Value`, giving one merge medium.
+fn load_value(path: &Path) -> Result<serde_json::Value> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut value: serde_json::Value = if path.extension().and_then(|s| s.to_str()) == Some("json")
+    {
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    } else {
+        serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    };
+
+    let extends = value.as_object_mut().and_then(|map| map.remove("extends"));
+    if let Some(extends) = extends {
+        let rel = extends
+            .as_str()
+            .with_context(|| format!("\"extends\" in {} must be a string path", path.display()))?;
+        let base_path = path.parent().unwrap_or_else(|| Path::new(".")).join(rel);
+        let mut base = load_value(&base_path)
+            .with_context(|| format!("resolving \"extends\" from {}", path.display()))?;
+        merge_value(&mut base, value);
+        return Ok(base);
+    }
+    Ok(value)
+}
+
+/// Deep-merge `over` onto `base`: object keys merge recursively; arrays and
+/// scalars from `over` replace their counterpart in `base` wholesale (so
+/// list-valued keys like `resolvePackages`/`include` override cleanly).
+fn merge_value(base: &mut serde_json::Value, over: serde_json::Value) {
+    match (base, over) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(over_map)) => {
+            for (k, v) in over_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => merge_value(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (base_slot, over) => *base_slot = over,
     }
 }
 
@@ -290,6 +333,67 @@ mod tests {
             .expect("response override present");
         assert_eq!(ov.when_path_ends_with.as_deref(), Some("/jws"));
         assert_eq!(ov.schema["type"], "object");
+    }
+
+    #[test]
+    fn merge_value_overrides_scalars_and_merges_objects() {
+        let mut base = serde_json::json!({
+            "output": "openapi.yaml",
+            "resolvePackages": ["@algoan/*"],
+            "info": { "title": "Base", "version": "1.0" }
+        });
+        merge_value(&mut base, serde_json::json!({ "info": { "title": "Child" } }));
+        assert_eq!(base["output"], "openapi.yaml");
+        assert_eq!(base["resolvePackages"][0], "@algoan/*");
+        assert_eq!(base["info"]["title"], "Child"); // child overrides
+        assert_eq!(base["info"]["version"], "1.0"); // sibling inherited
+    }
+
+    #[test]
+    fn merge_value_replaces_arrays_wholesale() {
+        let mut base = serde_json::json!({ "include": ["src", "lib"] });
+        merge_value(&mut base, serde_json::json!({ "include": ["app"] }));
+        assert_eq!(base["include"], serde_json::json!(["app"]));
+    }
+
+    #[test]
+    fn extends_merges_base_config() {
+        let dir = std::env::temp_dir().join(format!("nestoa-extends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("services/svc")).unwrap();
+        std::fs::write(
+            dir.join("nestoa.base.json"),
+            r#"{ "output": "openapi.yaml", "resolvePackages": ["@algoan/*"] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("services/svc/nestoa.config.json"),
+            r#"{ "extends": "../../nestoa.base.json", "info": { "title": "Svc", "version": "2.0" } }"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(Some(Path::new("nestoa.config.json")), &dir.join("services/svc"))
+            .expect("config with extends loads");
+        assert_eq!(cfg.info.title, "Svc"); // from child
+        assert_eq!(cfg.info.version, "2.0"); // from child
+        assert_eq!(cfg.resolve_packages, vec!["@algoan/*".to_string()]); // from base
+        assert_eq!(cfg.output, PathBuf::from("openapi.yaml")); // from base
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extends_missing_target_errors() {
+        let dir = std::env::temp_dir().join(format!("nestoa-extends-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nestoa.config.json"),
+            r#"{ "extends": "./does-not-exist.json" }"#,
+        )
+        .unwrap();
+        let err = Config::load(Some(Path::new("nestoa.config.json")), &dir);
+        assert!(err.is_err(), "missing extends target should error");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
