@@ -342,7 +342,10 @@ mod tests {
             "resolvePackages": ["@algoan/*"],
             "info": { "title": "Base", "version": "1.0" }
         });
-        merge_value(&mut base, serde_json::json!({ "info": { "title": "Child" } }));
+        merge_value(
+            &mut base,
+            serde_json::json!({ "info": { "title": "Child" } }),
+        );
         assert_eq!(base["output"], "openapi.yaml");
         assert_eq!(base["resolvePackages"][0], "@algoan/*");
         assert_eq!(base["info"]["title"], "Child"); // child overrides
@@ -372,8 +375,11 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = Config::load(Some(Path::new("nestoa.config.json")), &dir.join("services/svc"))
-            .expect("config with extends loads");
+        let cfg = Config::load(
+            Some(Path::new("nestoa.config.json")),
+            &dir.join("services/svc"),
+        )
+        .expect("config with extends loads");
         assert_eq!(cfg.info.title, "Svc"); // from child
         assert_eq!(cfg.info.version, "2.0"); // from child
         assert_eq!(cfg.resolve_packages, vec!["@algoan/*".to_string()]); // from base
@@ -383,7 +389,8 @@ mod tests {
 
     #[test]
     fn extends_missing_target_errors() {
-        let dir = std::env::temp_dir().join(format!("nestoa-extends-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nestoa-extends-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
