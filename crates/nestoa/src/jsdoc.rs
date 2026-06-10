@@ -9,6 +9,9 @@ pub struct JsDoc {
     pub description: Option<String>,
     pub deprecated: bool,
     pub deprecated_reason: Option<String>,
+    /// `@internal` (or `@private`): the annotated member is implementation-only
+    /// and must be omitted from the emitted schema.
+    pub internal: bool,
     /// Free-form tags as (name, body) pairs, preserving order.
     pub tags: Vec<(String, String)>,
     /// `@param name desc` lookup.
@@ -71,6 +74,7 @@ impl JsDoc {
                     self.deprecated_reason = Some(body.to_string());
                 }
             }
+            "internal" | "private" => self.internal = true,
             "example" => self.example = Some(body.to_string()),
             "summary" => self.summary = Some(body.to_string()),
             "description" => self.description = Some(body.to_string()),
@@ -200,5 +204,12 @@ mod tests {
             doc.params.get("id").map(|s| s.as_str()),
             Some("the identifier")
         );
+    }
+
+    #[test]
+    fn flags_internal_and_private() {
+        assert!(JsDoc::parse("\n * Raw data\n * @internal\n ").internal);
+        assert!(JsDoc::parse("\n * @private\n ").internal);
+        assert!(!JsDoc::parse("\n * Just a description\n ").internal);
     }
 }

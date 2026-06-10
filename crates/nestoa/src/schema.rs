@@ -425,6 +425,16 @@ impl<'a> SchemaCtx<'a> {
                     Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
                     _ => continue,
                 };
+                // `@internal`/`@private` members never reach the wire.
+                if self
+                    .sources
+                    .get(file)
+                    .zip(self.file_starts.get(file))
+                    .and_then(|(src, file_start)| jsdoc_before(src, *file_start, p.span))
+                    .is_some_and(|d| d.internal)
+                {
+                    continue;
+                }
                 let schema = p
                     .type_ann
                     .as_ref()
@@ -476,16 +486,22 @@ impl<'a> SchemaCtx<'a> {
                             Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
                             _ => continue,
                         };
+                        let doc = self
+                            .sources
+                            .get(file)
+                            .zip(self.file_starts.get(file))
+                            .and_then(|(src, file_start)| jsdoc_before(src, *file_start, p.span));
+                        // `@internal`/`@private` members never reach the wire.
+                        if doc.as_ref().is_some_and(|d| d.internal) {
+                            continue;
+                        }
                         let mut schema = p
                             .type_ann
                             .as_ref()
                             .map(|t| self.ts_type_to_schema(file, &t.type_ann))
                             .unwrap_or_else(|| json!({}));
-                        if let (Some(src), Some(file_start)) =
-                            (self.sources.get(file), self.file_starts.get(file))
-                            && let Some(doc) = jsdoc_before(src, *file_start, p.span)
-                        {
-                            attach_doc(&mut schema, &doc);
+                        if let Some(doc) = &doc {
+                            attach_doc(&mut schema, doc);
                         }
                         props.insert(name.clone(), schema);
                         if !p.optional {
@@ -593,16 +609,22 @@ impl<'a> SchemaCtx<'a> {
                             }
                             _ => continue,
                         };
+                        let doc = self
+                            .sources
+                            .get(file)
+                            .zip(self.file_starts.get(file))
+                            .and_then(|(src, file_start)| jsdoc_before(src, *file_start, p.span));
+                        // `@internal`/`@private` members never reach the wire.
+                        if doc.as_ref().is_some_and(|d| d.internal) {
+                            continue;
+                        }
                         let mut schema = p
                             .type_ann
                             .as_ref()
                             .map(|t| self.ts_type_to_schema(file, &t.type_ann))
                             .unwrap_or_else(|| json!({}));
-                        if let (Some(src), Some(file_start)) =
-                            (self.sources.get(file), self.file_starts.get(file))
-                            && let Some(doc) = jsdoc_before(src, *file_start, p.span)
-                        {
-                            attach_doc(&mut schema, &doc);
+                        if let Some(doc) = &doc {
+                            attach_doc(&mut schema, doc);
                         }
                         // class-validator `@IsOptional()` decorator implies optional.
                         let has_is_optional = p
@@ -977,5 +999,102 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Build a project plus the `sources`/`file_starts` maps JSDoc lookups need,
+    /// mirroring the wiring in `main.rs`.
+    fn project_with_sources(
+        files: &[(&str, &str)],
+    ) -> (
+        Project,
+        std::path::PathBuf,
+        HashMap<std::path::PathBuf, String>,
+        HashMap<std::path::PathBuf, swc_common::BytePos>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nestoa-jsdoc-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let parser = ParsingContext::default();
+        let mut project = Project::default();
+        let mut sources = HashMap::new();
+        let mut file_starts = HashMap::new();
+        for (rel, body) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            project.add(parser.parse_file(&path).unwrap());
+            sources.insert(path.clone(), body.to_string());
+            if let Some(fm) = parser
+                .source_map
+                .get_source_file(&swc_common::FileName::Real(path.clone()))
+            {
+                file_starts.insert(path.clone(), fm.start_pos);
+            }
+        }
+        (project, dir, sources, file_starts)
+    }
+
+    #[test]
+    fn internal_jsdoc_omits_property_from_schema() {
+        // `@internal` and `@private` mark implementation-only members that are
+        // stripped at runtime (toJSON / formatLean) and must not appear on the wire.
+        let (project, dir, sources, file_starts) = project_with_sources(&[(
+            "dto.ts",
+            "export class Dto {\n  /** Public field */\n  name?: string;\n  /**\n   * Raw data from the aggregator\n   * @internal\n   */\n  rawData?: string;\n  /** @private */\n  secret?: string;\n}",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+        };
+        let dto_file = dir.join("dto.ts");
+        let (decl_file, sym) = project.resolve(&dto_file, "Dto").expect("resolve Dto");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties");
+        assert!(props.contains_key("name"), "public field kept");
+        assert!(!props.contains_key("rawData"), "@internal field dropped");
+        assert!(!props.contains_key("secret"), "@private field dropped");
+    }
+
+    #[test]
+    fn internal_property_is_not_marked_required() {
+        // A required-by-syntax member that is `@internal` should neither appear
+        // in `properties` nor leak into `required`.
+        let (project, dir, sources, file_starts) = project_with_sources(&[(
+            "iface.ts",
+            "export interface Iface {\n  keep: string;\n  /** @internal */\n  drop: string;\n}",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+        };
+        let iface_file = dir.join("iface.ts");
+        let (decl_file, sym) = project.resolve(&iface_file, "Iface").expect("resolve Iface");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        let props = schema.get("properties").and_then(|p| p.as_object()).unwrap();
+        assert!(props.contains_key("keep"));
+        assert!(!props.contains_key("drop"));
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(required, vec!["keep"]);
     }
 }
