@@ -404,9 +404,7 @@ impl<'a> SchemaCtx<'a> {
                 }
             }
         }
-        self.components
-            .schemas
-            .insert(provisional.clone(), schema);
+        self.components.schemas.insert(provisional.clone(), schema);
         self.components
             .by_base
             .entry(base)
@@ -801,11 +799,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "nestoa-schema-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("nestoa-schema-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
@@ -876,8 +870,14 @@ mod tests {
         // Two distinct `Identity` declarations with different shapes, each
         // reached through a different parent type.
         let (project, dir) = project_from(&[
-            ("pd_identity.ts", "export interface Identity { name: string; }"),
-            ("party_identity.ts", "export interface Identity { siren: string; }"),
+            (
+                "pd_identity.ts",
+                "export interface Identity { name: string; }",
+            ),
+            (
+                "party_identity.ts",
+                "export interface Identity { siren: string; }",
+            ),
             (
                 "personal_details.ts",
                 "import { Identity } from './pd_identity';\nexport interface PersonalDetails { identity: Identity; }",
@@ -913,12 +913,16 @@ mod tests {
         let party = &ctx.components.schemas["Party"];
         assert_eq!(ref_name(party, "identity"), "PartyIdentity");
         // The two components keep their distinct shapes.
-        assert!(ctx.components.schemas["Identity"]["properties"]
-            .get("name")
-            .is_some());
-        assert!(ctx.components.schemas["PartyIdentity"]["properties"]
-            .get("siren")
-            .is_some());
+        assert!(
+            ctx.components.schemas["Identity"]["properties"]
+                .get("name")
+                .is_some()
+        );
+        assert!(
+            ctx.components.schemas["PartyIdentity"]["properties"]
+                .get("siren")
+                .is_some()
+        );
     }
 
     #[test]
@@ -926,8 +930,14 @@ mod tests {
         // Two distinct `Identity` declarations that happen to be structurally
         // identical collapse onto a single component.
         let (project, dir) = project_from(&[
-            ("a_identity.ts", "export interface Identity { name: string; }"),
-            ("b_identity.ts", "export interface Identity { name: string; }"),
+            (
+                "a_identity.ts",
+                "export interface Identity { name: string; }",
+            ),
+            (
+                "b_identity.ts",
+                "export interface Identity { name: string; }",
+            ),
             (
                 "a.ts",
                 "import { Identity } from './a_identity';\nexport interface A { identity: Identity; }",
@@ -958,8 +968,14 @@ mod tests {
 
         // No prefixed duplicate was created; both parents point at one Identity.
         assert!(!ctx.components.schemas.contains_key("BIdentity"));
-        assert_eq!(ref_name(&ctx.components.schemas["A"], "identity"), "Identity");
-        assert_eq!(ref_name(&ctx.components.schemas["B"], "identity"), "Identity");
+        assert_eq!(
+            ref_name(&ctx.components.schemas["A"], "identity"),
+            "Identity"
+        );
+        assert_eq!(
+            ref_name(&ctx.components.schemas["B"], "identity"),
+            "Identity"
+        );
     }
 
     #[test]
@@ -1085,9 +1101,14 @@ mod tests {
             current_owner: None,
         };
         let iface_file = dir.join("iface.ts");
-        let (decl_file, sym) = project.resolve(&iface_file, "Iface").expect("resolve Iface");
+        let (decl_file, sym) = project
+            .resolve(&iface_file, "Iface")
+            .expect("resolve Iface");
         let schema = ctx.symbol_to_schema(&decl_file, &sym);
-        let props = schema.get("properties").and_then(|p| p.as_object()).unwrap();
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap();
         assert!(props.contains_key("keep"));
         assert!(!props.contains_key("drop"));
         let required: Vec<&str> = schema
