@@ -166,6 +166,7 @@ pub fn rewrite_response(
         file_starts,
         components,
         type_env: Some(&env),
+        current_owner: None,
     };
     let schema = lower_inline(&mut ctx, &current_file, &current_ty);
     if schema.is_null() || schema == json!({}) {

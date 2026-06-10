@@ -15,17 +15,52 @@ use crate::symbols::{Project, Symbol};
 #[derive(Default)]
 pub struct ComponentSchemas {
     pub schemas: IndexMap<String, Value>,
-    seen: HashSet<String>,
+    /// Declaration identity (origin file + type name) -> the component name it
+    /// was assigned. The same declaration always maps to one component, so a
+    /// type referenced from many places is emitted once; a self-reference
+    /// hit during lowering finds the in-progress assignment here, which is how
+    /// recursive types terminate.
+    by_decl: HashMap<(std::path::PathBuf, String), String>,
+    /// Base (sanitized type) name -> the component names registered under it,
+    /// in registration order. Used to detect a same-name collision and to
+    /// dedupe a later declaration whose lowered schema is structurally equal to
+    /// an earlier sibling.
+    by_base: HashMap<String, Vec<String>>,
+    /// Every component name currently in use (reserved while lowering, or
+    /// committed). Guards against handing out a name that is already taken.
+    allocated: HashSet<String>,
 }
 
 impl ComponentSchemas {
+    /// Seed a schema under an exact name (used by tests). Production code goes
+    /// through `SchemaCtx::component_ref`, which handles naming and dedup.
+    #[cfg(test)]
     pub fn insert(&mut self, name: &str, schema: Value) {
         if !self.schemas.contains_key(name) {
             self.schemas.insert(name.to_string(), schema);
         }
     }
-    pub fn mark_seen(&mut self, name: &str) -> bool {
-        self.seen.insert(name.to_string())
+
+    /// Pick an unused component name for a colliding declaration: prefer
+    /// `<owner><base>` (the parent-type prefix), falling back to a numeric
+    /// suffix if that is somehow taken too.
+    fn fresh_name(&self, owner_prefix: &str, base: &str) -> String {
+        let candidate = if owner_prefix.is_empty() {
+            base.to_string()
+        } else {
+            format!("{owner_prefix}{base}")
+        };
+        if !self.allocated.contains(&candidate) {
+            return candidate;
+        }
+        let mut n = 2;
+        loop {
+            let c = format!("{candidate}{n}");
+            if !self.allocated.contains(&c) {
+                return c;
+            }
+            n += 1;
+        }
     }
 }
 
@@ -48,6 +83,11 @@ pub struct SchemaCtx<'a> {
     pub components: &'a mut ComponentSchemas,
     /// Active generic substitutions. `None` outside interceptor lowering.
     pub type_env: Option<&'a TypeEnv>,
+    /// Component name of the type whose body is currently being lowered. A
+    /// same-named child encountered here is disambiguated by prefixing this
+    /// owner's name (`Party` + `Identity` -> `PartyIdentity`). `None` at the
+    /// top level (route bodies/responses), so the first type keeps its bare name.
+    pub current_owner: Option<String>,
 }
 
 impl<'a> SchemaCtx<'a> {
@@ -189,12 +229,7 @@ impl<'a> SchemaCtx<'a> {
                 .project
                 .resolve_namespace_member(file, &parent, &member)
             {
-                let schema_name = sanitize_name(&member);
-                if self.components.mark_seen(&schema_name) {
-                    let resolved = self.symbol_to_schema(&decl_file, &sym);
-                    self.components.insert(&schema_name, resolved);
-                }
-                return json!({ "$ref": format!("#/components/schemas/{}", schema_name) });
+                return self.component_ref(&decl_file, &member, &sym);
             }
             // Unknown — fall through and return placeholder.
             return json!({ "x-unresolved": format!("{}.{}", parent, member) });
@@ -308,15 +343,76 @@ impl<'a> SchemaCtx<'a> {
 
         // Resolve to a project symbol.
         if let Some((decl_file, sym)) = self.project.resolve(file, &name) {
-            let schema_name = sanitize_name(&name);
-            if self.components.mark_seen(&schema_name) {
-                let resolved = self.symbol_to_schema(&decl_file, &sym);
-                self.components.insert(&schema_name, resolved);
-            }
-            return json!({ "$ref": format!("#/components/schemas/{}", schema_name) });
+            return self.component_ref(&decl_file, &name, &sym);
         }
         // Unknown — leave a permissive placeholder annotated with the name.
         json!({ "x-unresolved": name })
+    }
+
+    /// Resolve a reference to a named project type into a `$ref`, registering
+    /// the type as a reusable component on first encounter.
+    ///
+    /// Naming rules:
+    /// - The same declaration (same origin file + type name) is always emitted
+    ///   as one component, regardless of how many places reference it.
+    /// - The first declaration to claim a given base name keeps it bare.
+    /// - A *different* declaration that wants an already-taken base name is
+    ///   either deduped against a structurally-equal sibling, or — when its
+    ///   shape differs — registered under a fresh name prefixed with the
+    ///   enclosing type's name (`Party` + `Identity` -> `PartyIdentity`).
+    fn component_ref(&mut self, decl_file: &Path, type_name: &str, sym: &Symbol) -> Value {
+        let key = (decl_file.to_path_buf(), type_name.to_string());
+        // Already assigned: a repeat reference, or an in-progress recursion
+        // that must resolve to the name reserved below.
+        if let Some(name) = self.components.by_decl.get(&key) {
+            return ref_value(name);
+        }
+        let base = sanitize_name(type_name);
+        // First declaration to claim this base keeps it bare; a later, distinct
+        // one is disambiguated with its owner's name.
+        let provisional = if self.components.allocated.contains(&base) {
+            let owner = self
+                .current_owner
+                .clone()
+                .map(|o| sanitize_name(&o))
+                .unwrap_or_default();
+            self.components.fresh_name(&owner, &base)
+        } else {
+            base.clone()
+        };
+        // Reserve and record the assignment *before* lowering, so a self
+        // reference inside the body resolves back to this name.
+        self.components.allocated.insert(provisional.clone());
+        self.components
+            .by_decl
+            .insert(key.clone(), provisional.clone());
+        // Lower with this type as the owner, so a same-named child is prefixed
+        // by *this* type's name rather than an outer one.
+        let saved_owner = self.current_owner.replace(provisional.clone());
+        let schema = self.symbol_to_schema(decl_file, sym);
+        self.current_owner = saved_owner;
+        // A collision (provisional != base) may still be a duplicate: reuse an
+        // earlier sibling with an identical shape instead of adding a copy.
+        if provisional != base
+            && let Some(siblings) = self.components.by_base.get(&base).cloned()
+        {
+            for existing in siblings {
+                if self.components.schemas.get(&existing) == Some(&schema) {
+                    self.components.allocated.remove(&provisional);
+                    self.components.by_decl.insert(key, existing.clone());
+                    return ref_value(&existing);
+                }
+            }
+        }
+        self.components
+            .schemas
+            .insert(provisional.clone(), schema);
+        self.components
+            .by_base
+            .entry(base)
+            .or_default()
+            .push(provisional.clone());
+        ref_value(&provisional)
     }
 
     fn type_lit_schema(&mut self, file: &Path, lit: &TsTypeLit) -> Value {
@@ -602,6 +698,11 @@ fn collect_string_keys(ty: &TsType) -> Vec<String> {
     out
 }
 
+/// Build a `$ref` JSON value pointing at a named component schema.
+fn ref_value(name: &str) -> Value {
+    json!({ "$ref": format!("#/components/schemas/{name}") })
+}
+
 pub fn sanitize_name(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -674,7 +775,15 @@ mod tests {
     use std::collections::HashMap;
 
     fn project_from(files: &[(&str, &str)]) -> (Project, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("nestoa-schema-{}", std::process::id()));
+        // Unique per call so tests running in parallel never share a dir.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "nestoa-schema-{}-{}",
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
@@ -707,6 +816,7 @@ mod tests {
             file_starts: &file_starts,
             components: &mut components,
             type_env: None,
+            current_owner: None,
         };
         let derived_file = dir.join("derived.ts");
         let (decl_file, sym) = project
@@ -725,5 +835,147 @@ mod tests {
         assert!(own.get("properties").and_then(|p| p.get("b")).is_some());
         // The base class is collected into components for the $ref to point at.
         assert!(ctx.components.schemas.contains_key("Base"));
+    }
+
+    fn ref_name(schema: &Value, prop: &str) -> String {
+        schema
+            .get("properties")
+            .and_then(|p| p.get(prop))
+            .and_then(|p| p.get("$ref"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("expected $ref on property {prop}"))
+            .strip_prefix("#/components/schemas/")
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn same_name_different_shape_gets_parent_prefix() {
+        // Two distinct `Identity` declarations with different shapes, each
+        // reached through a different parent type.
+        let (project, dir) = project_from(&[
+            ("pd_identity.ts", "export interface Identity { name: string; }"),
+            ("party_identity.ts", "export interface Identity { siren: string; }"),
+            (
+                "personal_details.ts",
+                "import { Identity } from './pd_identity';\nexport interface PersonalDetails { identity: Identity; }",
+            ),
+            (
+                "party.ts",
+                "import { Identity } from './party_identity';\nexport interface Party { identity: Identity; }",
+            ),
+            (
+                "root.ts",
+                "import { PersonalDetails } from './personal_details';\nimport { Party } from './party';\nexport interface Root { personalDetails: PersonalDetails; party: Party; }",
+            ),
+        ]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+        };
+        let root_file = dir.join("root.ts");
+        let (decl_file, sym) = project.resolve(&root_file, "Root").expect("resolve Root");
+        ctx.component_ref(&decl_file, "Root", &sym);
+
+        // First-seen Identity keeps the bare name; the second is prefixed with
+        // its owner (Party).
+        let pd = &ctx.components.schemas["PersonalDetails"];
+        assert_eq!(ref_name(pd, "identity"), "Identity");
+        let party = &ctx.components.schemas["Party"];
+        assert_eq!(ref_name(party, "identity"), "PartyIdentity");
+        // The two components keep their distinct shapes.
+        assert!(ctx.components.schemas["Identity"]["properties"]
+            .get("name")
+            .is_some());
+        assert!(ctx.components.schemas["PartyIdentity"]["properties"]
+            .get("siren")
+            .is_some());
+    }
+
+    #[test]
+    fn same_name_identical_shape_is_deduped() {
+        // Two distinct `Identity` declarations that happen to be structurally
+        // identical collapse onto a single component.
+        let (project, dir) = project_from(&[
+            ("a_identity.ts", "export interface Identity { name: string; }"),
+            ("b_identity.ts", "export interface Identity { name: string; }"),
+            (
+                "a.ts",
+                "import { Identity } from './a_identity';\nexport interface A { identity: Identity; }",
+            ),
+            (
+                "b.ts",
+                "import { Identity } from './b_identity';\nexport interface B { identity: Identity; }",
+            ),
+            (
+                "root.ts",
+                "import { A } from './a';\nimport { B } from './b';\nexport interface Root { a: A; b: B; }",
+            ),
+        ]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+        };
+        let root_file = dir.join("root.ts");
+        let (decl_file, sym) = project.resolve(&root_file, "Root").expect("resolve Root");
+        ctx.component_ref(&decl_file, "Root", &sym);
+
+        // No prefixed duplicate was created; both parents point at one Identity.
+        assert!(!ctx.components.schemas.contains_key("BIdentity"));
+        assert_eq!(ref_name(&ctx.components.schemas["A"], "identity"), "Identity");
+        assert_eq!(ref_name(&ctx.components.schemas["B"], "identity"), "Identity");
+    }
+
+    #[test]
+    fn same_declaration_referenced_twice_is_one_component() {
+        // The same declaration reached from two properties is emitted once and
+        // never prefixed.
+        let (project, dir) = project_from(&[
+            ("account.ts", "export interface Account { id: string; }"),
+            (
+                "root.ts",
+                "import { Account } from './account';\nexport interface Root { primary: Account; secondary: Account; }",
+            ),
+        ]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+        };
+        let root_file = dir.join("root.ts");
+        let (decl_file, sym) = project.resolve(&root_file, "Root").expect("resolve Root");
+        ctx.component_ref(&decl_file, "Root", &sym);
+
+        let root = &ctx.components.schemas["Root"];
+        assert_eq!(ref_name(root, "primary"), "Account");
+        assert_eq!(ref_name(root, "secondary"), "Account");
+        assert_eq!(
+            ctx.components
+                .schemas
+                .keys()
+                .filter(|k| k.ends_with("Account"))
+                .count(),
+            1
+        );
     }
 }

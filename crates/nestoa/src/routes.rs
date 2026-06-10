@@ -252,6 +252,7 @@ impl<'a> Extractor<'a> {
                         file_starts: self.file_starts,
                         components: self.components,
                         type_env: None,
+                        current_owner: None,
                     };
                     let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
                     if !schema.is_null() && schema != json!({}) {
@@ -334,6 +335,7 @@ impl<'a> Extractor<'a> {
             file_starts: self.file_starts,
             components: self.components,
             type_env: None,
+            current_owner: None,
         };
         let schema = pat_info
             .ts_type
