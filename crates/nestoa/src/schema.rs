@@ -83,6 +83,10 @@ pub struct SchemaCtx<'a> {
     pub components: &'a mut ComponentSchemas,
     /// Active generic substitutions. `None` outside interceptor lowering.
     pub type_env: Option<&'a TypeEnv>,
+    /// User-configured transparent wrapper types (`Config::passthrough_types`),
+    /// each lowered to its first type argument. Extends the built-in passthrough
+    /// set (`Promise`, `Observable`, `Partial`, …).
+    pub passthrough_types: &'a [String],
     /// Component name of the type whose body is currently being lowered. A
     /// same-named child encountered here is disambiguated by prefixing this
     /// owner's name (`Party` + `Identity` -> `PartyIdentity`). `None` at the
@@ -250,6 +254,14 @@ impl<'a> SchemaCtx<'a> {
             let schema = self.ts_type_to_schema(&origin, &ty);
             self.type_env = saved;
             return schema;
+        }
+        // User-configured transparent wrappers: lower to the first type argument
+        // (a bare reference with no args lowers as the wrapper name itself).
+        if self.passthrough_types.iter().any(|t| t == &name)
+            && let Some(args) = &r.type_params
+            && let Some(first) = args.params.first()
+        {
+            return self.ts_type_to_schema(file, first);
         }
         // Built-in generic handling
         match name.as_str() {
@@ -846,6 +858,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &[],
         };
         let derived_file = dir.join("derived.ts");
         let (decl_file, sym) = project
@@ -864,6 +877,86 @@ mod tests {
         assert!(own.get("properties").and_then(|p| p.get("b")).is_some());
         // The base class is collected into components for the $ref to point at.
         assert!(ctx.components.schemas.contains_key("Base"));
+    }
+
+    #[test]
+    fn passthrough_type_lowers_to_first_type_arg() {
+        // `PopulatedDoc` is not a project symbol, so without the passthrough
+        // config it would surface as `x-unresolved`. Listed in passthrough_types,
+        // `PopulatedDoc<Target>` must lower exactly as a bare `Target` would.
+        let (project, dir) = project_from(&[
+            ("target.ts", "export interface Target { value: string; }"),
+            (
+                "holder.ts",
+                "import { Target } from './target';\nexport interface Holder { field?: PopulatedDoc<Target>; }",
+            ),
+        ]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let passthrough = vec!["PopulatedDoc".to_string()];
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            passthrough_types: &passthrough,
+        };
+        let holder_file = dir.join("holder.ts");
+        let (decl_file, sym) = project
+            .resolve(&holder_file, "Holder")
+            .expect("resolve Holder");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("field"))
+                .and_then(|f| f.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Target"),
+            "PopulatedDoc<Target> should lower to a $ref to Target, got {schema}"
+        );
+        assert!(ctx.components.schemas.contains_key("Target"));
+    }
+
+    #[test]
+    fn unconfigured_wrapper_stays_unresolved() {
+        // Same shape, but without the passthrough config the unknown wrapper is
+        // reported as `x-unresolved` rather than silently unwrapped.
+        let (project, dir) = project_from(&[
+            ("target.ts", "export interface Target { value: string; }"),
+            (
+                "holder.ts",
+                "import { Target } from './target';\nexport interface Holder { field?: PopulatedDoc<Target>; }",
+            ),
+        ]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            passthrough_types: &[],
+        };
+        let holder_file = dir.join("holder.ts");
+        let (decl_file, sym) = project
+            .resolve(&holder_file, "Holder")
+            .expect("resolve Holder");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("field"))
+                .and_then(|f| f.get("x-unresolved"))
+                .and_then(|v| v.as_str()),
+            Some("PopulatedDoc"),
+        );
     }
 
     fn ref_name(schema: &Value, prop: &str) -> String {
@@ -914,6 +1007,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
         let (decl_file, sym) = project.resolve(&root_file, "Root").expect("resolve Root");
@@ -974,6 +1068,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
         let (decl_file, sym) = project.resolve(&root_file, "Root").expect("resolve Root");
@@ -1012,6 +1107,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
         let (decl_file, sym) = project.resolve(&root_file, "Root").expect("resolve Root");
@@ -1083,6 +1179,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
         let (decl_file, sym) = project.resolve(&dto_file, "Dto").expect("resolve Dto");
@@ -1112,6 +1209,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &[],
         };
         let iface_file = dir.join("iface.ts");
         let (decl_file, sym) = project

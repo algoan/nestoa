@@ -25,6 +25,7 @@ Optional `nestoa.config.json` (or `.yaml` / `.yml`) at the project root:
   "output": "openapi.json",
   "basePath": "/api/v1",
   "info": { "title": "My API", "version": "1.2.3" },
+  "passthroughTypes": ["PopulatedDoc"],
   "decoratorAliases": {
     "AuthUser": "user",
     "MongoPaginationParamDecorator": "ignore"
@@ -35,6 +36,14 @@ Optional `nestoa.config.json` (or `.yaml` / `.yml`) at the project root:
 `decoratorAliases` lets you teach nestoa about project-specific decorators
 without modifying its source — the right-hand side picks one of the known
 handlers (`body`, `query`, `param`, `header`, `user`, `ignore`).
+
+`passthroughTypes` lists generic wrapper types that should be treated as
+transparent: each is lowered to its first type argument, discarding the wrapper.
+This extends the built-in passthrough set (`Promise`, `Observable`, `Partial`,
+…) and is meant for library/project wrappers whose API surface is just the type
+they wrap — for example mongoose's `PopulatedDoc<T>` (`T | RawId`), so a field
+typed `PopulatedDoc<Metadata>` resolves to `Metadata` instead of an
+`x-unresolved` placeholder.
 
 ### Global prefix
 

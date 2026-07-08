@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use swc_common::BytePos;
-use swc_ecma_ast::{Class, Decorator, Expr, TsArrayType, TsEntityName, TsType};
+use swc_ecma_ast::{
+    Class, Decorator, Expr, TsArrayType, TsEntityName, TsKeywordTypeKind, TsType,
+    TsUnionOrIntersectionType,
+};
 
 use crate::config::{Config, RequestBodyTransform};
 use crate::routes::RequestBody;
@@ -167,6 +170,7 @@ pub fn rewrite_response(
         components,
         type_env: Some(&env),
         current_owner: None,
+        passthrough_types: &config.passthrough_types,
     };
     let schema = lower_inline(&mut ctx, &current_file, &current_ty);
     if schema.is_null() || schema == json!({}) {
@@ -218,7 +222,14 @@ fn type_param_names(class: &Class) -> HashSet<String> {
     set
 }
 
-/// Peel `Promise<...>` / `Observable<...>` wrappers off a handler return type.
+/// Peel wrappers off a handler return type until the payload type is exposed:
+/// `Promise<...>` / `Observable<...>`, and nullish unions (`X | undefined` /
+/// `X | null` / `X | void`, as commonly written on handlers that may 404).
+/// A nullish union collapses to its sole non-nullish member; a genuine union of
+/// several payload types is left intact for `unify` to reject. This mirrors the
+/// way the schema lowerer treats `X | undefined` as just `X`, and is what lets
+/// an interceptor whose handler returns `Promise<DataToPaginate<T> | undefined>`
+/// still bind `T` and produce the transformed `PaginatedData<T>` response.
 fn unwrap_async(ty: &TsType) -> &TsType {
     if let TsType::TsTypeRef(r) = ty
         && let Some(name) = ref_ident(&r.type_name)
@@ -228,7 +239,27 @@ fn unwrap_async(ty: &TsType) -> &TsType {
     {
         return unwrap_async(first);
     }
+    if let TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) = ty {
+        let mut non_nullish = u.types.iter().filter(|t| !is_nullish(t));
+        if let (Some(only), None) = (non_nullish.next(), non_nullish.next()) {
+            return unwrap_async(only);
+        }
+    }
     ty
+}
+
+/// Whether a type is `undefined`, `null`, or `void` — union members that carry
+/// no wire shape and are dropped when peeling a handler return type.
+fn is_nullish(ty: &TsType) -> bool {
+    matches!(
+        ty,
+        TsType::TsKeywordType(k) if matches!(
+            k.kind,
+            TsKeywordTypeKind::TsUndefinedKeyword
+                | TsKeywordTypeKind::TsNullKeyword
+                | TsKeywordTypeKind::TsVoidKeyword
+        )
+    )
 }
 
 /// Structurally unify an interceptor's `In` pattern against the concrete
@@ -521,6 +552,43 @@ mod tests {
         // The element DTO is registered; the generic wrappers are inlined, not refs.
         assert!(components.schemas.contains_key("Project"));
         assert!(!components.schemas.contains_key("PaginatedData"));
+        assert!(!components.schemas.contains_key("DataToPaginate"));
+    }
+
+    #[test]
+    fn pagination_interceptor_rewrites_nullable_response() {
+        // A handler that may 404 writes `Promise<DataToPaginate<T> | undefined>`.
+        // The `| undefined` must be peeled so the interceptor still binds `T` and
+        // emits the transformed PaginatedData shape, not the raw generic wrapper
+        // with an unbound `T` (which surfaced as `x-unresolved: T`).
+        let (project, _dir, paths) = build(
+            "pag_null",
+            &[
+                ("pagination.d.ts", PAGINATION_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                (
+                    "projects.controller.ts",
+                    &paginated_controller("Promise<DataToPaginate<Project> | undefined>"),
+                ),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let route = routes.iter().find(|r| r.path == "/projects").unwrap();
+        let resp = route.response.as_ref().expect("response schema");
+        let props = resp.get("properties").expect("object with properties");
+        assert!(
+            props.get("pagination").is_some(),
+            "pagination block present"
+        );
+        let items = props
+            .get("resources")
+            .and_then(|r| r.get("items"))
+            .and_then(|i| i.get("$ref"))
+            .and_then(|v| v.as_str())
+            .expect("resources items $ref");
+        assert_eq!(items, "#/components/schemas/Project");
         assert!(!components.schemas.contains_key("DataToPaginate"));
     }
 

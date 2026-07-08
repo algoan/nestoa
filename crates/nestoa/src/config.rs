@@ -55,6 +55,16 @@ pub struct Config {
     #[serde(default)]
     pub resolve_packages: Vec<String>,
 
+    /// Generic wrapper type names to treat as transparent: each is lowered to
+    /// its first type argument, discarding the wrapper. This is the config-driven
+    /// counterpart to the built-in passthrough types (`Promise`, `Observable`,
+    /// `Partial`, …) and covers project- or library-specific wrappers whose API
+    /// surface is just the type they wrap — e.g. mongoose's
+    /// `PopulatedDoc<T>` (`T | RawId`), where only the populated `T` is
+    /// meaningful. `Foo<T>` with `["Foo"]` here lowers exactly as `T` would.
+    #[serde(default)]
+    pub passthrough_types: Vec<String>,
+
     /// Extra decorator-name aliases mapped to known handlers. Lets users wire in
     /// custom decorators without modifying the tool. For example, mapping a
     /// project-specific `@MyAuthUser` to the `user` parameter kind tells the
@@ -192,6 +202,7 @@ impl Default for Config {
             resolve_tsconfig_paths: true,
             tsconfig: None,
             resolve_packages: Vec::new(),
+            passthrough_types: Vec::new(),
             info: Info {
                 title: default_title(),
                 version: default_version(),

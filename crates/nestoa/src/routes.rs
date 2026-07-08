@@ -253,6 +253,7 @@ impl<'a> Extractor<'a> {
                         components: self.components,
                         type_env: None,
                         current_owner: None,
+                        passthrough_types: &self.config.passthrough_types,
                     };
                     let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
                     if !schema.is_null() && schema != json!({}) {
@@ -275,6 +276,7 @@ impl<'a> Extractor<'a> {
                     components: self.components,
                     type_env: None,
                     current_owner: None,
+                    passthrough_types: &self.config.passthrough_types,
                 };
                 method_doc
                     .route_mapping
@@ -366,6 +368,7 @@ impl<'a> Extractor<'a> {
             components: self.components,
             type_env: None,
             current_owner: None,
+            passthrough_types: &self.config.passthrough_types,
         };
         let schema = pat_info
             .ts_type
