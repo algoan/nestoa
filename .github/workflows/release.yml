@@ -20,8 +20,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full tag history to check for an existing release
+
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "Resolved version: '$VERSION'"
+          # Semver MAJOR.MINOR.PATCH with optional -prerelease / +build metadata.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid version '$VERSION'. Expected semver X.Y.Z (git tags must be vX.Y.Z, e.g. v0.1.3)."
+            exit 1
+          fi
+          # For manual runs, refuse to re-release a version that already has a
+          # tag. (Tag pushes are exempt: the tag IS the trigger, so it exists.)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists — version $VERSION has already been released. Bump the version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version validated: $VERSION"
+
   build:
     name: Build ${{ matrix.tag }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -53,20 +89,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Resolve version
-        id: version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building version $VERSION"
-
       - name: Stamp Cargo version
-        run: node npm/stamp-cargo-version.js "${{ steps.version.outputs.version }}"
+        run: node npm/stamp-cargo-version.js "${{ needs.validate.outputs.version }}"
 
       - name: Install cross linker
         if: matrix.cross-linker
@@ -91,7 +115,7 @@ jobs:
 
   publish:
     name: Publish to GitHub Packages
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -111,20 +135,9 @@ jobs:
         with:
           path: npm/platforms
 
-      - name: Resolve version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing version $VERSION"
-
       - name: Rewrite packages for GitHub Packages (@algoan scope)
         working-directory: npm
-        run: node prepare-github-publish.js "${{ steps.version.outputs.version }}"
+        run: node prepare-github-publish.js "${{ needs.validate.outputs.version }}"
 
       - name: Publish platform packages
         working-directory: npm
