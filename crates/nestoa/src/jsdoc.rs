@@ -17,6 +17,10 @@ pub struct JsDoc {
     /// `@param name desc` lookup.
     pub params: HashMap<String, String>,
     pub example: Option<String>,
+    /// `@route-mapping{ 'suffix': TypeName, ... }`: ordered (path-suffix, type
+    /// name) pairs letting one method serving several paths declare a distinct
+    /// response type per path. Empty when the tag is absent.
+    pub route_mapping: Vec<(String, String)>,
 }
 
 impl JsDoc {
@@ -34,10 +38,19 @@ impl JsDoc {
                 if let Some((tag_name, tag_body)) = current_tag.take() {
                     doc.consume_tag(&tag_name, tag_body.join("\n").trim());
                 }
-                let mut parts = rest.splitn(2, char::is_whitespace);
-                let name = parts.next().unwrap_or("").to_string();
-                let rest = parts.next().unwrap_or("").to_string();
-                current_tag = Some((name, vec![rest]));
+                // The tag name runs up to the first whitespace or `{`. Allowing
+                // `{` as a boundary lets `@route-mapping{ ... }` attach its
+                // brace-body with no separating space; a whitespace separator is
+                // consumed, while a `{` is kept as the start of the body.
+                let name_end = rest
+                    .find(|c: char| c.is_whitespace() || c == '{')
+                    .unwrap_or(rest.len());
+                let name = rest[..name_end].to_string();
+                let mut body = &rest[name_end..];
+                if let Some(stripped) = body.strip_prefix(char::is_whitespace) {
+                    body = stripped;
+                }
+                current_tag = Some((name, vec![body.to_string()]));
             } else if let Some((_, body)) = current_tag.as_mut() {
                 if !line.is_empty() || !body.is_empty() {
                     body.push(line.to_string());
@@ -85,10 +98,35 @@ impl JsDoc {
                     self.params.insert(name.to_string(), desc);
                 }
             }
+            "route-mapping" => self.route_mapping = parse_route_mapping(body),
             _ => {}
         }
         self.tags.push((name.to_string(), body.to_string()));
     }
+}
+
+/// Parse a `@route-mapping` body of the form
+/// `{ 'suffix': TypeName, 'other/suffix': OtherType }` into ordered
+/// (suffix, type name) pairs. Entries are separated by newlines and/or commas;
+/// each is `key: value` where the key may be quoted. Malformed entries (no
+/// `:`, empty key or value) are skipped so a stray line can't break parsing.
+fn parse_route_mapping(body: &str) -> Vec<(String, String)> {
+    let body = body.trim();
+    let inner = body.strip_prefix('{').unwrap_or(body);
+    let inner = inner.strip_suffix('}').unwrap_or(inner);
+    let mut out = Vec::new();
+    for entry in inner.split(['\n', ',']) {
+        let Some((key, val)) = entry.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+        let val = val.trim();
+        if key.is_empty() || val.is_empty() {
+            continue;
+        }
+        out.push((key.to_string(), val.to_string()));
+    }
+    out
 }
 
 /// Look up the JSDoc block immediately preceding `span` in `source`.
@@ -203,6 +241,52 @@ mod tests {
         assert_eq!(
             doc.params.get("id").map(|s| s.as_str()),
             Some("the identifier")
+        );
+    }
+
+    #[test]
+    fn parses_route_mapping_attached_brace() {
+        // The brace opens with no space after the tag name, and other tags
+        // surround it — both must still parse.
+        let raw = "\n * List pets\n * @route-mapping{\n * 'cats': Cat\n * 'dogs': Dog\n * 'birds': Bird\n * }\n * @param id the identifier\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.summary.as_deref(), Some("List pets"));
+        assert_eq!(
+            doc.route_mapping,
+            vec![
+                ("cats".to_string(), "Cat".to_string()),
+                ("dogs".to_string(), "Dog".to_string()),
+                ("birds".to_string(), "Bird".to_string()),
+            ]
+        );
+        // The surrounding tag is unaffected by the new boundary handling.
+        assert_eq!(
+            doc.params.get("id").map(|s| s.as_str()),
+            Some("the identifier")
+        );
+    }
+
+    #[test]
+    fn parses_route_mapping_with_space_and_multi_segment_keys() {
+        // A space before the brace, double quotes, and multi-segment suffixes.
+        let raw =
+            "\n * @route-mapping {\n * \"cats/latest\": Cat,\n * \"dogs/latest\": Dog\n * }\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(
+            doc.route_mapping,
+            vec![
+                ("cats/latest".to_string(), "Cat".to_string()),
+                ("dogs/latest".to_string(), "Dog".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_route_mapping_leaves_field_empty() {
+        assert!(
+            JsDoc::parse("\n * Just a summary\n ")
+                .route_mapping
+                .is_empty()
         );
     }
 

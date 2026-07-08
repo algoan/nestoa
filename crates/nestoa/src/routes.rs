@@ -261,6 +261,30 @@ impl<'a> Extractor<'a> {
                 }
             }
 
+            // `@route-mapping` lets one method serving several paths return a
+            // distinct schema per path, keyed by a trailing path suffix. Resolve
+            // each mapped type once (resolution registers components), then match
+            // it against each concrete path below.
+            let route_mapping: Vec<(String, Value)> = if method_doc.route_mapping.is_empty() {
+                Vec::new()
+            } else {
+                let mut ctx = SchemaCtx {
+                    project: self.project,
+                    sources: self.sources,
+                    file_starts: self.file_starts,
+                    components: self.components,
+                    type_env: None,
+                    current_owner: None,
+                };
+                method_doc
+                    .route_mapping
+                    .iter()
+                    .map(|(suffix, type_name)| {
+                        (suffix.clone(), ctx.named_type_to_schema(file, type_name))
+                    })
+                    .collect()
+            };
+
             let status_code = http_code.unwrap_or(match method {
                 HttpMethod::Post => 201,
                 HttpMethod::Delete => 204,
@@ -283,7 +307,13 @@ impl<'a> Extractor<'a> {
                 tags: vec![tag.to_string()],
             };
             for full_path in full_paths {
-                let response = response_override(self.config, &interceptor_names, &full_path)
+                // A `@route-mapping` match is the most specific author intent, so
+                // it wins over an interceptor override or the declared return type.
+                let response = route_mapping
+                    .iter()
+                    .find(|(suffix, _)| path_matches_suffix(&full_path, suffix))
+                    .map(|(_, schema)| schema.clone())
+                    .or_else(|| response_override(self.config, &interceptor_names, &full_path))
                     .or_else(|| response_value.clone());
                 out.push(Route {
                     path: full_path,
@@ -563,6 +593,19 @@ fn join_paths(prefix: Option<&str>, base: &str, sub: Option<&str>) -> String {
     formatted
 }
 
+/// Whether an OpenAPI path matches a `@route-mapping` key. The key names a
+/// trailing portion of the path (usually the last segment, e.g. `incomes`, but
+/// possibly several, e.g. `incomes/start`); it matches when the path equals it
+/// or ends with `/<suffix>`. Leading/trailing slashes on the key are ignored.
+fn path_matches_suffix(path: &str, suffix: &str) -> bool {
+    let suffix = suffix.trim_matches('/');
+    if suffix.is_empty() {
+        return false;
+    }
+    let path = path.trim_end_matches('/');
+    path == suffix || path.ends_with(&format!("/{suffix}"))
+}
+
 fn normalize_segment(s: &str) -> String {
     let s = s.trim().trim_matches('/');
     if s.is_empty() {
@@ -798,6 +841,174 @@ mod tests {
         assert_eq!(
             join_paths(None, "files", Some(":fileId/raw")),
             "/files/{fileId}/raw"
+        );
+    }
+
+    #[test]
+    fn matches_route_suffix() {
+        assert!(path_matches_suffix("/pets/{id}/cats", "cats"));
+        assert!(path_matches_suffix("/pets/{id}/cats", "/cats/"));
+        assert!(path_matches_suffix("/pets/{id}/cats/latest", "cats/latest"));
+        assert!(path_matches_suffix("/cats", "cats"));
+        // A bare substring that isn't a trailing segment must not match.
+        assert!(!path_matches_suffix("/pets/{id}/cats", "ats"));
+        assert!(!path_matches_suffix("/pets/{id}/dogs", "cats"));
+        assert!(!path_matches_suffix("/pets/{id}/cats", ""));
+    }
+
+    /// Build a `Project` plus the `sources`/`file_starts` maps JSDoc lookups
+    /// need, from a set of in-memory files, then extract routes + components.
+    fn extract_with_sources(
+        name: &str,
+        files: &[(&str, &str)],
+        entry_rel: &str,
+    ) -> (Vec<Route>, crate::schema::ComponentSchemas) {
+        use crate::config::Config;
+        use crate::parse::ParsingContext;
+        use crate::schema::ComponentSchemas;
+
+        let dir = std::env::temp_dir().join(format!("nestoa-rmap-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        let parser = ParsingContext::default();
+        let mut project = Project::default();
+        let mut sources: HashMap<PathBuf, String> = HashMap::new();
+        let mut file_starts: HashMap<PathBuf, BytePos> = HashMap::new();
+        let mut entry = Vec::new();
+        for (rel, body) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            let parsed = parser.parse_file(&path).unwrap();
+            sources.insert(path.clone(), body.to_string());
+            if let Some(fm) = parser
+                .source_map
+                .get_source_file(&swc_common::FileName::Real(path.clone()))
+            {
+                file_starts.insert(path.clone(), fm.start_pos);
+            }
+            project.add(parsed);
+            if *rel == entry_rel {
+                entry.push(path);
+            }
+        }
+
+        let config = Config::default();
+        let mut components = ComponentSchemas::default();
+        let routes = {
+            let mut ex = Extractor {
+                config: &config,
+                project: &project,
+                entry_files: &entry,
+                sources: &sources,
+                file_starts: &file_starts,
+                components: &mut components,
+            };
+            ex.extract_all()
+        };
+        (routes, components)
+    }
+
+    #[test]
+    fn route_mapping_gives_each_sibling_path_its_own_response() {
+        let controller = r#"
+            import { Cat } from './cat.dto';
+            import { Dog } from './dog.dto';
+
+            @Controller('pets')
+            export class PetsController {
+                /**
+                 * Find a pet detail by kind
+                 * @route-mapping{
+                 * 'cats': Cat
+                 * 'dogs': Dog
+                 * }
+                 */
+                @Get([':id/cats', ':id/dogs'])
+                public async findDetail(): Promise<Cat | Dog> {
+                    return null as any;
+                }
+            }
+        "#;
+        let (routes, components) = extract_with_sources(
+            "per-path",
+            &[
+                ("cat.dto.ts", "export class Cat { meow: boolean; }"),
+                ("dog.dto.ts", "export class Dog { bark: boolean; }"),
+                ("pets.controller.ts", controller),
+            ],
+            "pets.controller.ts",
+        );
+
+        let cats = routes.iter().find(|r| r.path.ends_with("/cats")).unwrap();
+        let dogs = routes.iter().find(|r| r.path.ends_with("/dogs")).unwrap();
+
+        // Each path carries its mapped type as a $ref, not the declared union.
+        assert_eq!(
+            cats.response
+                .as_ref()
+                .and_then(|r| r.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Cat")
+        );
+        assert_eq!(
+            dogs.response
+                .as_ref()
+                .and_then(|r| r.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Dog")
+        );
+        assert!(components.schemas.contains_key("Cat"));
+        assert!(components.schemas.contains_key("Dog"));
+    }
+
+    #[test]
+    fn route_mapping_unmatched_path_falls_back_to_declared_type() {
+        // The mapping only covers `/cats`; the `/dogs` sibling has no entry and
+        // must keep the handler's declared return type.
+        let controller = r#"
+            import { Cat } from './cat.dto';
+
+            @Controller('pets')
+            export class PetsController {
+                /**
+                 * @route-mapping{
+                 * 'cats': Cat
+                 * }
+                 */
+                @Get([':id/cats', ':id/dogs'])
+                public async findDetail(): Promise<Cat> {
+                    return null as any;
+                }
+            }
+        "#;
+        let (routes, _components) = extract_with_sources(
+            "fallback",
+            &[
+                ("cat.dto.ts", "export class Cat { meow: boolean; }"),
+                ("pets.controller.ts", controller),
+            ],
+            "pets.controller.ts",
+        );
+        let cats = routes.iter().find(|r| r.path.ends_with("/cats")).unwrap();
+        let dogs = routes.iter().find(|r| r.path.ends_with("/dogs")).unwrap();
+        // Both resolve to Cat here (declared type is Cat), but via different
+        // routes: cats via the mapping, dogs via the declared return type.
+        assert_eq!(
+            cats.response
+                .as_ref()
+                .and_then(|r| r.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Cat")
+        );
+        assert_eq!(
+            dogs.response
+                .as_ref()
+                .and_then(|r| r.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Cat")
         );
     }
 

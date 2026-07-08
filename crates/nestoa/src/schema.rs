@@ -349,6 +349,19 @@ impl<'a> SchemaCtx<'a> {
         json!({ "x-unresolved": name })
     }
 
+    /// Resolve a bare type name (written as it would appear in source, looked
+    /// up against `file`'s imports) into a schema, registering it as a reusable
+    /// component. An unresolvable name yields an `x-unresolved` placeholder,
+    /// exactly as an unresolved `TsTypeRef` would. Used by `@route-mapping`,
+    /// where the type is named in JSDoc rather than in the AST.
+    pub fn named_type_to_schema(&mut self, file: &Path, type_name: &str) -> Value {
+        if let Some((decl_file, sym)) = self.project.resolve(file, type_name) {
+            self.component_ref(&decl_file, type_name, &sym)
+        } else {
+            json!({ "x-unresolved": type_name })
+        }
+    }
+
     /// Resolve a reference to a named project type into a `$ref`, registering
     /// the type as a reusable component on first encounter.
     ///

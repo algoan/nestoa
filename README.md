@@ -46,6 +46,34 @@ resolved when it is a string literal, a local `const` bound to a string, or a
 `basePath` always wins, and the detection can be turned off with
 `"detectGlobalPrefix": false`.
 
+### Per-path response types (`@route-mapping`)
+
+A single handler can serve several paths (`@Get([':id/cats', ':id/dogs'])`).
+When they all return the same shape nestoa handles this automatically. When each
+path returns a *different* shape — same logic, one method — the declared return
+type is necessarily a union, so nestoa can't tell which path yields which member.
+The `@route-mapping` JSDoc tag resolves this by mapping a **trailing path suffix**
+to the type that path returns:
+
+```ts
+/**
+ * Find a pet detail by kind
+ * @route-mapping{
+ * 'cats': Cat
+ * 'dogs': Dog
+ * 'birds': Bird
+ * }
+ */
+@Get([':id/cats', ':id/dogs', ':id/birds'])
+public async findDetail(...): Promise<Cat | Dog | Bird> { … }
+```
+
+Each key matches when the route path equals it or ends with `/<key>`, so the last
+segment (`cats`) is usually enough; multi-segment suffixes (`cats/latest`) work
+too when the last segment alone is ambiguous. The type name is resolved
+against the controller file's imports and emitted as a `$ref`. Any path with no
+matching entry falls back to the handler's declared return type.
+
 ## How it works
 
 1. **Parse** every `.ts` file in the `include` paths with the swc parser.
@@ -64,7 +92,9 @@ resolved when it is a string literal, a local `const` bound to a string, or a
    enum-member references (`State.OK`), and `Date` (date-time string).
 6. **Carry JSDoc** through to the output: the leading summary becomes
    `summary`, additional paragraphs become `description`, `@param` lines
-   become parameter descriptions, `@deprecated` flips the operation flag.
+   become parameter descriptions, `@deprecated` flips the operation flag,
+   `@internal` / `@private` omit a property, and `@route-mapping` gives each
+   path of a multi-path handler its own response schema (see below).
 7. **Emit** an OpenAPI 3.1 document (`openapi.json` or `.yaml`).
 
 Unresolvable types (typically from external `node_modules`) are surfaced as
