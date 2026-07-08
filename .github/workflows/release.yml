@@ -118,7 +118,7 @@ jobs:
     needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # push the release tag on manual runs
       packages: write
     steps:
       - uses: actions/checkout@v4
@@ -155,3 +155,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish
+
+      # Tag the released commit on manual (workflow_dispatch) runs. Tag pushes
+      # already carry the tag, so this only runs for manual releases — and only
+      # after publishing succeeds, so a failed release leaves no tag behind.
+      - name: Tag release
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          git config user.name "algoanbot"
+          git config user.email "bot@algoan.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
