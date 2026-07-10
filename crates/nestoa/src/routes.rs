@@ -182,10 +182,15 @@ impl<'a> Extractor<'a> {
                     http = Some((method, paths));
                     continue;
                 }
-                if name == "HttpCode"
-                    && let Some(p) = numeric_arg(d)
-                {
-                    http_code = Some(p);
+                if name == "HttpCode" {
+                    // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
+                    // where the argument names a numeric `const` (possibly
+                    // imported from another module, e.g. `@algoan/multi-status`).
+                    http_code = numeric_arg(d).or_else(|| {
+                        ident_arg(d)
+                            .and_then(|c| self.project.resolve_const_number(file, &c))
+                            .map(|v| v as u16)
+                    });
                 }
             }
             let Some((method, sub_paths)) = http else {
@@ -595,6 +600,19 @@ fn numeric_arg(d: &swc_ecma_ast::Decorator) -> Option<u16> {
         return Some(n.value as u16);
     }
     None
+}
+
+/// The identifier name of a decorator's first argument, e.g. `MULTI_STATUS` in
+/// `@HttpCode(MULTI_STATUS)`. `None` when the argument is not a bare identifier.
+fn ident_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
+    let call = match &*d.expr {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    match call.args.first()?.expr.as_ref() {
+        Expr::Ident(i) => Some(i.sym.to_string()),
+        _ => None,
+    }
 }
 
 fn string_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
@@ -1090,6 +1108,37 @@ mod tests {
             ex.extract_all()
         };
         (routes, components)
+    }
+
+    #[test]
+    fn http_code_resolves_imported_numeric_const() {
+        // `@HttpCode(MULTI_STATUS)` where the constant is declared in one module
+        // and re-exported through a barrel (`export *`) — mirrors folder-manager
+        // importing `MULTI_STATUS` from `@algoan/multi-status`.
+        let controller = r#"
+            import { MULTI_STATUS } from './lib';
+
+            @Controller('batch')
+            export class BatchController {
+                @Post()
+                @HttpCode(MULTI_STATUS)
+                public async create(): Promise<string> { return ''; }
+            }
+        "#;
+        let (routes, _components) = extract_with_sources(
+            "httpcode-const",
+            &[
+                ("batch.controller.ts", controller),
+                ("lib.ts", "export * from './constants';"),
+                ("constants.ts", "export const MULTI_STATUS = 207;"),
+            ],
+            "batch.controller.ts",
+        );
+        let post = routes
+            .iter()
+            .find(|r| r.method == HttpMethod::Post)
+            .unwrap();
+        assert_eq!(post.status_code, 207);
     }
 
     #[test]

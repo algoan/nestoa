@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
-    TsTypeLit, TsTypeRef, TsUnionOrIntersectionType,
+    TsTypeLit, TsTypeParamInstantiation, TsTypeRef, TsUnionOrIntersectionType,
 };
 
 use crate::jsdoc::{JsDoc, jsdoc_before};
@@ -71,6 +71,12 @@ impl ComponentSchemas {
 pub struct TypeBinding {
     pub origin_file: std::path::PathBuf,
     pub ty: TsType,
+    /// A pre-lowered schema for this parameter. When set, a reference to the
+    /// parameter emits this value verbatim instead of re-lowering `ty`. Used by
+    /// generic instantiation (`instantiate_generic`), where an argument such as
+    /// `Omit<T, ...>` is lowered under the *outer* env before it shadows the
+    /// parameter it binds, so the resolved shape is captured eagerly.
+    pub resolved: Option<Value>,
 }
 
 /// Map of type-parameter name -> bound concrete type.
@@ -82,7 +88,9 @@ pub struct SchemaCtx<'a> {
     pub file_starts: &'a HashMap<std::path::PathBuf, swc_common::BytePos>,
     pub components: &'a mut ComponentSchemas,
     /// Active generic substitutions. `None` outside interceptor lowering.
-    pub type_env: Option<&'a TypeEnv>,
+    /// Owned so it can be temporarily replaced when instantiating a nested
+    /// generic type (whose own parameters shadow the outer ones).
+    pub type_env: Option<TypeEnv>,
     /// User-configured transparent wrapper types (`Config::passthrough_types`),
     /// each lowered to its first type argument. Extends the built-in passthrough
     /// set (`Promise`, `Observable`, `Partial`, …).
@@ -245,13 +253,18 @@ impl<'a> SchemaCtx<'a> {
         // because bound types come from the concrete side and never reference
         // the interceptor's own parameters (avoids param->param loops).
         if r.type_params.is_none()
-            && let Some(env) = self.type_env
-            && let Some(binding) = env.get(&name)
+            && let Some(binding) = self
+                .type_env
+                .as_ref()
+                .and_then(|env| env.get(&name))
+                .cloned()
         {
-            let origin = binding.origin_file.clone();
-            let ty = binding.ty.clone();
+            // Instantiation captured a pre-lowered shape — emit it directly.
+            if let Some(resolved) = binding.resolved {
+                return resolved;
+            }
             let saved = self.type_env.take();
-            let schema = self.ts_type_to_schema(&origin, &ty);
+            let schema = self.ts_type_to_schema(&binding.origin_file, &binding.ty);
             self.type_env = saved;
             return schema;
         }
@@ -355,6 +368,17 @@ impl<'a> SchemaCtx<'a> {
 
         // Resolve to a project symbol.
         if let Some((decl_file, sym)) = self.project.resolve(file, &name) {
+            // During interceptor response lowering, a named reference carrying
+            // type arguments (e.g. `MultiStatusResponse<Omit<T, ...>>`) is
+            // instantiated: the declaration's own generic parameters are bound
+            // to the arguments and its body inlined per route, so distinct
+            // element types never collapse onto one shared `$ref` component.
+            if self.type_env.is_some()
+                && let Some(args) = &r.type_params
+                && let Some(inlined) = self.instantiate_generic(file, &decl_file, &sym, args)
+            {
+                return inlined;
+            }
             return self.component_ref(&decl_file, &name, &sym);
         }
         // Unknown — leave a permissive placeholder annotated with the name.
@@ -436,6 +460,47 @@ impl<'a> SchemaCtx<'a> {
             .or_default()
             .push(provisional.clone());
         ref_value(&provisional)
+    }
+
+    /// Instantiate a generic project type reference (`Name<Arg1, ...>`) by
+    /// binding the declaration's own type parameters to the supplied arguments
+    /// and inlining its body. Returns `None` when the declaration has no type
+    /// parameters (a non-generic reference, which keeps its shared `$ref`).
+    ///
+    /// Each argument is lowered eagerly under the *current* env before the new
+    /// bindings take effect, so an argument that references an outer parameter
+    /// (`Omit<T, ...>` where `T` is bound by an interceptor) resolves in the
+    /// scope it was written in even though the callee reuses the name `T` for
+    /// its own parameter. The body is then lowered under only the fresh
+    /// bindings, and inlined rather than `$ref`d so distinct instantiations
+    /// (different element types) do not collide on one component.
+    fn instantiate_generic(
+        &mut self,
+        file: &Path,
+        decl_file: &Path,
+        sym: &Symbol,
+        args: &TsTypeParamInstantiation,
+    ) -> Option<Value> {
+        let params = generic_param_names(sym);
+        if params.is_empty() {
+            return None;
+        }
+        let mut new_env: TypeEnv = HashMap::new();
+        for (param, arg) in params.iter().zip(args.params.iter()) {
+            let resolved = self.ts_type_to_schema(file, arg);
+            new_env.insert(
+                param.clone(),
+                TypeBinding {
+                    origin_file: file.to_path_buf(),
+                    ty: (**arg).clone(),
+                    resolved: Some(resolved),
+                },
+            );
+        }
+        let saved = self.type_env.replace(new_env);
+        let schema = self.symbol_to_schema(decl_file, sym);
+        self.type_env = saved;
+        Some(schema)
     }
 
     fn type_lit_schema(&mut self, file: &Path, lit: &TsTypeLit) -> Value {
@@ -704,6 +769,20 @@ fn entity_name(e: &TsEntityName) -> String {
             format!("{}.{}", entity_name(&q.left), q.right.sym)
         }
     }
+}
+
+/// The names of a declaration's own generic type parameters, in order
+/// (`["T"]` for `interface Foo<T>`). Empty for a non-generic declaration.
+fn generic_param_names(sym: &Symbol) -> Vec<String> {
+    let type_params = match sym {
+        Symbol::Interface(i) => i.type_params.as_ref(),
+        Symbol::TypeAlias(a) => a.type_params.as_ref(),
+        Symbol::Class(c) => c.class.type_params.as_ref(),
+        Symbol::Enum(_) => None,
+    };
+    type_params
+        .map(|tp| tp.params.iter().map(|p| p.name.sym.to_string()).collect())
+        .unwrap_or_default()
 }
 
 fn keyword_schema(k: TsKeywordTypeKind) -> Value {

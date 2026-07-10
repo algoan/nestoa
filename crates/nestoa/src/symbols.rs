@@ -32,6 +32,9 @@ pub struct ImportBinding {
 #[derive(Clone, Default)]
 pub struct FileSymbols {
     pub declared: HashMap<String, Symbol>,
+    /// Numeric `const` values (`export const MULTI_STATUS = 207`), used to
+    /// resolve identifier arguments to decorators like `@HttpCode(MULTI_STATUS)`.
+    pub const_numbers: HashMap<String, f64>,
     pub imports: HashMap<String, ImportBinding>,
     /// `export { Foo } from "./other"` re-exports: local-name -> ImportBinding
     pub re_exports: HashMap<String, ImportBinding>,
@@ -120,6 +123,47 @@ impl Project {
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
         self.resolve_inner(file, name, &mut visited)
+    }
+
+    /// Resolve a numeric `const` by name, following imports and re-exports the
+    /// same way type resolution does. Used for decorator arguments that name a
+    /// constant, e.g. `@HttpCode(MULTI_STATUS)` where `MULTI_STATUS = 207` is
+    /// declared in (and re-exported from) another module.
+    pub fn resolve_const_number(&self, file: &Path, name: &str) -> Option<f64> {
+        let mut visited: std::collections::HashSet<(PathBuf, String)> =
+            std::collections::HashSet::new();
+        self.resolve_const_inner(file, name, &mut visited)
+    }
+
+    fn resolve_const_inner(
+        &self,
+        file: &Path,
+        name: &str,
+        visited: &mut std::collections::HashSet<(PathBuf, String)>,
+    ) -> Option<f64> {
+        if !visited.insert((file.to_path_buf(), name.to_string())) {
+            return None;
+        }
+        let fs = self.symbols.get(file)?;
+        if let Some(v) = fs.const_numbers.get(name) {
+            return Some(*v);
+        }
+        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
+            && let Some(target) = self.resolve_module(file, &binding.specifier)
+        {
+            let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
+            if let Some(found) = self.resolve_const_inner(&target, &next_name, visited) {
+                return Some(found);
+            }
+        }
+        for spec in &fs.star_re_exports {
+            if let Some(target) = self.resolve_module(file, spec)
+                && let Some(found) = self.resolve_const_inner(&target, name, visited)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     fn resolve_inner(
@@ -247,7 +291,30 @@ fn collect_decl(decl: &Decl, fs: &mut FileSymbols) {
             fs.declared
                 .insert(e.id.sym.to_string(), Symbol::Enum(Arc::new(*e.clone())));
         }
+        Decl::Var(v) => {
+            // Record numeric `const NAME = <literal>` so decorator arguments that
+            // reference the constant (e.g. `@HttpCode(MULTI_STATUS)`) can be
+            // resolved to their value, including across module boundaries.
+            for d in &v.decls {
+                if let (swc_ecma_ast::Pat::Ident(id), Some(init)) = (&d.name, &d.init)
+                    && let Some(n) = numeric_expr(init)
+                {
+                    fs.const_numbers.insert(id.id.sym.to_string(), n);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// The numeric value of an expression that is a number literal, optionally
+/// negated (`207`, `-1`). Returns `None` for anything else.
+fn numeric_expr(expr: &swc_ecma_ast::Expr) -> Option<f64> {
+    use swc_ecma_ast::{Expr, Lit, UnaryOp};
+    match expr {
+        Expr::Lit(Lit::Num(n)) => Some(n.value),
+        Expr::Unary(u) if matches!(u.op, UnaryOp::Minus) => numeric_expr(&u.arg).map(|v| -v),
+        _ => None,
     }
 }
 

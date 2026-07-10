@@ -168,7 +168,7 @@ pub fn rewrite_response(
         sources,
         file_starts,
         components,
-        type_env: Some(&env),
+        type_env: Some(env),
         current_owner: None,
         passthrough_types: &config.passthrough_types,
     };
@@ -180,14 +180,18 @@ pub fn rewrite_response(
     }
 }
 
-/// Lower the (possibly generic) `Out` type. When it is a bare reference to a
-/// project type, inline that declaration's body under the active substitution
-/// env rather than emitting a `$ref` to a shared named component — a generic
-/// wrapper like `PaginatedData<T>` must not collapse every element type onto a
-/// single component. Falls back to the normal lowering for everything else
-/// (arrays, type literals, built-ins such as `Omit`, unions, …).
+/// Lower the (possibly generic) `Out` type. When it is a bare, *non-generic*
+/// reference to a project type, inline that declaration's body under the active
+/// substitution env rather than emitting a `$ref` to a shared named component.
+/// A *generic* reference (e.g. `PaginatedData<T>` or `MultiStatusResponse<Omit<
+/// T, ...>>`) is instead routed through the normal lowering, which — with the
+/// env active — instantiates it: it binds the callee's own parameters to the
+/// arguments and inlines per route, so distinct element types never collapse
+/// onto a single component. Everything else (arrays, type literals, built-ins
+/// such as `Omit`, unions, …) also uses the normal lowering.
 fn lower_inline(ctx: &mut SchemaCtx, file: &Path, ty: &TsType) -> Value {
     if let TsType::TsTypeRef(r) = ty
+        && r.type_params.is_none()
         && let Some(name) = ref_ident(&r.type_name)
         && let Some((decl_file, sym)) = ctx.project.resolve(file, &name)
     {
@@ -292,6 +296,7 @@ fn unify(
             TypeBinding {
                 origin_file: concrete_file.to_path_buf(),
                 ty: concrete.clone(),
+                resolved: None,
             },
         );
         return true;
@@ -723,6 +728,80 @@ mod tests {
             let resp = route.response.as_ref().expect("response schema");
             assert_eq!(resp.get("type").and_then(|v| v.as_str()), Some("string"));
         }
+    }
+
+    // A generic interceptor whose `Out` nests a generic element type and reshapes
+    // it with `Omit` — the multi-status pattern. `NestInterceptor<T[],
+    // Envelope<Omit<T, 'validity'>>>` must instantiate `Envelope`/`Element` with
+    // the bound element type per route (not collapse onto a shared component) and
+    // apply the `Omit`.
+    const MULTISTATUS_DTS: &str = r#"
+        export interface Base { validity: boolean; }
+        export interface Element<T> {
+            status: number;
+            resource: T;
+        }
+        export interface Envelope<T> {
+            elements: Element<T>[];
+            total: number;
+        }
+        export declare class MultiStatusInterceptor<T extends Base>
+            implements NestInterceptor<T[], Envelope<Omit<T, 'validity'>>> {
+            intercept(): unknown;
+        }
+    "#;
+
+    const WIDGET_DTO: &str = "export class Widget { id: string; validity: boolean; }";
+
+    fn multistatus_controller() -> String {
+        r#"
+            import { MultiStatusInterceptor } from './multistatus';
+            import { Widget } from './widget.dto';
+
+            @Controller('widgets')
+            export class WidgetsController {
+                @Post()
+                @UseInterceptors(MultiStatusInterceptor)
+                public async post(): Promise<Widget[]> {
+                    return null as any;
+                }
+            }
+        "#
+        .to_string()
+    }
+
+    #[test]
+    fn generic_interceptor_instantiates_nested_element_type() {
+        let (project, _dir, paths) = build(
+            "multistatus",
+            &[
+                ("multistatus.d.ts", MULTISTATUS_DTS),
+                ("widget.dto.ts", WIDGET_DTO),
+                ("widgets.controller.ts", &multistatus_controller()),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let route = routes.iter().find(|r| r.path == "/widgets").unwrap();
+        let resp = route.response.as_ref().expect("response schema");
+
+        // The envelope shape is present: elements[].resource is the bound element
+        // type with the interceptor's `Omit<T, 'validity'>` applied.
+        let resource = &resp["properties"]["elements"]["items"]["properties"]["resource"];
+        assert!(
+            resource["properties"].get("id").is_some(),
+            "element resource keeps `id`"
+        );
+        assert!(
+            resource["properties"].get("validity").is_none(),
+            "Omit strips `validity` from the element resource"
+        );
+
+        // Generic wrappers are inlined per route, never emitted as shared
+        // components (which would collide across controllers with a different T).
+        assert!(!components.schemas.contains_key("Envelope"));
+        assert!(!components.schemas.contains_key("Element"));
     }
 
     #[test]
