@@ -79,6 +79,148 @@ pub struct Config {
     /// request-body reshaping that the type signature cannot express.
     #[serde(default)]
     pub interceptors: indexmap::IndexMap<String, InterceptorConfig>,
+
+    /// Automatic error-response generation. Every field has a recon-grounded
+    /// default, so an absent `errorResponses` still emits the deterministic
+    /// ("Tier A") set. See `ErrorResponses`.
+    #[serde(default)]
+    pub error_responses: ErrorResponses,
+}
+
+/// Configuration for automatic error-response generation. Recovers the
+/// `400`/`401`/`403`/`404`/`409`/`413`/`422` responses NestJS produces but that
+/// never appear in a handler's return type. Every field defaults to a value
+/// grounded in the surveyed `@algoan` services, so an empty `errorResponses`
+/// (or none at all) still auto-emits the deterministic set: `401` for guarded
+/// routes, `403` for `@Roles`, `400` for validated bodies, and the pipe-mapped
+/// `404`/`400`. The map only *tunes* names/scope and *adds* the service-thrown
+/// codes a controller signature cannot reveal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ErrorResponses {
+    /// Master switch. When false, no error responses are emitted at all.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// How authentication is wired, which decides where `401` applies:
+    /// - `global`: every route is protected (the app registers an `APP_GUARD`
+    ///   auth guard). Emit `401` unless the route opts out.
+    /// - `per-controller`: only routes whose controller/method carries a guard
+    ///   decorator naming one of `authGuards` (`@UseGuards(AuthGuard)`).
+    /// - `none`: no authentication anywhere; never emit `401`.
+    #[serde(default)]
+    pub auth: AuthScope,
+
+    /// In `per-controller` mode, the guard class names (as written inside
+    /// `@UseGuards(...)`) that mark a route as authenticated.
+    #[serde(default = "default_auth_guards")]
+    pub auth_guards: Vec<String>,
+
+    /// Decorators that opt a route (or its whole controller) out of `401` — e.g.
+    /// `@Unprotected()`.
+    #[serde(default = "default_auth_opt_out")]
+    pub auth_opt_out: Vec<String>,
+
+    /// Decorators whose presence on a route/controller implies `403`. Our role
+    /// guard requires a route-level role, so `@Roles({...})` is a reliable local
+    /// signal even though the guard itself is global.
+    #[serde(default = "default_role_decorators")]
+    pub role_decorators: Vec<String>,
+
+    /// Emit `400` for any route with a request-body DTO, on the assumption that
+    /// a global `ValidationPipe` validates it (true for every surveyed service).
+    #[serde(default = "default_true")]
+    pub validation: bool,
+
+    /// Scan each handler's own body for `throw new <HttpException>(...)` and add
+    /// the matching status (e.g. a `throw new UnprocessableEntityException()` in
+    /// the controller → `422`). Only the handler body is read, not called
+    /// services, so it is deterministic and side-effect free. Default true.
+    #[serde(default = "default_true")]
+    pub scan_throws: bool,
+
+    /// Pipe class name -> the status it throws on invalid input, applied to
+    /// pipes on `@Param`/`@Query`. Defaults cover the `@algoan` pipes (which
+    /// throw `404`, not `400`) and Nest's built-in parse pipes.
+    #[serde(default = "default_pipes")]
+    pub pipes: indexmap::IndexMap<String, u16>,
+
+    /// Filter-level codes not derivable from any route construct (e.g. `413`
+    /// from an Express body-size limit). Applied to every route, optionally
+    /// gated on a path suffix. Empty by default (`500` is intentionally never a
+    /// default — it is a processing failure, not a documented outcome).
+    #[serde(default)]
+    pub global: Vec<GlobalError>,
+
+    /// Per-path additions for service-thrown ("Tier B") errors the controller
+    /// signature cannot reveal (the lone `409`, most `422`, business `404`).
+    /// Empty by default; the source-level counterpart is the `@throws` JSDoc tag.
+    #[serde(default)]
+    pub routes: Vec<RouteErrors>,
+}
+
+impl Default for ErrorResponses {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth: AuthScope::default(),
+            auth_guards: default_auth_guards(),
+            auth_opt_out: default_auth_opt_out(),
+            role_decorators: default_role_decorators(),
+            validation: true,
+            scan_throws: true,
+            pipes: default_pipes(),
+            global: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+}
+
+/// How authentication is wired across the service. See `ErrorResponses::auth`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthScope {
+    /// Every route is protected by a global guard.
+    #[default]
+    Global,
+    /// Only routes whose controller/method carries an auth-guard decorator.
+    PerController,
+    /// No authentication; never emit `401`.
+    None,
+}
+
+/// A filter-level error applied to every route. See `ErrorResponses::global`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GlobalError {
+    /// The HTTP status code to emit.
+    pub status: u16,
+    /// Only apply to routes whose path ends with this suffix (e.g. `/logo`).
+    #[serde(default)]
+    pub when_path_ends_with: Option<String>,
+    /// Response description; a sensible default is used when omitted.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Per-path Tier-B error additions. See `ErrorResponses::routes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouteErrors {
+    /// Match routes whose full path ends with this suffix (e.g. `/aggregate`).
+    #[serde(default)]
+    pub when_path_ends_with: Option<String>,
+    /// Match the route whose full path equals this exactly.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Restrict the match to a single HTTP method (e.g. `post`), so sibling
+    /// routes sharing a path — `POST /customers` (which `409`/`422`s) vs
+    /// `GET /customers` (which doesn't) — can be targeted independently. Matched
+    /// case-insensitively. When omitted, every method on the path matches.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Status codes to add to every matching route.
+    pub add: Vec<u16>,
 }
 
 /// Per-interceptor handling. See `Config::interceptors`.
@@ -190,6 +332,35 @@ fn default_true() -> bool {
     true
 }
 
+fn default_auth_guards() -> Vec<String> {
+    vec!["AuthGuard".into()]
+}
+
+fn default_auth_opt_out() -> Vec<String> {
+    vec!["Unprotected".into()]
+}
+
+fn default_role_decorators() -> Vec<String> {
+    vec!["Roles".into()]
+}
+
+/// Pipe -> rejection status. The `@algoan` `ParseObjectIdPipe`/`ParseDatePipe`
+/// throw `404` (not the conventional `400`); Nest's built-in parse pipes and
+/// `ValidationPipe` throw `400`.
+fn default_pipes() -> indexmap::IndexMap<String, u16> {
+    let mut m = indexmap::IndexMap::new();
+    m.insert("ParseObjectIdPipe".into(), 404);
+    m.insert("ParseDatePipe".into(), 404);
+    m.insert("ParseEnumPipe".into(), 400);
+    m.insert("ParseBoolPipe".into(), 400);
+    m.insert("ParseIntPipe".into(), 400);
+    m.insert("ParseFloatPipe".into(), 400);
+    m.insert("ParseUUIDPipe".into(), 400);
+    m.insert("ParseArrayPipe".into(), 400);
+    m.insert("ValidationPipe".into(), 400);
+    m
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -210,6 +381,7 @@ impl Default for Config {
             },
             decorator_aliases: indexmap::IndexMap::new(),
             interceptors: indexmap::IndexMap::new(),
+            error_responses: ErrorResponses::default(),
         }
     }
 }
@@ -412,6 +584,43 @@ mod tests {
         let err = Config::load(Some(Path::new("nestoa.config.json")), &dir);
         assert!(err.is_err(), "missing extends target should error");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn error_responses_defaults_when_absent() {
+        let cfg: Config = serde_json::from_str("{}").expect("empty config parses");
+        let er = &cfg.error_responses;
+        assert!(er.enabled);
+        assert_eq!(er.auth, AuthScope::Global);
+        assert_eq!(er.auth_opt_out, vec!["Unprotected".to_string()]);
+        assert_eq!(er.role_decorators, vec!["Roles".to_string()]);
+        assert!(er.validation);
+        assert_eq!(er.pipes.get("ParseObjectIdPipe"), Some(&404));
+        assert_eq!(er.pipes.get("ParseEnumPipe"), Some(&400));
+    }
+
+    #[test]
+    fn error_responses_partial_override_keeps_other_defaults() {
+        let cfg: Config = serde_json::from_str(
+            r#"{ "errorResponses": {
+                "auth": "per-controller",
+                "pipes": { "ParseObjectIdPipe": 400 },
+                "routes": [ { "whenPathEndsWith": "/aggregate", "add": [409] } ],
+                "global": [ { "status": 413, "whenPathEndsWith": "/logo" } ]
+            } }"#,
+        )
+        .expect("partial errorResponses parses");
+        let er = &cfg.error_responses;
+        assert_eq!(er.auth, AuthScope::PerController);
+        assert_eq!(er.pipes.get("ParseObjectIdPipe"), Some(&400)); // overridden
+        assert!(er.validation); // default preserved
+        assert_eq!(er.auth_opt_out, vec!["Unprotected".to_string()]); // default preserved
+        assert_eq!(er.routes[0].add, vec![409]);
+        assert_eq!(
+            er.routes[0].when_path_ends_with.as_deref(),
+            Some("/aggregate")
+        );
+        assert_eq!(er.global[0].status, 413);
     }
 
     #[test]

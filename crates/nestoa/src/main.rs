@@ -1,5 +1,6 @@
 mod config;
 mod discover;
+mod errors;
 mod globalprefix;
 mod interceptors;
 mod jsdoc;

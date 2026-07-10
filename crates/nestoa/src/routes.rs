@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 use swc_common::BytePos;
 use swc_ecma_ast::{
-    Class, ClassMember, Expr, ExprOrSpread, Lit, MethodKind, Param, Pat, PropName, TsEntityName,
-    TsType, TsTypeRef,
+    Callee, Class, ClassMember, Decorator, Expr, ExprOrSpread, Function, Lit, MethodKind, Param,
+    Pat, PropName, TsEntityName, TsType, TsTypeRef,
 };
+use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::config::{Config, DecoratorAlias};
+use crate::config::{AuthScope, Config, DecoratorAlias};
+use crate::errors::{self, ERROR_SCHEMA_NAME};
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
@@ -69,6 +71,10 @@ pub struct Route {
     pub response: Option<Value>,
     pub status_code: u16,
     pub tags: Vec<String>,
+    /// Error responses (`status -> description`), reconstructed from guards,
+    /// pipes, validation, and declared throws. Every one references the shared
+    /// `Error` component. Sorted by status for deterministic output.
+    pub errors: BTreeMap<u16, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +156,14 @@ impl<'a> Extractor<'a> {
         // `@UseInterceptors(...)` applied at the controller level — these run
         // before any method-level ones, so they lead the combined list.
         let class_interceptors = collect_interceptors(&class.decorators);
+        // Controller-level error signals: a decorator on the class applies to
+        // every method (auth opt-out, roles, and — in per-controller auth mode —
+        // an `@UseGuards(AuthGuard)`). Computed to plain bools so no borrow of
+        // `self.config` is held across the `&mut self` calls in the loop below.
+        let er_cfg = &self.config.error_responses;
+        let class_opted_out = has_any_decorator(&class.decorators, &er_cfg.auth_opt_out);
+        let class_has_roles = has_any_decorator(&class.decorators, &er_cfg.role_decorators);
+        let class_guarded = has_use_guards(&class.decorators, &er_cfg.auth_guards);
         for member in &class.body {
             let ClassMember::Method(m) = member else {
                 continue;
@@ -293,6 +307,34 @@ impl<'a> Extractor<'a> {
                 _ => 200,
             });
 
+            // Error-response signals for this method (path-independent parts).
+            // The auth opt-out and role decorators apply if present on either the
+            // method or its controller; `auth_active` follows the configured
+            // scope. Pipe names come from every parameter's decorators.
+            let er = &self.config.error_responses;
+            let opted_out =
+                class_opted_out || has_any_decorator(&m.function.decorators, &er.auth_opt_out);
+            let has_roles =
+                class_has_roles || has_any_decorator(&m.function.decorators, &er.role_decorators);
+            let auth_active = match er.auth {
+                AuthScope::Global => true,
+                AuthScope::PerController => {
+                    class_guarded || has_use_guards(&m.function.decorators, &er.auth_guards)
+                }
+                AuthScope::None => false,
+            };
+            let pipe_names: Vec<String> = m
+                .function
+                .params
+                .iter()
+                .flat_map(param_pipe_names)
+                .collect();
+            let scanned_throws: Vec<u16> = if er.scan_throws {
+                scanned_throw_statuses(&m.function)
+            } else {
+                Vec::new()
+            };
+
             // Per-path response is filled in below: an interceptor may override
             // it for only some of the route's sibling paths (e.g. a signing
             // interceptor that rewrites the body solely on the `/jws` variant).
@@ -307,7 +349,9 @@ impl<'a> Extractor<'a> {
                 response: None,
                 status_code,
                 tags: vec![tag.to_string()],
+                errors: BTreeMap::new(),
             };
+            let has_body = template.request_body.is_some();
             for full_path in full_paths {
                 // A `@route-mapping` match is the most specific author intent, so
                 // it wins over an interceptor override or the declared return type.
@@ -317,9 +361,22 @@ impl<'a> Extractor<'a> {
                     .map(|(_, schema)| schema.clone())
                     .or_else(|| response_override(self.config, &interceptor_names, &full_path))
                     .or_else(|| response_value.clone());
+                let signals = errors::RouteSignals {
+                    auth_active,
+                    auth_opted_out: opted_out,
+                    has_roles,
+                    has_body,
+                    pipes: &pipe_names,
+                    throws: &method_doc.throws,
+                    scanned_throws: &scanned_throws,
+                    method: method.as_lower(),
+                    path: &full_path,
+                };
+                let route_errors = errors::compute(&signals, er);
                 out.push(Route {
                     path: full_path,
                     response,
+                    errors: route_errors,
                     ..template.clone()
                 });
             }
@@ -552,6 +609,99 @@ fn string_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
     None
 }
 
+/// Whether any decorator in `decorators` has one of the given names.
+fn has_any_decorator(decorators: &[Decorator], names: &[String]) -> bool {
+    decorators
+        .iter()
+        .any(|d| names.iter().any(|n| decorator_name(d) == *n))
+}
+
+/// Whether a `@UseGuards(...)` decorator lists one of the given guard class
+/// names (e.g. `AuthGuard`). Guards may be written as a bare identifier, a
+/// `new Guard()`, or a `Guard(...)` factory call.
+fn has_use_guards(decorators: &[Decorator], guards: &[String]) -> bool {
+    for d in decorators {
+        if decorator_name(d) == "UseGuards"
+            && let Expr::Call(call) = &*d.expr
+        {
+            let mut names = Vec::new();
+            for arg in &call.args {
+                collect_class_idents(&arg.expr, &mut names);
+            }
+            if names.iter().any(|n| guards.contains(n)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pipe class names applied to a parameter's decorators (`@Param('id', new
+/// ParseObjectIdPipe())` → `["ParseObjectIdPipe"]`). The field-name selector
+/// (a string/number literal) contributes nothing.
+fn param_pipe_names(p: &Param) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in &p.decorators {
+        if let Expr::Call(call) = &*d.expr {
+            for arg in &call.args {
+                collect_class_idents(&arg.expr, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// HTTP status codes thrown directly in a handler body via `throw new
+/// <HttpException>(...)`, mapped through `errors::exception_status`. The whole
+/// function body is scanned (including nested blocks and closures), so a throw
+/// guarded by an `if` is still surfaced; only the handler's own body is read —
+/// calls into services are not followed. Sorted and de-duplicated.
+fn scanned_throw_statuses(func: &Function) -> Vec<u16> {
+    let mut finder = ThrowFinder { codes: Vec::new() };
+    func.visit_with(&mut finder);
+    finder.codes.sort_unstable();
+    finder.codes.dedup();
+    finder.codes
+}
+
+struct ThrowFinder {
+    codes: Vec<u16>,
+}
+
+impl Visit for ThrowFinder {
+    fn visit_throw_stmt(&mut self, n: &swc_ecma_ast::ThrowStmt) {
+        if let Expr::New(new) = n.arg.as_ref()
+            && let Expr::Ident(i) = new.callee.as_ref()
+            && let Some(code) = errors::exception_status(i.sym.as_ref())
+        {
+            self.codes.push(code);
+        }
+        n.visit_children_with(self);
+    }
+}
+
+/// Push the class-name identifier(s) referenced by `expr` — a bare `Ident`, a
+/// `new X()`, or an `X(...)` call — onto `out`. Literals and other expressions
+/// contribute nothing.
+fn collect_class_idents(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Ident(i) => out.push(i.sym.to_string()),
+        Expr::New(n) => {
+            if let Expr::Ident(i) = &*n.callee {
+                out.push(i.sym.to_string());
+            }
+        }
+        Expr::Call(c) => {
+            if let Callee::Expr(e) = &c.callee
+                && let Expr::Ident(i) = &**e
+            {
+                out.push(i.sym.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
     if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
         &s[..s.len() - suffix.len()]
@@ -619,7 +769,15 @@ fn normalize_segment(s: &str) -> String {
 }
 
 /// Convert routes + components into an OpenAPI 3.1 document.
-pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchemas) -> Value {
+pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
+    // Register the shared error-body schema once, if any route emits an error
+    // response. Tree-shaking below drops it if nothing ends up referencing it.
+    if routes.iter().any(|r| !r.errors.is_empty()) {
+        components
+            .schemas
+            .entry(ERROR_SCHEMA_NAME.to_string())
+            .or_insert_with(errors::error_schema);
+    }
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
     for r in routes {
         let entry = paths.entry(r.path.clone()).or_default();
@@ -697,6 +855,26 @@ pub fn to_openapi(config: &Config, routes: &[Route], components: ComponentSchema
             status.insert("content".into(), Value::Object(content));
         }
         responses.insert(r.status_code.to_string(), Value::Object(status));
+        // Error responses: each references the shared `Error` component so the
+        // body shape is documented once. A code that somehow coincides with the
+        // success status never overwrites it (the success entry was inserted
+        // first and `entry` is a no-op then).
+        for (code, description) in &r.errors {
+            if *code == r.status_code {
+                continue;
+            }
+            let mut status = Map::new();
+            status.insert("description".into(), Value::String(description.clone()));
+            let mut content = Map::new();
+            let mut media = Map::new();
+            media.insert(
+                "schema".into(),
+                json!({ "$ref": format!("#/components/schemas/{ERROR_SCHEMA_NAME}") }),
+            );
+            content.insert("application/json".into(), Value::Object(media));
+            status.insert("content".into(), Value::Object(content));
+            responses.insert(code.to_string(), Value::Object(status));
+        }
         op.insert("responses".into(), Value::Object(responses));
         entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
@@ -915,6 +1093,71 @@ mod tests {
     }
 
     #[test]
+    fn error_responses_are_emitted_per_route_and_share_error_component() {
+        let controller = r#"
+            import { CreateDto } from './create.dto';
+
+            @Controller('items')
+            export class ItemsController {
+                @Get(':id')
+                @Roles({ roles: ['reader'] })
+                public async findOne(@Param('id', new ParseObjectIdPipe()) id: string): Promise<string> {}
+
+                @Post()
+                @Unprotected()
+                public async create(@Body() dto: CreateDto): Promise<string> {}
+
+                @Get(':id/scores')
+                @Roles({ roles: ['reader'] })
+                public async scores(@Param('id', new ParseObjectIdPipe()) id: string): Promise<string> {
+                    if (disabled) {
+                        throw new UnprocessableEntityException('product disabled');
+                    }
+                    return '';
+                }
+            }
+        "#;
+        let dto = "export interface CreateDto { name: string; }";
+        let (routes, components) = extract_with_sources(
+            "errors-e2e",
+            &[("items.controller.ts", controller), ("create.dto.ts", dto)],
+            "items.controller.ts",
+        );
+
+        let get = routes.iter().find(|r| r.method == HttpMethod::Get).unwrap();
+        // Global auth (401) + @Roles (403) + ParseObjectIdPipe (404). No body → no 400.
+        assert_eq!(
+            get.errors.keys().copied().collect::<Vec<_>>(),
+            vec![401, 403, 404]
+        );
+
+        let post = routes
+            .iter()
+            .find(|r| r.method == HttpMethod::Post)
+            .unwrap();
+        // @Unprotected suppresses 401; no @Roles; a @Body DTO yields 400.
+        assert_eq!(post.errors.keys().copied().collect::<Vec<_>>(), vec![400]);
+
+        // The scores route throws UnprocessableEntityException in its body → 422
+        // is detected on top of auth (401), role (403), and pipe (404).
+        let scores = routes.iter().find(|r| r.path.ends_with("/scores")).unwrap();
+        assert_eq!(
+            scores.errors.keys().copied().collect::<Vec<_>>(),
+            vec![401, 403, 404, 422]
+        );
+
+        // The shared Error component is registered and referenced.
+        let doc = to_openapi(&crate::config::Config::default(), &routes, components);
+        assert_eq!(
+            doc["components"]["schemas"]["Error"]["properties"]["code"]["type"],
+            "string"
+        );
+        let get_404 = &doc["paths"]["/items/{id}"]["get"]["responses"]["404"]["content"]["application/json"]
+            ["schema"]["$ref"];
+        assert_eq!(get_404, "#/components/schemas/Error");
+    }
+
+    #[test]
     fn route_mapping_gives_each_sibling_path_its_own_response() {
         let controller = r#"
             import { Cat } from './cat.dto';
@@ -1117,6 +1360,7 @@ mod tests {
             response: None,
             status_code: 200,
             tags: vec![],
+            errors: BTreeMap::new(),
         }
     }
 

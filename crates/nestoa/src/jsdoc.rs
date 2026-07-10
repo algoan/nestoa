@@ -21,6 +21,11 @@ pub struct JsDoc {
     /// name) pairs letting one method serving several paths declare a distinct
     /// response type per path. Empty when the tag is absent.
     pub route_mapping: Vec<(String, String)>,
+    /// `@throws <status> [description]` (aliases `@httpError`, `@exception`):
+    /// error responses a handler produces by throwing — including ones thrown
+    /// deep in called service code, which no static route analysis can see. Each
+    /// entry is (status code, optional description). Empty when the tag is absent.
+    pub throws: Vec<(u16, Option<String>)>,
 }
 
 impl JsDoc {
@@ -99,6 +104,11 @@ impl JsDoc {
                 }
             }
             "route-mapping" => self.route_mapping = parse_route_mapping(body),
+            "throws" | "httpError" | "exception" => {
+                if let Some(entry) = parse_throws(body) {
+                    self.throws.push(entry);
+                }
+            }
             _ => {}
         }
         self.tags.push((name.to_string(), body.to_string()));
@@ -127,6 +137,28 @@ fn parse_route_mapping(body: &str) -> Vec<(String, String)> {
         out.push((key.to_string(), val.to_string()));
     }
     out
+}
+
+/// Parse a `@throws` body into (status, optional description). Accepts both the
+/// JSDoc `{...}` type-brace form (`@throws {409} Conflict`) and a bare leading
+/// token (`@throws 409 Conflict`). Returns `None` when the leading token is not
+/// a numeric status, so `@throws {ConflictException} ...` (no code) is skipped
+/// rather than mis-parsed.
+fn parse_throws(body: &str) -> Option<(u16, Option<String>)> {
+    let body = body.trim();
+    let (code_tok, rest) = if let Some(after) = body.strip_prefix('{') {
+        let (inside, rest) = after.split_once('}')?;
+        (inside.trim(), rest.trim())
+    } else {
+        let mut parts = body.splitn(2, char::is_whitespace);
+        (
+            parts.next().unwrap_or("").trim(),
+            parts.next().unwrap_or("").trim(),
+        )
+    };
+    let status: u16 = code_tok.parse().ok()?;
+    let desc = (!rest.is_empty()).then(|| rest.to_string());
+    Some((status, desc))
 }
 
 /// Look up the JSDoc block immediately preceding `span` in `source`.
@@ -288,6 +320,25 @@ mod tests {
                 .route_mapping
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parses_throws_tag_variants() {
+        let raw = "\n * Trigger the thing\n * @throws 409 Conflict when already aggregated\n * @throws {422} product disabled\n * @throws 404\n * @exception {ConflictException} no numeric code, skipped\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(
+            doc.throws,
+            vec![
+                (409, Some("Conflict when already aggregated".to_string())),
+                (422, Some("product disabled".to_string())),
+                (404, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_throws_leaves_field_empty() {
+        assert!(JsDoc::parse("\n * Just a summary\n ").throws.is_empty());
     }
 
     #[test]
