@@ -87,6 +87,55 @@ too when the last segment alone is ambiguous. The type name is resolved
 against the controller file's imports and emitted as a `$ref`. Any path with no
 matching entry falls back to the handler's declared return type.
 
+### Interceptors
+
+A NestJS interceptor can reshape the payload between the handler and the wire,
+so the handler's declared return type is not what the client receives. nestoa
+recovers the real response from the interceptor's type signature: for a class
+`implements NestInterceptor<In, Out>`, it unifies the handler's (Promise /
+Observable-unwrapped) return type against `In` to bind the interceptor's generic
+parameters, then lowers `Out` as the response schema.
+
+Lowering `Out` performs **generic instantiation** — a named type carrying
+arguments (`PaginatedData<T>`, or `MultiStatusResponse<Omit<T, 'validity'>>`)
+binds the referenced declaration's own parameters to those arguments and is
+inlined *per route*, so utility types like `Omit` applied to a bound parameter
+resolve and two controllers using the same interceptor with different element
+types never collide on one component. For example `@algoan/multi-status`'s
+`MultiStatusInterceptor<T>` (`T[]` → `MultiStatusResponse<Omit<T, …>>`) yields
+the batch envelope with each element's `resource` set to the controller's own
+DTO, and `@HttpCode(MULTI_STATUS)` on the handler sets the status to `207` (the
+argument may name a `const`, resolved to its value across modules, not only a
+numeric literal).
+
+Not every transform lives in the type signature. The `interceptors` config map,
+keyed by the class name as written in `@UseInterceptors(...)`, covers the rest:
+
+```json
+{
+  "interceptors": {
+    "LoggingInterceptor": { "ignore": true },
+    "BulkBodyInterceptor": { "requestBody": "single-or-array" },
+    "SignResponseInterceptor": {
+      "response": {
+        "whenPathEndsWith": "/jws",
+        "schema": { "type": "object", "properties": { "payload": { "type": "string" } } }
+      }
+    }
+  }
+}
+```
+
+- `ignore` — a pure side-effect interceptor (logging / tracing / scrubbing)
+  that never touches the wire shape; skip it.
+- `requestBody: "single-or-array"` — the client may send one object or an
+  array (emitted as `oneOf: [S, { type: array, items: S }]`); this reshaping is
+  imperative, not in the type signature.
+- `response: { whenPathEndsWith?, schema }` — an OpenAPI schema used verbatim,
+  for interceptors whose wire shape is runtime control flow rather than a type.
+  The optional suffix lets sibling routes sharing one interceptor via an array
+  path (`@Get([':id', ':id/jws'])`) keep distinct shapes.
+
 ### Error responses
 
 A handler's return type only describes its *success* response. The `4xx`/`5xx`
@@ -138,7 +187,8 @@ off.
    cross-file symbol table, following `import`, `export *` and barrel files.
 3. **Find** classes annotated with `@Controller` and walk their members for
    HTTP-verb decorators (`@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`,
-   `@Head`, `@Options`, `@All`) and `@HttpCode`.
+   `@Head`, `@Options`, `@All`) and `@HttpCode` (whose argument may be a
+   numeric literal or a named `const`, resolved across modules).
 4. **Map** each parameter to its OpenAPI location via `@Param`, `@Query`,
    `@Body`, `@Headers` (plus user-defined aliases). The parameter's TypeScript
    type becomes its schema.
@@ -147,15 +197,18 @@ off.
    utility types (`Promise<T>`, `Observable<T>`, `Partial`, `Required`,
    `Readonly`, `NonNullable`, `Pick`, `Omit`, `Record<K,V>`), qualified
    enum-member references (`State.OK`), and `Date` (date-time string).
-6. **Carry JSDoc** through to the output: the leading summary becomes
+6. **Rewrite** the response for any `@UseInterceptors(...)` from the
+   interceptor's `NestInterceptor<In, Out>` signature, plus config-driven
+   request/response reshaping (see [Interceptors](#interceptors)).
+7. **Carry JSDoc** through to the output: the leading summary becomes
    `summary`, additional paragraphs become `description`, `@param` lines
    become parameter descriptions, `@deprecated` flips the operation flag,
    `@internal` / `@private` omit a property, `@route-mapping` gives each
    path of a multi-path handler its own response schema, and `@throws` declares
    error responses thrown in service code (see above).
-7. **Reconstruct error responses** from guards, pipes, validation, and declared
+8. **Reconstruct error responses** from guards, pipes, validation, and declared
    throws, referencing a shared `Error` component (see [Error responses](#error-responses)).
-8. **Emit** an OpenAPI 3.1 document (`openapi.json` or `.yaml`).
+9. **Emit** an OpenAPI 3.1 document (`openapi.json` or `.yaml`).
 
 Unresolvable types (typically from external `node_modules`) are surfaced as
 `x-unresolved: <TypeName>` so the gap is visible rather than silently turning
@@ -187,14 +240,28 @@ npm/
 ## Building from source
 
 ```sh
-cargo build --release
+cargo build --release          # or: make build
 ./target/release/nestoa path/to/project
 ```
 
 ## Tests
 
 ```sh
-cargo test
+cargo test                     # or: make test
+```
+
+## Development (Makefile)
+
+A `Makefile` mirrors the CI pipeline (`.github/workflows/ci.yml`) so the same
+checks and builds run locally with one command. Run `make help` for the full
+list; the common targets are:
+
+```sh
+make ci          # everything CI runs: lint + test + release build
+make test        # cargo test --workspace --locked
+make build       # cargo build --release --workspace --locked
+make lint        # fmt check + clippy (deny warnings)
+make fmt-fix     # apply formatting fixes
 ```
 
 ## Release / distribution
@@ -215,6 +282,9 @@ and customisable". Two levers are exposed instead:
   onto one of the built-in parameter kinds.
 - **Config-driven error responses** — tune the guard/role/pipe names and auth
   scope, or add service-thrown codes per route, under `errorResponses`.
+- **Config-driven interceptors** — mark side-effect interceptors as ignored,
+  declare request-body reshaping, or supply a verbatim response schema, under
+  `interceptors`.
 - **Source contributions** — adding a new utility-type lowering, JSDoc tag, or
   error-response source is a one-file change in `schema.rs` / `jsdoc.rs` /
   `errors.rs`. The code is organised to make that the easy path.
