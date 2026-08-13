@@ -193,7 +193,9 @@ off.
    `@Body`, `@Headers` (plus user-defined aliases). The parameter's TypeScript
    type becomes its schema.
 5. **Lower** TypeScript types to JSON Schema, including primitives, arrays,
-   tuples, unions (lifted to `oneOf` / merged enums), intersections (`allOf`),
+   tuples, unions (lifted to `oneOf` / merged enums, with `| null` widening the
+   `type` keyword — see [Output conventions](#output-conventions)),
+   intersections (`allOf`),
    utility types (`Promise<T>`, `Observable<T>`, `Partial`, `Required`,
    `Readonly`, `NonNullable`, `Pick`, `Omit`, `Record<K,V>`), qualified
    enum-member references (`State.OK`), and `Date` (date-time string).
@@ -213,6 +215,31 @@ off.
 Unresolvable types (typically from external `node_modules`) are surfaced as
 `x-unresolved: <TypeName>` so the gap is visible rather than silently turning
 into `{}` — you can fill those in via the config later if needed.
+
+## Output conventions
+
+The document is OpenAPI 3.1, but it is written so that a downgrade to 3.0 (or a
+merge into a 3.0 document) is mechanical and never silently loses meaning:
+
+- **Nullability** uses JSON Schema 2020-12, never 3.0's `nullable` keyword —
+  which 3.1 removed and which only ever meant anything beside a `type` keyword.
+  So `string | null` widens the type (`type: ["string", "null"]`), a nullable
+  enum lists `null` among its values, and a union or a `$ref` gains an explicit
+  `{ "type": "null" }` member instead of a sibling flag.
+- **`$ref` never carries siblings.** Annotations such as a JSDoc `description`
+  are legal beside a `$ref` in 3.1, but 3.0's JSON Reference semantics discard
+  everything next to the reference ("All other properties in a $ref object are
+  ignored"), so a documented reference is emitted as an `allOf` branch instead:
+
+  ```yaml
+  type:
+    allOf:
+      - $ref: '#/components/schemas/AccountType'
+    description: Account's type
+  ```
+
+- **`undefined` / `void` members drop out of unions.** `T | undefined` lowers to
+  plain `T`; optionality is carried by the object's `required` list.
 
 ## Repo layout
 

@@ -150,11 +150,19 @@ impl<'a> SchemaCtx<'a> {
                             Some(Value::Array(a)) if a.iter().any(|v| v.is_null()),
                         )
                 });
+                // Drop the members with no wire representation: the `null` branch
+                // (folded into `nullable` above) and the JSON-null placeholder
+                // that `void`/`undefined`/`never` lower to — a `T | undefined`
+                // property is already expressed by leaving it out of `required`.
                 let non_null: Vec<Value> = parts
                     .into_iter()
-                    .filter(|p| p.get("type").and_then(|t| t.as_str()) != Some("null"))
+                    .filter(|p| {
+                        p.is_object() && p.get("type").and_then(|t| t.as_str()) != Some("null")
+                    })
                     .collect();
-                let mut schema = if non_null.len() == 1 {
+                let schema = if non_null.is_empty() {
+                    json!({})
+                } else if non_null.len() == 1 {
                     non_null.into_iter().next().unwrap()
                 } else if non_null
                     .iter()
@@ -179,10 +187,11 @@ impl<'a> SchemaCtx<'a> {
                 } else {
                     json!({ "oneOf": non_null })
                 };
-                if nullable && let Value::Object(map) = &mut schema {
-                    map.insert("nullable".into(), Value::Bool(true));
+                if nullable {
+                    make_nullable(schema)
+                } else {
+                    schema
                 }
-                schema
             }
             TsUnionOrIntersectionType::TsIntersectionType(it) => {
                 let parts: Vec<Value> = it
@@ -866,6 +875,78 @@ fn callee_name(e: &Expr) -> String {
     }
 }
 
+/// Encode "may also be null" the OpenAPI 3.1 way.
+///
+/// 3.0's `nullable: true` keyword does not exist in 3.1 (whose schemas are
+/// JSON Schema 2020-12): a 3.1 consumer ignores it outright, and even under 3.0
+/// semantics it only means something next to a `type` keyword — beside a `$ref`
+/// or a `oneOf` it was a silent no-op that linters flag (Redocly's
+/// `nullable-type-sibling`). So widen the `type` keyword instead, and where
+/// there is no type to widen add an explicit `{ "type": "null" }` branch.
+fn make_nullable(schema: Value) -> Value {
+    let Value::Object(mut m) = schema else {
+        return schema;
+    };
+    // Unconstrained (`any`/`unknown`) already admits null; adding a branch to
+    // `{}` would only narrow nothing into noise.
+    if m.is_empty() {
+        return Value::Object(m);
+    }
+    // An `enum` constrains the value list independently of `type`, so `null`
+    // has to be listed there too.
+    if let Some(Value::Array(values)) = m.get_mut("enum")
+        && !values.iter().any(Value::is_null)
+    {
+        values.push(Value::Null);
+    }
+    match m.get("type").cloned() {
+        Some(Value::String(t)) => {
+            m.insert("type".into(), json!([t, "null"]));
+            return Value::Object(m);
+        }
+        Some(Value::Array(mut types)) => {
+            if !types.iter().any(|t| t.as_str() == Some("null")) {
+                types.push(Value::String("null".into()));
+            }
+            m.insert("type".into(), Value::Array(types));
+            return Value::Object(m);
+        }
+        _ => {}
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(Value::Array(branches)) = m.get_mut(key) {
+            if !branches
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("null"))
+            {
+                branches.push(json!({ "type": "null" }));
+            }
+            return Value::Object(m);
+        }
+    }
+    // `$ref`, `allOf`, `x-unresolved`: no type keyword of our own to widen.
+    json!({ "oneOf": [Value::Object(m), { "type": "null" }] })
+}
+
+/// Make a schema map a legal place to hang annotation keywords.
+///
+/// A `$ref` with siblings is valid 3.1, but the JSON Reference semantics of
+/// 3.0.x (and a lot of tooling that still follows them, Swagger Editor
+/// included: "All other properties in a $ref object are ignored") discard
+/// everything beside the `$ref`. Moving the reference into
+/// `allOf: [{ $ref }]` keeps the same meaning in 3.1 while giving the
+/// siblings a real schema object to apply to in 3.0 consumers too.
+fn ref_to_allof(m: &mut Map<String, Value>) {
+    let Some(r) = m.remove("$ref") else {
+        return;
+    };
+    let mut branches = vec![json!({ "$ref": r })];
+    if let Some(Value::Array(existing)) = m.remove("allOf") {
+        branches.extend(existing);
+    }
+    m.insert("allOf".into(), Value::Array(branches));
+}
+
 fn attach_doc(schema: &mut Value, doc: &JsDoc) {
     if let Value::Object(m) = schema {
         attach_doc_to_map(m, doc);
@@ -879,9 +960,13 @@ fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
         (None, Some(d)) => Some(d.clone()),
         (None, None) => None,
     };
-    if let Some(c) = combined
-        && !m.contains_key("description")
-    {
+    let description = combined.filter(|_| !m.contains_key("description"));
+    if description.is_none() && !doc.deprecated && doc.example.is_none() {
+        return;
+    }
+    // Only worth restructuring once there is actually a sibling to carry.
+    ref_to_allof(m);
+    if let Some(c) = description {
         m.insert("description".into(), Value::String(c));
     }
     if doc.deprecated {
@@ -1307,5 +1392,142 @@ mod tests {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         assert_eq!(required, vec!["keep"]);
+    }
+
+    #[test]
+    fn documented_ref_property_hoists_ref_into_allof() {
+        // A `$ref` with a `description` sibling: 3.0 tooling drops the sibling
+        // (Swagger Editor's "All other properties in a $ref object are ignored"),
+        // so the reference has to move into an `allOf` branch.
+        let (project, dir, sources, file_starts) = project_with_sources(&[
+            ("kind.ts", "export interface Kind { label: string; }"),
+            (
+                "dto.ts",
+                "import { Kind } from './kind';\nexport class Dto {\n  /** Account's type */\n  kind?: Kind;\n  /** Plain field */\n  name?: string;\n}",
+            ),
+        ]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            passthrough_types: &[],
+        };
+        let dto_file = dir.join("dto.ts");
+        let (decl_file, sym) = project.resolve(&dto_file, "Dto").expect("resolve Dto");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        let kind = schema
+            .get("properties")
+            .and_then(|p| p.get("kind"))
+            .unwrap();
+        assert!(
+            kind.get("$ref").is_none(),
+            "no bare $ref beside siblings, got {kind}"
+        );
+        assert_eq!(
+            kind.pointer("/allOf/0/$ref").and_then(|v| v.as_str()),
+            Some("#/components/schemas/Kind"),
+            "reference kept as an allOf branch, got {kind}"
+        );
+        assert_eq!(
+            kind.get("description").and_then(|v| v.as_str()),
+            Some("Account's type")
+        );
+        // An undocumented reference stays a bare $ref — nothing to carry.
+        let (project2, dir2, sources2, file_starts2) = project_with_sources(&[
+            ("kind.ts", "export interface Kind { label: string; }"),
+            (
+                "dto.ts",
+                "import { Kind } from './kind';\nexport class Dto {\n  kind?: Kind;\n}",
+            ),
+        ]);
+        let mut components2 = ComponentSchemas::default();
+        let mut ctx2 = SchemaCtx {
+            project: &project2,
+            sources: &sources2,
+            file_starts: &file_starts2,
+            components: &mut components2,
+            type_env: None,
+            current_owner: None,
+            passthrough_types: &[],
+        };
+        let dto_file2 = dir2.join("dto.ts");
+        let (decl_file2, sym2) = project2.resolve(&dto_file2, "Dto").expect("resolve Dto");
+        let bare = ctx2.symbol_to_schema(&decl_file2, &sym2);
+        assert_eq!(
+            bare.pointer("/properties/kind/$ref")
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Kind"),
+            "undocumented reference stays bare, got {bare}"
+        );
+    }
+
+    #[test]
+    fn nullable_unions_use_json_schema_null_not_nullable_keyword() {
+        // `nullable: true` is a 3.0 keyword with no meaning in the 3.1 document
+        // nestoa emits, and beside a `$ref`/`oneOf` it is a no-op even in 3.0.
+        let (project, dir, sources, file_starts) = project_with_sources(&[
+            ("kind.ts", "export interface Kind { label: string; }"),
+            (
+                "dto.ts",
+                "import { Kind } from './kind';\nexport interface Dto {\n  name: string | null;\n  kind: Kind | null;\n  state: 'a' | 'b' | null;\n  mixed: string | number | null;\n  maybe?: Kind | undefined;\n}",
+            ),
+        ]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            passthrough_types: &[],
+        };
+        let dto_file = dir.join("dto.ts");
+        let (decl_file, sym) = project.resolve(&dto_file, "Dto").expect("resolve Dto");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        let props = schema.get("properties").unwrap();
+        assert!(
+            !schema.to_string().contains("nullable"),
+            "no 3.0 nullable keyword anywhere, got {schema}"
+        );
+
+        // A primitive widens its `type` keyword.
+        assert_eq!(
+            props.pointer("/name/type").unwrap(),
+            &json!(["string", "null"])
+        );
+
+        // A reference has no type keyword of its own: add a null branch.
+        let kind = props.get("kind").unwrap();
+        assert_eq!(
+            kind.pointer("/oneOf/0/$ref").and_then(|v| v.as_str()),
+            Some("#/components/schemas/Kind"),
+            "got {kind}"
+        );
+        assert_eq!(kind.pointer("/oneOf/1/type").unwrap(), &json!("null"));
+
+        // An enum constrains values independently of `type`, so `null` joins both.
+        let state = props.get("state").unwrap();
+        assert_eq!(state.get("type").unwrap(), &json!(["string", "null"]));
+        assert_eq!(state.get("enum").unwrap(), &json!(["a", "b", null]));
+
+        // A oneOf gains an explicit null member rather than a sibling keyword.
+        let mixed = props.get("mixed").unwrap();
+        let branches = mixed.get("oneOf").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(branches.len(), 3, "got {mixed}");
+        assert_eq!(branches[2].get("type").unwrap(), &json!("null"));
+
+        // `| undefined` has no wire representation: it must not leak a JSON null
+        // into a `oneOf`, and optionality is already carried by `required`.
+        assert_eq!(
+            props.pointer("/maybe/$ref").and_then(|v| v.as_str()),
+            Some("#/components/schemas/Kind"),
+            "got {}",
+            props.get("maybe").unwrap()
+        );
     }
 }
