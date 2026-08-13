@@ -4,22 +4,16 @@
 # with the TypeScript LSP plugin and its dependencies.
 npm install -g @anthropic-ai/claude-code@latest typescript-language-server typescript
 
-# Set up the Claude Code CLI plugins.
+# The Rust LSP server. Installed as a rustup component so it always matches the
+# toolchain the rust devcontainer feature pinned, rather than drifting from it.
+rustup component add rust-analyzer
+
+# Set up the Claude Code CLI plugins. The analyser is Rust (crates/nestoa), the
+# npm shim and the input fixtures under codebase/ are TypeScript, so both LSPs
+# are worth having. Re-running these is a no-op on an already-set-up container.
 claude plugin marketplace update claude-plugins-official
 claude plugin install typescript-lsp@claude-plugins-official
-
-# Install code-review-graph via pip (MCP configured via .mcp.json, not as a Claude plugin)
-# https://github.com/tirth8205/code-review-graph
-if ! command -v code-review-graph &> /dev/null; then
-  sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip > /dev/null
-  pip3 install --break-system-packages code-review-graph
-fi
+claude plugin install rust-analyzer-lsp@claude-plugins-official
 
 # List the installed plugins to verify the installation.
 claude plugin list
-
-# Rebuild code-review-graph (retry once after clearing stale DB if it fails)
-if ! code-review-graph build; then
-  rm -fr .code-review-graph
-  code-review-graph build
-fi
