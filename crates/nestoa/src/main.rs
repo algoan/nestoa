@@ -1,4 +1,5 @@
 mod config;
+mod dialect;
 mod discover;
 mod errors;
 mod globalprefix;
@@ -18,7 +19,7 @@ use clap::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use swc_common::BytePos;
 
-use crate::config::{Config, OutputFormat};
+use crate::config::{Config, OpenApiVersion, OutputFormat};
 use crate::parse::ParsingContext;
 use crate::routes::{Extractor, to_openapi};
 use crate::schema::ComponentSchemas;
@@ -42,6 +43,10 @@ struct Cli {
     /// Override the output file path.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Override the OpenAPI version to emit.
+    #[arg(long, value_enum)]
+    openapi_version: Option<OpenApiVersion>,
 
     /// Print the resolved configuration and exit.
     #[arg(long)]
@@ -129,6 +134,9 @@ fn main() -> Result<()> {
     let mut cfg = Config::load(cli.config.as_deref(), &project_root)?;
     if let Some(o) = cli.output {
         cfg.output = o;
+    }
+    if let Some(v) = cli.openapi_version {
+        cfg.openapi_version = v;
     }
 
     if cli.print_config {
