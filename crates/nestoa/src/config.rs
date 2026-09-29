@@ -22,6 +22,14 @@ pub struct Config {
     #[serde(default)]
     pub format: Option<OutputFormat>,
 
+    /// OpenAPI version the document is emitted for. `3.1.0` (the default) is
+    /// the dialect the analyser lowers types into; `3.0.3` runs the emitted
+    /// document through `dialect::downgrade_to_30` so it validates against the
+    /// older schema. See that module for what the downgrade can and cannot
+    /// preserve.
+    #[serde(default)]
+    pub openapi_version: OpenApiVersion,
+
     /// Global API base path prepended to every route.
     #[serde(default)]
     pub base_path: Option<String>,
@@ -274,6 +282,31 @@ pub enum OutputFormat {
     Yaml,
 }
 
+/// OpenAPI version to emit. See `Config::openapi_version`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum OpenApiVersion {
+    /// JSON Schema 2020-12 dialect: `type: [T, "null"]`, tuples as
+    /// `prefixItems`. What the analyser lowers into natively.
+    #[default]
+    #[serde(rename = "3.1.0")]
+    #[value(name = "3.1.0")]
+    V31,
+    /// The 3.0.3 subset: `nullable: true`, no `"null"` type, no tuples.
+    #[serde(rename = "3.0.3")]
+    #[value(name = "3.0.3")]
+    V30,
+}
+
+impl OpenApiVersion {
+    /// The version string written to the document's `openapi` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V31 => "3.1.0",
+            Self::V30 => "3.0.3",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Info {
@@ -368,6 +401,7 @@ impl Default for Config {
             exclude: default_exclude(),
             output: default_output(),
             format: None,
+            openapi_version: OpenApiVersion::default(),
             base_path: None,
             detect_global_prefix: true,
             resolve_tsconfig_paths: true,

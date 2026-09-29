@@ -210,7 +210,8 @@ off.
    error responses thrown in service code (see above).
 8. **Reconstruct error responses** from guards, pipes, validation, and declared
    throws, referencing a shared `Error` component (see [Error responses](#error-responses)).
-9. **Emit** an OpenAPI 3.1 document (`openapi.json` or `.yaml`).
+9. **Emit** an OpenAPI 3.1 document (`openapi.json` or `.yaml`), or a 3.0.3
+   one when [`openapiVersion`](#emitting-openapi-303) asks for it.
 
 Unresolvable types (typically from external `node_modules`) are surfaced as
 `x-unresolved: <TypeName>` so the gap is visible rather than silently turning
@@ -218,14 +219,9 @@ into `{}` — you can fill those in via the config later if needed.
 
 ## Output conventions
 
-The document is OpenAPI 3.1, but it is written so that a downgrade to 3.0 (or a
-merge into a 3.0 document) is mechanical and never silently loses meaning:
+The document is OpenAPI 3.1 by default. Most of it is written to read the same
+way under 3.0:
 
-- **Nullability** uses JSON Schema 2020-12, never 3.0's `nullable` keyword —
-  which 3.1 removed and which only ever meant anything beside a `type` keyword.
-  So `string | null` widens the type (`type: ["string", "null"]`), a nullable
-  enum lists `null` among its values, and a union or a `$ref` gains an explicit
-  `{ "type": "null" }` member instead of a sibling flag.
 - **`$ref` never carries siblings.** Annotations such as a JSDoc `description`
   are legal beside a `$ref` in 3.1, but 3.0's JSON Reference semantics discard
   everything next to the reference ("All other properties in a $ref object are
@@ -240,6 +236,52 @@ merge into a 3.0 document) is mechanical and never silently loses meaning:
 
 - **`undefined` / `void` members drop out of unions.** `T | undefined` lowers to
   plain `T`; optionality is carried by the object's `required` list.
+
+Two constructs, however, simply have no spelling that is valid in both
+versions, so a 3.1 document is never also a 3.0 one. Use
+[`openapiVersion`](#emitting-openapi-303) when you need 3.0.3.
+
+- **Nullability.** 3.1 has no `nullable` keyword (a 3.1 consumer ignores it, so
+  the field reads as non-nullable) and 3.0 has no `"null"` type. The 3.1 output
+  uses JSON Schema 2020-12 throughout: `string | null` widens the type
+  (`type: ["string", "null"]`), a nullable enum lists `null` among its values,
+  and a nullable union or `$ref` gains an explicit `{ "type": "null" }` member.
+- **Tuples.** `[number, number]` lowers to `prefixItems` + `items: false`.
+  3.0 arrays are homogeneous and have neither keyword.
+
+### Emitting OpenAPI 3.0.3
+
+Set `openapiVersion` (or pass `--openapi-version`) to emit a document that
+validates against 3.0.3:
+
+```json
+{
+  "openapiVersion": "3.0.3"
+}
+```
+
+```sh
+nestoa . --openapi-version 3.0.3
+```
+
+The analyser still lowers types into 3.1; the finished document is then
+downgraded in one pass (`dialect.rs`), which also covers schemas you supplied
+verbatim through `interceptors[].response.schema`:
+
+| 3.1 | 3.0.3 |
+| --- | --- |
+| `type: [T, "null"]` | `type: T` + `nullable: true` |
+| `enum: [a, b, null]` | `enum: [a, b]` + `nullable: true` |
+| `oneOf: [<schema>, {type: "null"}]` | `<schema>` — **nullability is lost** |
+| `prefixItems: [A, B]`, `items: false` | `items: <A merged with B>` + `minItems`/`maxItems` — **order is lost** |
+
+The two lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means
+something beside a `type` keyword, and a union — which is how a nullable
+`$ref`, `allOf` or `x-unresolved` is expressed — has none of its own; keeping
+the flag there would be a no-op that linters reject (Redocly's
+`nullable-type-sibling`). A 3.0.3 document cannot say "this `$ref` may be
+null". Likewise 3.0.3 arrays are homogeneous, so a tuple keeps its arity but
+not its per-position types.
 
 ## Repo layout
 

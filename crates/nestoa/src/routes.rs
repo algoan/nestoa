@@ -10,7 +10,8 @@ use swc_ecma_ast::{
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::config::{AuthScope, Config, DecoratorAlias};
+use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
+use crate::dialect;
 use crate::errors::{self, ERROR_SCHEMA_NAME};
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
@@ -786,7 +787,8 @@ fn normalize_segment(s: &str) -> String {
     }
 }
 
-/// Convert routes + components into an OpenAPI 3.1 document.
+/// Convert routes + components into an OpenAPI document, in the version
+/// `config.openapi_version` selects (3.1 natively; 3.0.3 via `dialect`).
 pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
     // Register the shared error-body schema once, if any route emits an error
     // response. Tree-shaking below drops it if nothing ends up referencing it.
@@ -927,7 +929,10 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
     let reachable = reachable_schemas(&paths_json, &components.schemas);
 
     let mut root = Map::new();
-    root.insert("openapi".into(), Value::String("3.1.0".into()));
+    root.insert(
+        "openapi".into(),
+        Value::String(config.openapi_version.as_str().into()),
+    );
     root.insert("info".into(), Value::Object(info));
     root.insert("paths".into(), Value::Object(paths_json));
     // Schemas are collected in type-encounter order, which also follows file
@@ -944,7 +949,11 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         comp.insert("schemas".into(), Value::Object(schemas));
         root.insert("components".into(), Value::Object(comp));
     }
-    Value::Object(root)
+    let mut doc = Value::Object(root);
+    if config.openapi_version == OpenApiVersion::V30 {
+        dialect::downgrade_to_30(&mut doc);
+    }
+    doc
 }
 
 /// Component-schema name referenced by a `$ref` of the form
@@ -1420,6 +1429,61 @@ mod tests {
         let mut r = route(method, path);
         r.response = Some(json!({"$ref": format!("#/components/schemas/{schema_ref}")}));
         r
+    }
+
+    #[test]
+    fn to_openapi_emits_3_1_by_default_and_downgrades_on_request() {
+        use crate::config::OpenApiVersion;
+        use crate::schema::ComponentSchemas;
+        use serde_json::json;
+
+        let build = |version: OpenApiVersion| {
+            let mut components = ComponentSchemas::default();
+            components.insert(
+                "Account",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": ["string", "null"]},
+                        "owner": {"oneOf": [{"$ref": "#/components/schemas/Owner"}, {"type": "null"}]},
+                        "range": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false}
+                    }
+                }),
+            );
+            components.insert("Owner", json!({"type": "object"}));
+            let config = Config {
+                openapi_version: version,
+                ..Config::default()
+            };
+            to_openapi(
+                &config,
+                &[route_ref(HttpMethod::Get, "/accounts", "Account")],
+                components,
+            )
+        };
+
+        let v31 = build(OpenApiVersion::V31);
+        assert_eq!(v31["openapi"], "3.1.0");
+        let props = &v31["components"]["schemas"]["Account"]["properties"];
+        assert_eq!(props["label"]["type"], json!(["string", "null"]));
+        assert!(props["owner"]["oneOf"].is_array());
+        assert!(props["range"]["prefixItems"].is_array());
+
+        let v30 = build(OpenApiVersion::V30);
+        assert_eq!(v30["openapi"], "3.0.3");
+        let props = &v30["components"]["schemas"]["Account"]["properties"];
+        assert_eq!(props["label"], json!({"type": "string", "nullable": true}));
+        // The nullable wrapper is gone; the reference survives and still keeps
+        // `Owner` reachable for tree-shaking.
+        assert_eq!(
+            props["owner"],
+            json!({"$ref": "#/components/schemas/Owner"})
+        );
+        assert!(v30["components"]["schemas"].get("Owner").is_some());
+        assert_eq!(
+            props["range"],
+            json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2})
+        );
     }
 
     #[test]
