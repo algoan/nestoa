@@ -288,7 +288,8 @@ or `x-unresolved` is expressed — has none of its own; keeping the flag there
 would be a no-op that linters reject (Redocly's `nullable-type-sibling`). So a
 3.0.3 document cannot say "this `$ref` may be null", and it has no null-only
 schema either. Likewise its arrays are homogeneous, so a tuple keeps its
-length but not its per-position types.
+maximum length — `maxItems`, matching `prefixItems`, which caps an array
+without requiring every position — but not its per-position types.
 
 Only the closed tuple the analyser emits (`prefixItems` with `items: false`)
 is converted. An open tuple — `items` absent, `true`, or a tail schema — is
