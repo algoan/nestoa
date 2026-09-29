@@ -20,13 +20,19 @@
 //! | `oneOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
 //! | `type: "null"` on its own                | unconstrained — the type is lost   |
 //!
-//! That last row is a real loss, and it is unavoidable rather than a shortcut:
+//! The last two rows are real losses, and unavoidable rather than shortcuts:
 //! `nullable` only means something beside a `type` keyword, and a union — which
 //! is how a nullable `$ref`, `allOf` or `x-unresolved` is expressed — has no
 //! `type` of its own to attach it to. Keeping `nullable` there would produce a
 //! no-op that linters reject (Redocly's `nullable-type-sibling`), so the branch
 //! is dropped instead. A 3.0.3 document simply cannot say "this `$ref` may be
-//! null".
+//! null", and it has no null-only schema for a `null`-typed property either.
+//!
+//! The pass walks the whole document rather than the OpenAPI object model, so
+//! it keeps working wherever a schema turns up — including one handed over
+//! verbatim in the config. To make that safe it skips the keywords whose
+//! values are instance data (see `is_instance_data`): an `example` that looks
+//! like a schema is documented payload, not something to rewrite.
 //!
 //! Tuples degrade rather than disappear. `[A, B]` lowers to `prefixItems` +
 //! `items: false` in 3.1; 3.0.3 arrays are homogeneous, so the element schemas
@@ -51,7 +57,11 @@ pub fn downgrade_to_30(doc: &mut Value) {
             downgrade_null_type(map);
             downgrade_null_enum(map);
             downgrade_standalone_null(map);
-            map.values_mut().for_each(downgrade_to_30);
+            for (key, value) in map.iter_mut() {
+                if !is_instance_data(key) {
+                    downgrade_to_30(value);
+                }
+            }
         }
         _ => {}
     }
@@ -104,6 +114,7 @@ fn downgrade_null_enum(map: &mut Map<String, Value>) {
 /// Returns whether a lone member was folded up into `map`, which leaves keys
 /// the caller has not rewritten yet (and possibly another union to unwrap).
 fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
+    let mut unwrapped = false;
     for key in ["oneOf", "anyOf"] {
         let Some(Value::Array(branches)) = map.get(key) else {
             continue;
@@ -127,7 +138,7 @@ fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
                 let sole = sole.clone();
                 map.remove(key);
                 map.extend(sole);
-                return true;
+                unwrapped = true;
             }
             [] => {
                 map.remove(key);
@@ -136,9 +147,20 @@ fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
                 map.insert(key.into(), Value::Array(kept));
             }
         }
-        return false;
     }
-    false
+    unwrapped
+}
+
+/// Whether a keyword's value is instance data (a documented payload) or an
+/// opaque extension, rather than a schema.
+///
+/// The walk must not descend into these. An `example` is what the API says it
+/// returns; if one happens to look like a schema — an object with a `type`
+/// key, say — rewriting it would change the documented payload. `enum` and
+/// `const` values are read at the schema level but are likewise instance data
+/// inside.
+fn is_instance_data(key: &str) -> bool {
+    matches!(key, "example" | "examples" | "default" | "enum" | "const") || key.starts_with("x-")
 }
 
 /// `{type: "null"}` on its own -> an unconstrained schema.
@@ -347,6 +369,31 @@ mod tests {
             down(json!({"type": "null", "description": "always null"})),
             json!({"description": "always null"})
         );
+    }
+
+    #[test]
+    fn handles_a_null_branch_in_both_union_keywords() {
+        assert_eq!(
+            down(json!({
+                "oneOf": [{"type": "string"}, {"type": "null"}],
+                "anyOf": [{"type": "integer"}, {"type": "null"}]
+            })),
+            json!({"oneOf": [{"type": "string"}], "anyOf": [{"type": "integer"}]})
+        );
+    }
+
+    #[test]
+    fn never_rewrites_instance_data() {
+        // `example`/`default`/`enum` values are documented payloads, not
+        // schemas; a payload that happens to look like one must survive.
+        let doc = json!({
+            "type": "object",
+            "example": {"type": "null", "range": {"prefixItems": [{"type": "number"}]}},
+            "default": {"type": ["string", "null"]},
+            "enum": [{"type": "null"}],
+            "x-vendor": {"type": ["string", "null"]}
+        });
+        assert_eq!(down(doc.clone()), doc);
     }
 
     #[test]

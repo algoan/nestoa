@@ -279,13 +279,17 @@ verbatim through `interceptors[].response.schema`:
 | `type: "null"` on its own | an unconstrained schema — **the type is lost** |
 | `prefixItems: [A, B]`, `items: false` | `items: <A merged with B>` + `minItems`/`maxItems` — **order is lost** |
 
-The two lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means
+The three lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means
 something beside a `type` keyword, and a union — which is how a nullable
 `$ref`, `allOf` or `x-unresolved` is expressed — has none of its own; keeping
 the flag there would be a no-op that linters reject (Redocly's
-`nullable-type-sibling`). A 3.0.3 document cannot say "this `$ref` may be
-null". Likewise 3.0.3 arrays are homogeneous, so a tuple keeps its arity but
-not its per-position types.
+`nullable-type-sibling`). So a 3.0.3 document cannot say "this `$ref` may be
+null", and it has no null-only schema either. Likewise its arrays are
+homogeneous, so a tuple keeps its arity but not its per-position types.
+
+Instance data is never touched: the pass does not descend into `example`,
+`examples`, `default`, `enum`/`const` values or `x-` extensions, so a
+documented payload that happens to look like a schema survives unchanged.
 
 ## Repo layout
 
