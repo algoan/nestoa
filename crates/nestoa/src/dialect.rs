@@ -18,6 +18,7 @@
 //! | `type: [T, "null"]`                      | `type: T` + `nullable: true`       |
 //! | `enum: [a, b, null]`                     | `enum: [a, b]` + `nullable: true`  |
 //! | `oneOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
+//! | `type: "null"` on its own                | unconstrained — the type is lost   |
 //!
 //! That last row is a real loss, and it is unavoidable rather than a shortcut:
 //! `nullable` only means something beside a `type` keyword, and a union — which
@@ -41,10 +42,15 @@ pub fn downgrade_to_30(doc: &mut Value) {
     match doc {
         Value::Array(items) => items.iter_mut().for_each(downgrade_to_30),
         Value::Object(map) => {
+            // Unwrapping a union folds its lone member's keys into this object,
+            // and that member can itself carry a 3.1 construct. The recursion
+            // below only descends into values, so those merged keys would never
+            // be revisited — settle the unwrapping first, then rewrite.
+            while unwrap_null_union(map) {}
             downgrade_tuple(map);
             downgrade_null_type(map);
             downgrade_null_enum(map);
-            downgrade_null_union(map);
+            downgrade_standalone_null(map);
             map.values_mut().for_each(downgrade_to_30);
         }
         _ => {}
@@ -94,7 +100,10 @@ fn downgrade_null_enum(map: &mut Map<String, Value>) {
 
 /// Drop a `{type: "null"}` branch from a `oneOf`/`anyOf`, unwrapping the union
 /// when it was only there to carry that branch.
-fn downgrade_null_union(map: &mut Map<String, Value>) {
+///
+/// Returns whether a lone member was folded up into `map`, which leaves keys
+/// the caller has not rewritten yet (and possibly another union to unwrap).
+fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
     for key in ["oneOf", "anyOf"] {
         let Some(Value::Array(branches)) = map.get(key) else {
             continue;
@@ -118,6 +127,7 @@ fn downgrade_null_union(map: &mut Map<String, Value>) {
                 let sole = sole.clone();
                 map.remove(key);
                 map.extend(sole);
+                return true;
             }
             [] => {
                 map.remove(key);
@@ -126,7 +136,20 @@ fn downgrade_null_union(map: &mut Map<String, Value>) {
                 map.insert(key.into(), Value::Array(kept));
             }
         }
-        return;
+        return false;
+    }
+    false
+}
+
+/// `{type: "null"}` on its own -> an unconstrained schema.
+///
+/// A property declared `null` in TypeScript lowers to this (`keyword_schema`'s
+/// `TsNullKeyword` arm). 3.0.3 has no null-only schema, so the constraint is
+/// dropped rather than left as invalid syntax; any annotations beside it
+/// (`description`, `deprecated`, …) are kept.
+fn downgrade_standalone_null(map: &mut Map<String, Value>) {
+    if map.get("type").is_some_and(is_null_type_name) {
+        map.remove("type");
     }
 }
 
@@ -298,6 +321,31 @@ mod tests {
         assert_eq!(
             down(json!({"type": "array", "prefixItems": [], "items": false})),
             json!({"type": "array", "minItems": 0, "maxItems": 0})
+        );
+    }
+
+    #[test]
+    fn rewrites_the_lone_branch_a_union_unwrap_folds_up() {
+        assert_eq!(
+            down(json!({"oneOf": [{"type": ["string", "null"]}, {"type": "null"}]})),
+            json!({"type": "string", "nullable": true})
+        );
+        assert_eq!(
+            down(json!({
+                "oneOf": [
+                    {"type": "array", "prefixItems": [{"type": "number"}], "items": false},
+                    {"type": "null"}
+                ]
+            })),
+            json!({"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 1})
+        );
+    }
+
+    #[test]
+    fn degrades_a_standalone_null_type_to_an_unconstrained_schema() {
+        assert_eq!(
+            down(json!({"type": "null", "description": "always null"})),
+            json!({"description": "always null"})
         );
     }
 

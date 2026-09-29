@@ -249,6 +249,9 @@ versions, so a 3.1 document is never also a 3.0 one. Use
 - **Tuples.** `[number, number]` lowers to `prefixItems` + `items: false`.
   3.0 arrays are homogeneous and have neither keyword.
 
+A property declared `null` outright lowers to `type: "null"`, which 3.0 also
+lacks; the downgrade drops the constraint, keeping any annotations beside it.
+
 ### Emitting OpenAPI 3.0.3
 
 Set `openapiVersion` (or pass `--openapi-version`) to emit a document that
@@ -273,6 +276,7 @@ verbatim through `interceptors[].response.schema`:
 | `type: [T, "null"]` | `type: T` + `nullable: true` |
 | `enum: [a, b, null]` | `enum: [a, b]` + `nullable: true` |
 | `oneOf: [<schema>, {type: "null"}]` | `<schema>` — **nullability is lost** |
+| `type: "null"` on its own | an unconstrained schema — **the type is lost** |
 | `prefixItems: [A, B]`, `items: false` | `items: <A merged with B>` + `minItems`/`maxItems` — **order is lost** |
 
 The two lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means
