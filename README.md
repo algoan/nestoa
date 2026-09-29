@@ -279,15 +279,23 @@ verbatim through `interceptors[].response.schema`:
 | `type: "null"` on its own | an unconstrained schema — **the type is lost** |
 | `type: [A, B]` (multi-type) | `anyOf: [{type: A}, {type: B}]` |
 | `const: v` | `enum: [v]` |
-| `prefixItems: [A, B]`, `items: false` | `items: <A merged with B>` + `minItems`/`maxItems` — **order is lost** |
+| `prefixItems: [A, B]` + `items: false` | `items: <A merged with B>` + `maxItems` — **order is lost** |
 
-The three lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means
-something beside a `type` keyword, and a union — which is how a nullable
-`$ref`, `allOf` or `x-unresolved` is expressed — has none of its own; keeping
-the flag there would be a no-op that linters reject (Redocly's
-`nullable-type-sibling`). So a 3.0.3 document cannot say "this `$ref` may be
-null", and it has no null-only schema either. Likewise its arrays are
-homogeneous, so a tuple keeps its arity but not its per-position types.
+The nullable-union, standalone-null and tuple rows lose information, and that
+is a limit of 3.0.3 rather than a shortcut. `nullable` only means something
+beside a `type` keyword, and a union — which is how a nullable `$ref`, `allOf`
+or `x-unresolved` is expressed — has none of its own; keeping the flag there
+would be a no-op that linters reject (Redocly's `nullable-type-sibling`). So a
+3.0.3 document cannot say "this `$ref` may be null", and it has no null-only
+schema either. Likewise its arrays are homogeneous, so a tuple keeps its
+length but not its per-position types.
+
+Only the closed tuple the analyser emits (`prefixItems` with `items: false`)
+is converted. An open tuple — `items` absent, `true`, or a tail schema — is
+passed through untouched: approximating one means inventing bounds and
+guessing how to fold the tail into a single element schema, and nothing in the
+analyser produces one. `minItems` is never synthesized either, since
+`prefixItems` constrains the positions an array has without requiring them.
 
 Instance data is never touched: the pass does not descend into `example`,
 `examples`, `default`, `enum`/`const` values or `x-` extensions, so a

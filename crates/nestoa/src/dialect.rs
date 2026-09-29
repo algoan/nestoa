@@ -22,7 +22,8 @@
 //! | `type: [A, B]` (multi-type)              | `anyOf: [{type: A}, {type: B}]`    |
 //! | `const: v`                               | `enum: [v]`                        |
 //!
-//! The last two rows are real losses, and unavoidable rather than shortcuts:
+//! The nullable-union and standalone-null rows are real losses, and
+//! unavoidable rather than shortcuts:
 //! `nullable` only means something beside a `type` keyword, and a union — which
 //! is how a nullable `$ref`, `allOf` or `x-unresolved` is expressed — has no
 //! `type` of its own to attach it to. Keeping `nullable` there would produce a
@@ -41,8 +42,9 @@
 //!
 //! Tuples degrade rather than disappear. `[A, B]` lowers to `prefixItems` +
 //! `items: false` in 3.1; 3.0.3 arrays are homogeneous, so the element schemas
-//! are merged into a single `items` and the fixed length is preserved as
-//! `minItems`/`maxItems`. Element *order* is what gets lost.
+//! are merged into a single `items` and the closed length becomes `maxItems`.
+//! Element *order* is what gets lost. Only that closed shape is converted —
+//! see `downgrade_tuple` for why an open tuple is left alone.
 
 use serde_json::{Map, Value, json};
 
@@ -242,49 +244,66 @@ fn downgrade_standalone_null(map: &mut Map<String, Value>) {
     }
 }
 
-/// A `prefixItems` tuple -> a homogeneous array approximating it.
+/// A closed `prefixItems` tuple -> a homogeneous array approximating it.
 ///
-/// 3.0.3 arrays have one element schema, so the per-position types are merged
-/// into a single `items` and the length is carried by `minItems`/`maxItems`.
-/// `items: false` closes the tuple, which is what the analyser emits and what
-/// pins `maxItems`; `items: <schema>` instead means "then any number of
-/// these", so the tail joins the merge and the array stays open. Bounds
-/// already on the schema are left as they are.
+/// Only the shape `schema.rs` emits is handled: `prefixItems` alongside
+/// `items: false`. 3.0.3 arrays have one element schema, so the per-position
+/// schemas are merged into a single `items` and the closed length becomes
+/// `maxItems`. Element order is what gets lost.
+///
+/// An *open* tuple (`items` absent, `true`, or a tail schema) is left exactly
+/// as it is. Approximating one means guessing how to fold a tail into the
+/// element schema and what bounds to invent, and nothing in the analyser
+/// produces one — only a hand-written `interceptors[].response.schema` could,
+/// and its author is better placed than this pass to decide what it should
+/// become in 3.0.3.
+///
+/// Note what is *not* synthesized: `prefixItems` constrains the positions an
+/// array happens to have, it does not require them, so a shorter array is
+/// valid against the source. Adding `minItems` would reject values the 3.1
+/// document accepts and leave the two dialects describing different
+/// contracts. (That the 3.1 lowering is itself looser than the TypeScript
+/// tuple it comes from is a `schema.rs` question, not one for the downgrade.)
 fn downgrade_tuple(map: &mut Map<String, Value>) {
+    if map.get("items") != Some(&Value::Bool(false)) {
+        return;
+    }
     let Some(Value::Array(prefix)) = map.remove("prefixItems") else {
         return;
     };
+    map.remove("items");
     let arity = prefix.len();
-    let tail = map.remove("items");
-    let closed = tail == Some(Value::Bool(false));
 
-    let mut distinct: Vec<Value> = Vec::new();
-    let mut push = |element: Value| {
-        if element.is_object() && !distinct.contains(&element) {
-            distinct.push(element);
+    // A position accepting anything (`true`, or `{}`) makes the whole
+    // homogeneous approximation unconstrained — no single element schema
+    // admits it while still narrowing the others.
+    let constrains = |e: &Value| e.as_object().is_some_and(|m| !m.is_empty());
+    if prefix.iter().all(constrains) {
+        let mut distinct: Vec<Value> = Vec::new();
+        for element in prefix {
+            if !distinct.contains(&element) {
+                distinct.push(element);
+            }
         }
+        match distinct.len() {
+            0 => {}
+            1 => {
+                map.insert("items".into(), distinct.into_iter().next().unwrap());
+            }
+            // `anyOf` for the same overlap reason as a multi-type array.
+            _ => {
+                map.insert("items".into(), json!({ "anyOf": distinct }));
+            }
+        }
+    }
+
+    // A closed tuple caps the length. Intersect rather than overwrite, so an
+    // existing tighter bound survives.
+    let capped = match map.get("maxItems").and_then(Value::as_u64) {
+        Some(existing) => existing.min(arity as u64),
+        None => arity as u64,
     };
-    prefix.into_iter().for_each(&mut push);
-    if let Some(tail) = tail.filter(|_| !closed) {
-        push(tail);
-    }
-
-    match distinct.len() {
-        // Nothing to constrain elements with: an empty closed tuple, or an
-        // open one whose tail is `true`.
-        0 => {}
-        1 => {
-            map.insert("items".into(), distinct.into_iter().next().unwrap());
-        }
-        // `anyOf` for the same overlap reason as a multi-type array.
-        _ => {
-            map.insert("items".into(), json!({ "anyOf": distinct }));
-        }
-    }
-    map.entry("minItems").or_insert_with(|| json!(arity));
-    if closed {
-        map.entry("maxItems").or_insert_with(|| json!(arity));
-    }
+    map.insert("maxItems".into(), json!(capped));
 }
 
 /// `const: v` -> `enum: [v]`, the 3.0.3 way to pin a single value.
@@ -296,10 +315,20 @@ fn downgrade_const(map: &mut Map<String, Value>) {
     let Some(value) = map.remove("const") else {
         return;
     };
-    if value.is_null() || map.contains_key("enum") {
+    if value.is_null() {
         return;
     }
-    map.insert("enum".into(), Value::Array(vec![value]));
+    // `const` is the tighter constraint, so an existing `enum` intersects down
+    // to it; an empty result means the source was already unsatisfiable.
+    match map.get("enum") {
+        Some(Value::Array(values)) => {
+            let kept: Vec<Value> = values.iter().filter(|v| **v == value).cloned().collect();
+            map.insert("enum".into(), Value::Array(kept));
+        }
+        _ => {
+            map.insert("enum".into(), Value::Array(vec![value]));
+        }
+    }
 }
 
 fn is_null_type_name(value: &Value) -> bool {
@@ -399,7 +428,7 @@ mod tests {
                 "prefixItems": [{"type": "number"}, {"type": "number"}],
                 "items": false
             })),
-            json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2})
+            json!({"type": "array", "items": {"type": "number"}, "maxItems": 2})
         );
     }
 
@@ -414,7 +443,6 @@ mod tests {
             json!({
                 "type": "array",
                 "items": {"anyOf": [{"type": "string"}, {"type": "number"}]},
-                "minItems": 2,
                 "maxItems": 2
             })
         );
@@ -431,7 +459,6 @@ mod tests {
             json!({
                 "type": "array",
                 "items": {"type": "string", "nullable": true},
-                "minItems": 2,
                 "maxItems": 2
             })
         );
@@ -441,7 +468,7 @@ mod tests {
     fn empty_tuple_becomes_a_zero_length_array() {
         assert_eq!(
             down(json!({"type": "array", "prefixItems": [], "items": false})),
-            json!({"type": "array", "minItems": 0, "maxItems": 0})
+            json!({"type": "array", "maxItems": 0})
         );
     }
 
@@ -458,7 +485,7 @@ mod tests {
                     {"type": "null"}
                 ]
             })),
-            json!({"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 1})
+            json!({"type": "array", "items": {"type": "number"}, "maxItems": 1})
         );
     }
 
@@ -551,31 +578,30 @@ mod tests {
     }
 
     #[test]
-    fn keeps_an_open_tuple_open() {
-        // `items: <schema>` means "and then any number of these" — the tail
-        // schema joins the approximation and there is no upper bound.
-        assert_eq!(
-            down(json!({
-                "type": "array",
-                "prefixItems": [{"type": "string"}],
-                "items": {"type": "number"}
-            })),
-            json!({
-                "type": "array",
-                "items": {"anyOf": [{"type": "string"}, {"type": "number"}]},
-                "minItems": 1
-            })
-        );
+    fn leaves_an_open_tuple_alone() {
+        // Only the closed shape the analyser emits is converted. An open
+        // tuple would need invented bounds and a guessed element merge, so it
+        // is passed through for its author to deal with.
+        for tail in [json!({"type": "number"}), json!(true), Value::Null] {
+            let mut doc = json!({"type": "array", "prefixItems": [{"type": "string"}]});
+            if !tail.is_null() {
+                doc["items"] = tail;
+            }
+            assert_eq!(down(doc.clone()), doc);
+        }
     }
 
     #[test]
-    fn keeps_explicit_bounds_on_a_tuple() {
+    fn keeps_explicit_bounds_and_intersects_the_cap() {
+        // An existing `minItems` is the source's own constraint and survives;
+        // `maxItems` is intersected with the closed length, never widened.
         assert_eq!(
             down(json!({
                 "type": "array",
                 "prefixItems": [{"type": "number"}, {"type": "number"}],
                 "items": false,
-                "minItems": 1
+                "minItems": 1,
+                "maxItems": 5
             })),
             json!({
                 "type": "array",
@@ -583,6 +609,37 @@ mod tests {
                 "minItems": 1,
                 "maxItems": 2
             })
+        );
+        assert_eq!(
+            down(json!({
+                "type": "array",
+                "prefixItems": [{"type": "number"}, {"type": "number"}],
+                "items": false,
+                "maxItems": 1
+            }))["maxItems"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn an_unconstrained_position_leaves_the_elements_unconstrained() {
+        // `true` at one position admits anything there, so no single `items`
+        // schema can narrow the others without rejecting it.
+        assert_eq!(
+            down(json!({
+                "type": "array",
+                "prefixItems": [{"type": "string"}, true],
+                "items": false
+            })),
+            json!({"type": "array", "maxItems": 2})
+        );
+    }
+
+    #[test]
+    fn intersects_const_with_an_existing_enum() {
+        assert_eq!(
+            down(json!({"type": "string", "const": "A", "enum": ["A", "B"]})),
+            json!({"type": "string", "enum": ["A"]})
         );
     }
 

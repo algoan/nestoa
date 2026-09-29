@@ -1482,7 +1482,7 @@ mod tests {
         assert!(v30["components"]["schemas"].get("Owner").is_some());
         assert_eq!(
             props["range"],
-            json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2})
+            json!({"type": "array", "items": {"type": "number"}, "maxItems": 2})
         );
     }
 
