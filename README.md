@@ -277,6 +277,7 @@ verbatim through `interceptors[].response.schema`:
 | `enum: [a, b, null]` | `enum: [a, b]` + `nullable: true` |
 | `oneOf: [<schema>, {type: "null"}]` | `<schema>` — **nullability is lost** |
 | `type: "null"` on its own | an unconstrained schema — **the type is lost** |
+| `type: [A, B]` (multi-type) | `oneOf: [{type: A}, {type: B}]` |
 | `prefixItems: [A, B]`, `items: false` | `items: <A merged with B>` + `minItems`/`maxItems` — **order is lost** |
 
 The three lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means
@@ -289,7 +290,9 @@ homogeneous, so a tuple keeps its arity but not its per-position types.
 
 Instance data is never touched: the pass does not descend into `example`,
 `examples`, `default`, `enum`/`const` values or `x-` extensions, so a
-documented payload that happens to look like a schema survives unchanged.
+documented payload that happens to look like a schema survives unchanged. That
+applies to those words as *keywords* only — a DTO field named `example` is
+still a schema and is downgraded like any other.
 
 ## Repo layout
 

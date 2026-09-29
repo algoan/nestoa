@@ -19,6 +19,7 @@
 //! | `enum: [a, b, null]`                     | `enum: [a, b]` + `nullable: true`  |
 //! | `oneOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
 //! | `type: "null"` on its own                | unconstrained — the type is lost   |
+//! | `type: [A, B]` (multi-type)              | `oneOf: [{type: A}, {type: B}]`    |
 //!
 //! The last two rows are real losses, and unavoidable rather than shortcuts:
 //! `nullable` only means something beside a `type` keyword, and a union — which
@@ -32,7 +33,10 @@
 //! it keeps working wherever a schema turns up — including one handed over
 //! verbatim in the config. To make that safe it skips the keywords whose
 //! values are instance data (see `is_instance_data`): an `example` that looks
-//! like a schema is documented payload, not something to rewrite.
+//! like a schema is documented payload, not something to rewrite. Those
+//! keywords only count in keyword position: inside a `properties` map the same
+//! word is a field name, and a DTO with a field called `example` still needs
+//! its schema downgraded (`is_name_keyed_map`).
 //!
 //! Tuples degrade rather than disappear. `[A, B]` lowers to `prefixItems` +
 //! `items: false` in 3.1; 3.0.3 arrays are homogeneous, so the element schemas
@@ -58,7 +62,14 @@ pub fn downgrade_to_30(doc: &mut Value) {
             downgrade_null_enum(map);
             downgrade_standalone_null(map);
             for (key, value) in map.iter_mut() {
-                if !is_instance_data(key) {
+                if is_name_keyed_map(key) {
+                    // `properties`, `paths`, `content`, … are keyed by names
+                    // the user chose, so a key here means nothing about what
+                    // its value is. Walk every value.
+                    if let Value::Object(entries) = value {
+                        entries.values_mut().for_each(downgrade_to_30);
+                    }
+                } else if !is_instance_data(key) {
                     downgrade_to_30(value);
                 }
             }
@@ -69,25 +80,42 @@ pub fn downgrade_to_30(doc: &mut Value) {
 
 /// `type: [T, "null"]` -> `type: T` + `nullable: true`.
 ///
-/// A multi-type array is left alone: 3.0.3 has no way to express one, and the
-/// analyser never emits one — `make_nullable` only ever widens a single type.
+/// 3.0.3 allows only a single string `type`, so any array has to go. The
+/// analyser itself only ever produces `[T, "null"]` (`make_nullable` widens one
+/// concrete type), but a schema handed over verbatim in the config can carry a
+/// genuine multi-type array; that becomes a `oneOf` of one-type branches, and
+/// takes the same nullability loss as any other union.
 fn downgrade_null_type(map: &mut Map<String, Value>) {
     let Some(Value::Array(types)) = map.get("type") else {
         return;
     };
-    if !types.iter().any(is_null_type_name) {
-        return;
-    }
     let concrete: Vec<Value> = types
         .iter()
         .filter(|t| !is_null_type_name(t))
         .cloned()
         .collect();
-    let [single] = concrete.as_slice() else {
-        return;
-    };
-    map.insert("type".into(), single.clone());
-    map.insert("nullable".into(), Value::Bool(true));
+    match concrete.as_slice() {
+        // `["null"]` — 3.0.3 has no null-only schema, as for a scalar one.
+        [] => {
+            map.remove("type");
+        }
+        [single] => {
+            let nullable = concrete.len() != types.len();
+            map.insert("type".into(), single.clone());
+            if nullable {
+                map.insert("nullable".into(), Value::Bool(true));
+            }
+        }
+        many => {
+            let branches: Vec<Value> = many.iter().map(|t| json!({ "type": t })).collect();
+            map.remove("type");
+            // A union is already there to constrain the value, and merging two
+            // is not something a generated document should be inventing.
+            if !map.contains_key("oneOf") && !map.contains_key("anyOf") {
+                map.insert("oneOf".into(), Value::Array(branches));
+            }
+        }
+    }
 }
 
 /// `enum: [a, b, null]` -> `enum: [a, b]` + `nullable: true`.
@@ -159,8 +187,37 @@ fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
 /// key, say — rewriting it would change the documented payload. `enum` and
 /// `const` values are read at the schema level but are likewise instance data
 /// inside.
+///
+/// Only meaningful in keyword position: inside a `properties` map the same
+/// word is a field name, which is what `is_name_keyed_map` exists to catch.
 fn is_instance_data(key: &str) -> bool {
     matches!(key, "example" | "examples" | "default" | "enum" | "const") || key.starts_with("x-")
+}
+
+/// Whether a keyword's value is a map keyed by user-chosen names rather than
+/// by schema keywords — so its keys carry no meaning for this pass and each
+/// value has to be walked regardless of what it is called.
+///
+/// A DTO with a field named `example` or `default` is ordinary TypeScript, and
+/// without this its schema would be skipped and keep its 3.1 constructs.
+fn is_name_keyed_map(key: &str) -> bool {
+    matches!(
+        key,
+        "properties"
+            | "patternProperties"
+            | "$defs"
+            | "definitions"
+            | "schemas"
+            | "paths"
+            | "responses"
+            | "content"
+            | "headers"
+            | "encoding"
+            | "callbacks"
+            | "links"
+            | "securitySchemes"
+            | "variables"
+    )
 }
 
 /// `{type: "null"}` on its own -> an unconstrained schema.
@@ -397,12 +454,48 @@ mod tests {
     }
 
     #[test]
-    fn leaves_a_multi_type_array_alone() {
-        // 3.0.3 cannot express it and the analyser never emits one; rewriting
-        // it would mean inventing a meaning.
+    fn downgrades_a_property_whose_name_is_a_skipped_keyword() {
+        // `properties` keys are field names, not keywords: a DTO with a field
+        // called `example` or `default` still needs its schema downgraded.
+        assert_eq!(
+            down(json!({
+                "type": "object",
+                "properties": {
+                    "example": {"type": ["string", "null"]},
+                    "default": {"type": ["number", "null"]},
+                    "x-status": {"type": ["boolean", "null"]}
+                }
+            })),
+            json!({
+                "type": "object",
+                "properties": {
+                    "example": {"type": "string", "nullable": true},
+                    "default": {"type": "number", "nullable": true},
+                    "x-status": {"type": "boolean", "nullable": true}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn splits_a_multi_type_array_into_a_union() {
+        assert_eq!(
+            down(json!({"type": ["string", "number"]})),
+            json!({"oneOf": [{"type": "string"}, {"type": "number"}]})
+        );
+        // The null member is dropped with it, the same nullability loss any
+        // union takes.
         assert_eq!(
             down(json!({"type": ["string", "number", "null"]})),
-            json!({"type": ["string", "number", "null"]})
+            json!({"oneOf": [{"type": "string"}, {"type": "number"}]})
+        );
+    }
+
+    #[test]
+    fn a_null_only_type_array_becomes_unconstrained() {
+        assert_eq!(
+            down(json!({"type": ["null"], "description": "d"})),
+            json!({"description": "d"})
         );
     }
 
