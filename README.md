@@ -277,7 +277,8 @@ verbatim through `interceptors[].response.schema`:
 | `enum: [a, b, null]` | `enum: [a, b]` + `nullable: true` |
 | `oneOf: [<schema>, {type: "null"}]` | `<schema>` — **nullability is lost** |
 | `type: "null"` on its own | an unconstrained schema — **the type is lost** |
-| `type: [A, B]` (multi-type) | `oneOf: [{type: A}, {type: B}]` |
+| `type: [A, B]` (multi-type) | `anyOf: [{type: A}, {type: B}]` |
+| `const: v` | `enum: [v]` |
 | `prefixItems: [A, B]`, `items: false` | `items: <A merged with B>` + `minItems`/`maxItems` — **order is lost** |
 
 The three lossy rows are limits of 3.0.3, not shortcuts. `nullable` only means

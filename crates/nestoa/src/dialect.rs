@@ -19,7 +19,8 @@
 //! | `enum: [a, b, null]`                     | `enum: [a, b]` + `nullable: true`  |
 //! | `oneOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
 //! | `type: "null"` on its own                | unconstrained — the type is lost   |
-//! | `type: [A, B]` (multi-type)              | `oneOf: [{type: A}, {type: B}]`    |
+//! | `type: [A, B]` (multi-type)              | `anyOf: [{type: A}, {type: B}]`    |
+//! | `const: v`                               | `enum: [v]`                        |
 //!
 //! The last two rows are real losses, and unavoidable rather than shortcuts:
 //! `nullable` only means something beside a `type` keyword, and a union — which
@@ -61,6 +62,7 @@ pub fn downgrade_to_30(doc: &mut Value) {
             downgrade_null_type(map);
             downgrade_null_enum(map);
             downgrade_standalone_null(map);
+            downgrade_const(map);
             for (key, value) in map.iter_mut() {
                 if is_name_keyed_map(key) {
                     // `properties`, `paths`, `content`, … are keyed by names
@@ -107,12 +109,20 @@ fn downgrade_null_type(map: &mut Map<String, Value>) {
             }
         }
         many => {
-            let branches: Vec<Value> = many.iter().map(|t| json!({ "type": t })).collect();
+            // `anyOf`, not `oneOf`: the members can overlap (an integer is
+            // also a number), and `oneOf` rejects a value matching more than
+            // one branch. Nullability rides on the first branch, which has a
+            // `type` for `nullable` to attach to, so it survives here.
+            let nullable = many.len() != types.len();
+            let mut branches: Vec<Value> = many.iter().map(|t| json!({ "type": t })).collect();
+            if nullable && let Some(Value::Object(first)) = branches.first_mut() {
+                first.insert("nullable".into(), Value::Bool(true));
+            }
             map.remove("type");
             // A union is already there to constrain the value, and merging two
             // is not something a generated document should be inventing.
             if !map.contains_key("oneOf") && !map.contains_key("anyOf") {
-                map.insert("oneOf".into(), Value::Array(branches));
+                map.insert("anyOf".into(), Value::Array(branches));
             }
         }
     }
@@ -232,32 +242,64 @@ fn downgrade_standalone_null(map: &mut Map<String, Value>) {
     }
 }
 
-/// `{type: array, prefixItems: [A, B], items: false}` -> a homogeneous array of
-/// the merged element schema, with the tuple's arity kept as min/maxItems.
+/// A `prefixItems` tuple -> a homogeneous array approximating it.
+///
+/// 3.0.3 arrays have one element schema, so the per-position types are merged
+/// into a single `items` and the length is carried by `minItems`/`maxItems`.
+/// `items: false` closes the tuple, which is what the analyser emits and what
+/// pins `maxItems`; `items: <schema>` instead means "then any number of
+/// these", so the tail joins the merge and the array stays open. Bounds
+/// already on the schema are left as they are.
 fn downgrade_tuple(map: &mut Map<String, Value>) {
     let Some(Value::Array(prefix)) = map.remove("prefixItems") else {
         return;
     };
     let arity = prefix.len();
+    let tail = map.remove("items");
+    let closed = tail == Some(Value::Bool(false));
+
     let mut distinct: Vec<Value> = Vec::new();
-    for element in prefix {
-        if !distinct.contains(&element) {
+    let mut push = |element: Value| {
+        if element.is_object() && !distinct.contains(&element) {
             distinct.push(element);
         }
+    };
+    prefix.into_iter().for_each(&mut push);
+    if let Some(tail) = tail.filter(|_| !closed) {
+        push(tail);
     }
+
     match distinct.len() {
-        0 => {
-            map.remove("items");
-        }
+        // Nothing to constrain elements with: an empty closed tuple, or an
+        // open one whose tail is `true`.
+        0 => {}
         1 => {
             map.insert("items".into(), distinct.into_iter().next().unwrap());
         }
+        // `anyOf` for the same overlap reason as a multi-type array.
         _ => {
-            map.insert("items".into(), json!({ "oneOf": distinct }));
+            map.insert("items".into(), json!({ "anyOf": distinct }));
         }
     }
-    map.insert("minItems".into(), json!(arity));
-    map.insert("maxItems".into(), json!(arity));
+    map.entry("minItems").or_insert_with(|| json!(arity));
+    if closed {
+        map.entry("maxItems").or_insert_with(|| json!(arity));
+    }
+}
+
+/// `const: v` -> `enum: [v]`, the 3.0.3 way to pin a single value.
+///
+/// Skipping the walk into `const` protects the instance value; the keyword
+/// itself still has to go, since 3.0.3 has no `const`. A `const` of `null` is
+/// a null-only schema by another name and degrades the same way.
+fn downgrade_const(map: &mut Map<String, Value>) {
+    let Some(value) = map.remove("const") else {
+        return;
+    };
+    if value.is_null() || map.contains_key("enum") {
+        return;
+    }
+    map.insert("enum".into(), Value::Array(vec![value]));
 }
 
 fn is_null_type_name(value: &Value) -> bool {
@@ -371,7 +413,7 @@ mod tests {
             })),
             json!({
                 "type": "array",
-                "items": {"oneOf": [{"type": "string"}, {"type": "number"}]},
+                "items": {"anyOf": [{"type": "string"}, {"type": "number"}]},
                 "minItems": 2,
                 "maxItems": 2
             })
@@ -479,15 +521,68 @@ mod tests {
 
     #[test]
     fn splits_a_multi_type_array_into_a_union() {
+        // `anyOf`, not `oneOf`: overlapping members such as integer/number
+        // match more than one branch, which `oneOf` rejects.
         assert_eq!(
-            down(json!({"type": ["string", "number"]})),
-            json!({"oneOf": [{"type": "string"}, {"type": "number"}]})
+            down(json!({"type": ["integer", "number"]})),
+            json!({"anyOf": [{"type": "integer"}, {"type": "number"}]})
         );
-        // The null member is dropped with it, the same nullability loss any
-        // union takes.
+        // Nullability survives here — a branch with a plain `type` can carry
+        // the flag, so it does not have to be dropped.
         assert_eq!(
             down(json!({"type": ["string", "number", "null"]})),
-            json!({"oneOf": [{"type": "string"}, {"type": "number"}]})
+            json!({"anyOf": [{"type": "string", "nullable": true}, {"type": "number"}]})
+        );
+    }
+
+    #[test]
+    fn converts_const_to_a_single_value_enum() {
+        assert_eq!(
+            down(json!({"type": "string", "const": "ok"})),
+            json!({"type": "string", "enum": ["ok"]})
+        );
+        // A const of null is a null-only schema by another name.
+        assert_eq!(down(json!({"const": null})), json!({}));
+        // The instance value itself is never walked.
+        assert_eq!(
+            down(json!({"const": {"type": "null"}})),
+            json!({"enum": [{"type": "null"}]})
+        );
+    }
+
+    #[test]
+    fn keeps_an_open_tuple_open() {
+        // `items: <schema>` means "and then any number of these" — the tail
+        // schema joins the approximation and there is no upper bound.
+        assert_eq!(
+            down(json!({
+                "type": "array",
+                "prefixItems": [{"type": "string"}],
+                "items": {"type": "number"}
+            })),
+            json!({
+                "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "number"}]},
+                "minItems": 1
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_explicit_bounds_on_a_tuple() {
+        assert_eq!(
+            down(json!({
+                "type": "array",
+                "prefixItems": [{"type": "number"}, {"type": "number"}],
+                "items": false,
+                "minItems": 1
+            })),
+            json!({
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 1,
+                "maxItems": 2
+            })
         );
     }
 
