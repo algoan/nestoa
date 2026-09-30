@@ -29,6 +29,12 @@ pub struct ComponentSchemas {
     /// Every component name currently in use (reserved while lowering, or
     /// committed). Guards against handing out a name that is already taken.
     allocated: HashSet<String>,
+    /// Recursive instantiations already lowered, keyed by declaration + the
+    /// arguments bound to it. Lives here rather than on `SchemaCtx` because a
+    /// context is built per interceptor rewrite: without it, a second route
+    /// instantiating `TreeNode<Project>` would lower a duplicate component
+    /// under a fresh name instead of reusing the first.
+    instantiated: HashMap<InstantiationKey, String>,
 }
 
 impl ComponentSchemas {
@@ -138,15 +144,18 @@ pub struct SchemaCtx<'a> {
     /// owner's name (`Party` + `Identity` -> `PartyIdentity`). `None` at the
     /// top level (route bodies/responses), so the first type keeps its bare name.
     pub current_owner: Option<String>,
-    /// Instantiations whose body is currently being lowered by
-    /// `instantiate_generic`, keyed by declaration *and* the concrete arguments
-    /// bound to it. A generic type whose body reaches itself (`TreeNode<T>`
-    /// holding `TreeNode<T>[]`) has no finite inlining, so the re-entrant
-    /// reference becomes a `$ref` to the name held here — allocated on first
-    /// re-entry, `None` until then, so a type that never recurses is still
-    /// inlined. Keying on the arguments keeps `TreeNode<Project>` and
-    /// `TreeNode<Widget>` on separate components.
-    pub instantiating: HashMap<InstantiationKey, Option<String>>,
+    /// Declarations whose body `instantiate_generic` is currently lowering.
+    /// Keyed on the declaration alone — *not* on its arguments — because a
+    /// polymorphically recursive type (`Nest<T>` holding `Nest<Nest<T>>`)
+    /// presents different arguments at every level and would never repeat an
+    /// argument-keyed entry. Reaching a declaration already being lowered means
+    /// the type has no finite inlining, so the reference becomes a `$ref` to
+    /// the name carried here: `.1` is the name to allocate from, `.0` the hint
+    /// it is built from, filled in only on the first such re-entry so a type
+    /// that never recurses is still inlined whole. Arguments are lowered before
+    /// the entry is made, so a finite nesting (`Box<Box<T>>`) completes and
+    /// unmarks before the outer level marks itself.
+    pub instantiating: HashMap<(std::path::PathBuf, String), (String, Option<String>)>,
 }
 
 impl<'a> SchemaCtx<'a> {
@@ -562,36 +571,50 @@ impl<'a> SchemaCtx<'a> {
             );
         }
         let key = instantiation_key(decl_file, type_name, &params, &new_env);
-        // Re-entered while its own body is still being lowered: the type
-        // reaches itself, which has no finite inlining. Hand back a `$ref` to a
-        // name reserved for this exact instantiation — the body completing
-        // below is registered under it. The name is allocated here, on first
-        // re-entry, so a type that never recurses is still inlined whole.
-        if let Some(slot) = self.instantiating.get(&key).cloned() {
-            let name = match slot {
+        // Already lowered — by an earlier route, or an earlier field of this
+        // one. Recursive instantiations are components, so reuse the existing
+        // one rather than lowering a duplicate under a fresh name.
+        if let Some(name) = self.components.instantiated.get(&key) {
+            return Some(ref_value(name));
+        }
+        let decl = (decl_file.to_path_buf(), type_name.to_string());
+        // This declaration is already being lowered further up the stack, so it
+        // reaches itself and has no finite inlining. Cut the cycle with a `$ref`
+        // to the enclosing instantiation, allocating its name on this first
+        // re-entry. Matching on the declaration alone is what makes a
+        // polymorphically recursive type terminate: its arguments grow at every
+        // level and would never match.
+        if let Some((hint, allocated)) = self.instantiating.get(&decl).cloned() {
+            let name = match allocated {
                 Some(name) => name,
                 None => {
-                    let base = sanitize_name(type_name);
-                    let suffix = instantiation_suffix(&params, &new_env);
-                    let name = self.components.fresh_name("", &format!("{base}{suffix}"));
+                    let name = self.components.fresh_name("", &hint);
                     self.components.allocated.insert(name.clone());
-                    self.instantiating.insert(key, Some(name.clone()));
+                    self.instantiating.insert(decl, (hint, Some(name.clone())));
                     name
                 }
             };
             return Some(ref_value(&name));
         }
-        self.instantiating.insert(key.clone(), None);
+        // The name a re-entry would take, built from *this* level's arguments so
+        // the component is named after what it actually holds.
+        let hint = format!(
+            "{}{}",
+            sanitize_name(type_name),
+            instantiation_suffix(&params, &new_env)
+        );
+        self.instantiating.insert(decl.clone(), (hint, None));
         let saved = self.type_env.replace(new_env);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.type_env = saved;
         // A name is present only if the body reached back here. Registering the
-        // finished schema under it makes every level of the recursion — and any
-        // later route instantiating the same declaration with the same
-        // arguments — share one component.
-        match self.instantiating.remove(&key).flatten() {
+        // finished schema under it makes every level of the recursion share one
+        // component, and recording the instantiation makes later routes binding
+        // the same arguments reuse it instead of allocating a near-duplicate.
+        match self.instantiating.remove(&decl).and_then(|(_, name)| name) {
             Some(name) => {
                 self.components.schemas.insert(name.clone(), schema);
+                self.components.instantiated.insert(key, name.clone());
                 Some(ref_value(&name))
             }
             None => Some(schema),

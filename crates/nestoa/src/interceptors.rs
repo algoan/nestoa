@@ -454,6 +454,42 @@ mod tests {
         }
     "#;
 
+    const SAME_TYPE_TWO_ROUTE_CONTROLLER: &str = r#"
+        import { PaginationBodyInterceptor, DataToPaginate } from './pagination';
+        import { Project } from './project.dto';
+
+        @Controller('things')
+        export class ThingsController {
+            @Get('a')
+            @UseInterceptors(new PaginationBodyInterceptor({ perPageName: 'limit' }))
+            public async a(): Promise<DataToPaginate<Project>> {
+                return null as any;
+            }
+
+            @Get('b')
+            @UseInterceptors(new PaginationBodyInterceptor({ perPageName: 'limit' }))
+            public async b(): Promise<DataToPaginate<Project>> {
+                return null as any;
+            }
+        }
+    "#;
+
+    const POLY_NEST_DTS: &str = r#"
+        export interface DataToPaginate<T> {
+            resources: T[];
+        }
+        export interface Nest<T> {
+            child: Nest<Nest<T>>;
+        }
+        interface PaginatedData<T> {
+            resources: Nest<T>[];
+        }
+        export declare class PaginationBodyInterceptor<T>
+            implements NestInterceptor<DataToPaginate<T>, PaginatedData<T>> {
+            intercept(): unknown;
+        }
+    "#;
+
     const NESTED_BOX_DTS: &str = r#"
         export interface DataToPaginate<T> {
             resources: T[];
@@ -578,6 +614,102 @@ mod tests {
     /// `Out`, instantiation used to re-enter it without a guard and recurse
     /// until the stack was exhausted (SIGABRT). It now becomes one component
     /// per argument binding, self-referential on the wire.
+    /// A polymorphically recursive type — `Nest<T>` holding `Nest<Nest<T>>` —
+    /// presents *different* arguments at every level, so an argument-keyed
+    /// cycle guard never repeats an entry and recurses until the stack dies.
+    /// The guard matches on the declaration instead, cutting the cycle with a
+    /// `$ref` to the enclosing instantiation.
+    #[test]
+    fn polymorphically_recursive_generic_terminates() {
+        let (project, _dir, paths) = build(
+            "polynest",
+            &[
+                ("pagination.d.ts", POLY_NEST_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                (
+                    "projects.controller.ts",
+                    &paginated_controller("Promise<DataToPaginate<Project>>"),
+                ),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let resp = routes
+            .iter()
+            .find(|r| r.path == "/projects")
+            .and_then(|r| r.response.as_ref())
+            .expect("response schema");
+        assert_eq!(
+            resp.get("properties")
+                .and_then(|p| p.get("resources"))
+                .and_then(|r| r.get("items"))
+                .and_then(|i| i.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/NestProject"),
+        );
+        // The cycle is cut by pointing back at the enclosing instantiation: an
+        // approximation, since each level is a genuinely different type, but the
+        // only finite schema for it.
+        let nest = components.schemas.get("NestProject").expect("NestProject");
+        assert_eq!(
+            nest.get("properties")
+                .and_then(|p| p.get("child"))
+                .and_then(|c| c.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/NestProject"),
+        );
+    }
+
+    /// Two routes binding the same recursive generic to the *same* element type
+    /// must share one component. `instantiating` is per-`SchemaCtx` and a
+    /// context is built per interceptor rewrite, so without the completed-
+    /// instantiation map on `ComponentSchemas` the second route lowered a
+    /// duplicate under a fresh name (`TreeNodeProject2`).
+    #[test]
+    fn identical_recursive_instantiations_share_one_component() {
+        let (project, _dir, paths) = build(
+            "rectree3",
+            &[
+                ("pagination.d.ts", TREE_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                ("things.controller.ts", SAME_TYPE_TWO_ROUTE_CONTROLLER),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let element = |path: &str| -> String {
+            routes
+                .iter()
+                .find(|r| r.path == path)
+                .and_then(|r| r.response.as_ref())
+                .and_then(|s| s.get("properties"))
+                .and_then(|p| p.get("resources"))
+                .and_then(|r| r.get("items"))
+                .and_then(|i| i.get("$ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(element("/things/a"), "#/components/schemas/TreeNodeProject");
+        assert_eq!(
+            element("/things/a"),
+            element("/things/b"),
+            "both routes reuse one component",
+        );
+        let dupes: Vec<&String> = components
+            .schemas
+            .keys()
+            .filter(|k| k.starts_with("TreeNode"))
+            .collect();
+        assert_eq!(
+            dupes,
+            vec!["TreeNodeProject"],
+            "no near-duplicate component"
+        );
+    }
+
     #[test]
     fn recursive_generic_under_interceptor_terminates() {
         let (project, _dir, paths) = build(
