@@ -170,7 +170,7 @@ pub fn rewrite_response(
         components,
         type_env: Some(env),
         current_owner: None,
-        instantiating: HashSet::new(),
+        instantiating: HashMap::new(),
         passthrough_types: &config.passthrough_types,
     };
     let schema = lower_inline(&mut ctx, &current_file, &current_ty);
@@ -433,6 +433,40 @@ mod tests {
 
     const PROJECT_DTO: &str = "export class Project { id: string; name?: string; }";
 
+    const TWO_ROUTE_CONTROLLER: &str = r#"
+        import { PaginationBodyInterceptor, DataToPaginate } from './pagination';
+        import { Project } from './project.dto';
+        import { Widget } from './widget.dto';
+
+        @Controller('things')
+        export class ThingsController {
+            @Get('projects')
+            @UseInterceptors(new PaginationBodyInterceptor({ perPageName: 'limit' }))
+            public async projects(): Promise<DataToPaginate<Project>> {
+                return null as any;
+            }
+
+            @Get('widgets')
+            @UseInterceptors(new PaginationBodyInterceptor({ perPageName: 'limit' }))
+            public async widgets(): Promise<DataToPaginate<Widget>> {
+                return null as any;
+            }
+        }
+    "#;
+
+    const NESTED_BOX_DTS: &str = r#"
+        export interface DataToPaginate<T> {
+            resources: T[];
+        }
+        interface Box<U> {
+            value: U;
+        }
+        export declare class PaginationBodyInterceptor<T>
+            implements NestInterceptor<DataToPaginate<T>, Box<Box<T>>> {
+            intercept(): unknown;
+        }
+    "#;
+
     fn paginated_controller(ret: &str) -> String {
         format!(
             r#"
@@ -542,8 +576,8 @@ mod tests {
     /// A generic type that reaches itself (`TreeNode<T>` holding `TreeNode<T>[]`)
     /// cannot be inlined to a finite schema. Reached through an interceptor's
     /// `Out`, instantiation used to re-enter it without a guard and recurse
-    /// until the stack was exhausted (SIGABRT). The outer instantiation is still
-    /// inlined; the self reference falls back to a shared `$ref`.
+    /// until the stack was exhausted (SIGABRT). It now becomes one component
+    /// per argument binding, self-referential on the wire.
     #[test]
     fn recursive_generic_under_interceptor_terminates() {
         let (project, _dir, paths) = build(
@@ -562,13 +596,21 @@ mod tests {
 
         let route = routes.iter().find(|r| r.path == "/projects").unwrap();
         let resp = route.response.as_ref().expect("response schema");
-        let node = resp
-            .get("properties")
-            .and_then(|p| p.get("resources"))
-            .and_then(|r| r.get("items"))
-            .expect("resources items");
+        assert_eq!(
+            resp.get("properties")
+                .and_then(|p| p.get("resources"))
+                .and_then(|r| r.get("items"))
+                .and_then(|i| i.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/TreeNodeProject"),
+            "the recursive element is a component named after its argument",
+        );
 
-        // The outer instantiation is still inlined, with T bound to the element DTO.
+        let node = components
+            .schemas
+            .get("TreeNodeProject")
+            .expect("recursive component registered");
+        // The argument is bound concretely...
         assert_eq!(
             node.get("properties")
                 .and_then(|p| p.get("value"))
@@ -576,16 +618,118 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("#/components/schemas/Project"),
         );
-        // The self reference terminates as a `$ref` instead of recursing forever.
+        // ...and the self reference points back at the same component, which is
+        // the finite form of a recursive schema.
         assert_eq!(
             node.get("properties")
                 .and_then(|p| p.get("children"))
                 .and_then(|c| c.get("items"))
                 .and_then(|i| i.get("$ref"))
                 .and_then(|v| v.as_str()),
-            Some("#/components/schemas/TreeNode"),
+            Some("#/components/schemas/TreeNodeProject"),
         );
-        assert!(components.schemas.contains_key("TreeNode"));
+    }
+
+    /// Two routes instantiating the same recursive generic with different
+    /// element types must not share one component: keying the in-progress
+    /// instantiation on the declaration alone made the second route's children
+    /// reference the first route's tree.
+    #[test]
+    fn recursive_generic_keeps_each_element_type_apart() {
+        let (project, _dir, paths) = build(
+            "rectree2",
+            &[
+                ("pagination.d.ts", TREE_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                ("widget.dto.ts", "export class Widget { sku: string; }"),
+                ("things.controller.ts", TWO_ROUTE_CONTROLLER),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[3].clone()]);
+
+        let element = |path: &str| -> String {
+            routes
+                .iter()
+                .find(|r| r.path == path)
+                .and_then(|r| r.response.as_ref())
+                .and_then(|s| s.get("properties"))
+                .and_then(|p| p.get("resources"))
+                .and_then(|r| r.get("items"))
+                .and_then(|i| i.get("$ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let projects = element("/things/projects");
+        let widgets = element("/things/widgets");
+        assert_ne!(
+            projects, widgets,
+            "each element type gets its own component"
+        );
+        assert_eq!(projects, "#/components/schemas/TreeNodeProject");
+        assert_eq!(widgets, "#/components/schemas/TreeNodeWidget");
+
+        // Each component binds its own element type, and recurses into itself.
+        for (component, element) in [("TreeNodeProject", "Project"), ("TreeNodeWidget", "Widget")] {
+            let node = components.schemas.get(component).expect(component);
+            assert_eq!(
+                node.get("properties")
+                    .and_then(|p| p.get("value"))
+                    .and_then(|v| v.get("$ref"))
+                    .and_then(|v| v.as_str()),
+                Some(format!("#/components/schemas/{element}").as_str()),
+            );
+            assert_eq!(
+                node.get("properties")
+                    .and_then(|p| p.get("children"))
+                    .and_then(|c| c.get("items"))
+                    .and_then(|i| i.get("$ref"))
+                    .and_then(|v| v.as_str()),
+                Some(format!("#/components/schemas/{component}").as_str()),
+            );
+        }
+    }
+
+    /// `Box<Box<T>>` is finite nesting, not recursion. Marking the declaration
+    /// active before lowering its arguments made the inner reference look
+    /// re-entrant, stranding the callee's own parameter unbound.
+    #[test]
+    fn repeated_generic_in_arguments_is_not_recursion() {
+        let (project, _dir, paths) = build(
+            "boxbox",
+            &[
+                ("pagination.d.ts", NESTED_BOX_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                (
+                    "projects.controller.ts",
+                    &paginated_controller("Promise<DataToPaginate<Project>>"),
+                ),
+            ],
+        );
+        let config = Config::default();
+        let (routes, _components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let resp = routes
+            .iter()
+            .find(|r| r.path == "/projects")
+            .and_then(|r| r.response.as_ref())
+            .expect("response schema");
+        // Both levels inline, and the innermost value is the bound element.
+        assert_eq!(
+            resp.get("properties")
+                .and_then(|p| p.get("value"))
+                .and_then(|v| v.get("properties"))
+                .and_then(|p| p.get("value"))
+                .and_then(|v| v.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Project"),
+        );
+        let flat = serde_json::to_string(resp).unwrap();
+        assert!(
+            !flat.contains("x-unresolved"),
+            "no parameter left unbound: {flat}"
+        );
     }
 
     #[test]

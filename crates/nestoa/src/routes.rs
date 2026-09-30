@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -273,7 +273,7 @@ impl<'a> Extractor<'a> {
                         components: self.components,
                         type_env: None,
                         current_owner: None,
-                        instantiating: HashSet::new(),
+                        instantiating: HashMap::new(),
                         passthrough_types: &self.config.passthrough_types,
                     };
                     let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
@@ -297,7 +297,7 @@ impl<'a> Extractor<'a> {
                     components: self.components,
                     type_env: None,
                     current_owner: None,
-                    instantiating: HashSet::new(),
+                    instantiating: HashMap::new(),
                     passthrough_types: &self.config.passthrough_types,
                 };
                 method_doc
@@ -433,7 +433,7 @@ impl<'a> Extractor<'a> {
             components: self.components,
             type_env: None,
             current_owner: None,
-            instantiating: HashSet::new(),
+            instantiating: HashMap::new(),
             passthrough_types: &self.config.passthrough_types,
         };
         let schema = pat_info
