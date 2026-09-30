@@ -716,6 +716,17 @@ impl<'a> SchemaCtx<'a> {
                 }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
+                        // A `static` member lives on the constructor, never on an
+                        // instance, so it is never part of the serialized body.
+                        // A `private` one is explicitly outside the public
+                        // contract — same intent as the `@private` JSDoc tag.
+                        // Both routinely hold internals (loggers, caches) whose
+                        // types would otherwise be dragged into the components.
+                        if p.is_static
+                            || p.accessibility == Some(swc_ecma_ast::Accessibility::Private)
+                        {
+                            continue;
+                        }
                         let name = match &p.key {
                             swc_ecma_ast::PropName::Ident(i) => i.sym.to_string(),
                             swc_ecma_ast::PropName::Str(s) => {
@@ -1348,6 +1359,52 @@ mod tests {
             }
         }
         (project, dir, sources, file_starts)
+    }
+
+    /// `static` members live on the constructor and `private` ones are outside
+    /// the public contract, so neither belongs in a serialized body. Both are
+    /// common homes for internals (a logger, a cache) whose types would
+    /// otherwise be pulled into `components.schemas`.
+    #[test]
+    fn static_and_private_class_props_are_omitted() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            r#"
+            import { Logger } from '@nestjs/common';
+            export class Account {
+                private static readonly logger: Logger = new Logger('Account');
+                private secret: string;
+                static VERSION: number;
+                public id: string;
+                label?: string;
+            }
+            "#,
+        )]);
+        let mut components = ComponentSchemas::default();
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: HashSet::new(),
+            passthrough_types: &[],
+        };
+        let dto_file = dir.join("dto.ts");
+        let (decl_file, sym) = project.resolve(&dto_file, "Account").unwrap();
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+
+        let props = schema.get("properties").unwrap();
+        assert!(props.get("id").is_some(), "public instance prop kept");
+        assert!(props.get("label").is_some(), "optional public prop kept");
+        assert!(props.get("logger").is_none(), "private static prop dropped");
+        assert!(props.get("secret").is_none(), "private prop dropped");
+        assert!(props.get("VERSION").is_none(), "static prop dropped");
+        // The dropped members must not drag their types into the components.
+        assert!(!components.schemas.contains_key("Logger"));
     }
 
     #[test]
