@@ -170,7 +170,7 @@ pub fn rewrite_response(
         components,
         type_env: Some(env),
         current_owner: None,
-        instantiating: HashMap::new(),
+        instantiating: Vec::new(),
         passthrough_types: &config.passthrough_types,
     };
     let schema = lower_inline(&mut ctx, &current_file, &current_ty);
@@ -474,6 +474,26 @@ mod tests {
         }
     "#;
 
+    /// Mirrors `schema::MAX_INSTANTIATION_DEPTH`.
+    const MAX_NEST_LEVELS: usize = 4;
+
+    const PAIR_DTS: &str = r#"
+        export interface DataToPaginate<T> {
+            resources: T[];
+        }
+        export interface Pair<A> {
+            a: A;
+            other: Pair<string>;
+        }
+        interface PaginatedData<T> {
+            resources: Pair<T>[];
+        }
+        export declare class PaginationBodyInterceptor<T>
+            implements NestInterceptor<DataToPaginate<T>, PaginatedData<T>> {
+            intercept(): unknown;
+        }
+    "#;
+
     const POLY_NEST_DTS: &str = r#"
         export interface DataToPaginate<T> {
             resources: T[];
@@ -615,10 +635,10 @@ mod tests {
     /// until the stack was exhausted (SIGABRT). It now becomes one component
     /// per argument binding, self-referential on the wire.
     /// A polymorphically recursive type — `Nest<T>` holding `Nest<Nest<T>>` —
-    /// presents *different* arguments at every level, so an argument-keyed
-    /// cycle guard never repeats an entry and recurses until the stack dies.
-    /// The guard matches on the declaration instead, cutting the cycle with a
-    /// `$ref` to the enclosing instantiation.
+    /// produces a *fresh* argument binding at every level, so it never repeats
+    /// an instantiation and cannot terminate on its own. Each level is lowered
+    /// faithfully up to `MAX_INSTANTIATION_DEPTH`, then folded back onto the
+    /// outermost instance so the schema closes.
     #[test]
     fn polymorphically_recursive_generic_terminates() {
         let (project, _dir, paths) = build(
@@ -635,29 +655,104 @@ mod tests {
         let config = Config::default();
         let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
 
-        let resp = routes
+        let entry = routes
             .iter()
             .find(|r| r.path == "/projects")
             .and_then(|r| r.response.as_ref())
-            .expect("response schema");
-        assert_eq!(
-            resp.get("properties")
-                .and_then(|p| p.get("resources"))
-                .and_then(|r| r.get("items"))
-                .and_then(|i| i.get("$ref"))
-                .and_then(|v| v.as_str()),
-            Some("#/components/schemas/NestProject"),
-        );
-        // The cycle is cut by pointing back at the enclosing instantiation: an
-        // approximation, since each level is a genuinely different type, but the
-        // only finite schema for it.
-        let nest = components.schemas.get("NestProject").expect("NestProject");
-        assert_eq!(
-            nest.get("properties")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("resources"))
+            .and_then(|r| r.get("items"))
+            .and_then(|i| i.get("$ref"))
+            .and_then(|v| v.as_str())
+            .expect("element $ref");
+
+        // Walk `child` from the entry point: the chain must close onto a
+        // component already seen rather than run off, and do so within the
+        // depth bound.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = entry.rsplit('/').next().unwrap().to_string();
+        loop {
+            if seen.contains(&cursor) {
+                break;
+            }
+            seen.push(cursor.clone());
+            assert!(seen.len() <= 8, "chain did not close: {seen:?}");
+            let node = components
+                .schemas
+                .get(&cursor)
+                .unwrap_or_else(|| panic!("missing component {cursor}"));
+            cursor = node
+                .get("properties")
                 .and_then(|p| p.get("child"))
                 .and_then(|c| c.get("$ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{cursor}.child is not a $ref"))
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string();
+        }
+        assert_eq!(seen.len(), MAX_NEST_LEVELS, "expanded to the depth bound");
+    }
+
+    /// A declaration referring to itself with *different* arguments is not
+    /// recursion: `Pair<A>` holding `other: Pair<string>` must lower that field
+    /// as its own instantiation, keeping `string`. Guarding on the declaration
+    /// alone collapsed it onto the enclosing `Pair<Project>`, so `other.a` came
+    /// out as `Project`.
+    #[test]
+    fn same_declaration_with_other_arguments_is_not_recursion() {
+        let (project, _dir, paths) = build(
+            "pairargs",
+            &[
+                ("pagination.d.ts", PAIR_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                (
+                    "projects.controller.ts",
+                    &paginated_controller("Promise<DataToPaginate<Project>>"),
+                ),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let outer = routes
+            .iter()
+            .find(|r| r.path == "/projects")
+            .and_then(|r| r.response.as_ref())
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("resources"))
+            .and_then(|r| r.get("items"))
+            .expect("element schema");
+
+        // The outer binding keeps its own argument...
+        assert_eq!(
+            outer
+                .get("properties")
+                .and_then(|p| p.get("a"))
+                .and_then(|a| a.get("$ref"))
                 .and_then(|v| v.as_str()),
-            Some("#/components/schemas/NestProject"),
+            Some("#/components/schemas/Project"),
+        );
+        // ...and `other` resolves to a *separate* instance bound to `string`.
+        let other = outer
+            .get("properties")
+            .and_then(|p| p.get("other"))
+            .and_then(|o| o.get("$ref"))
+            .and_then(|v| v.as_str())
+            .expect("other $ref")
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let inner = components.schemas.get(other).expect("inner instance");
+        assert_eq!(
+            inner
+                .get("properties")
+                .and_then(|p| p.get("a"))
+                .and_then(|a| a.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("string"),
+            "the inner instantiation keeps its own `string` argument",
         );
     }
 

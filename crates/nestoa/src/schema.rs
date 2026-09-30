@@ -88,6 +88,15 @@ pub struct TypeBinding {
 /// Map of type-parameter name -> bound concrete type.
 pub type TypeEnv = HashMap<String, TypeBinding>;
 
+/// How deep one declaration may be re-instantiated with *fresh* arguments
+/// before the expansion is folded back onto the instance already in flight.
+/// A type that refers to itself with different arguments is not recursive and
+/// must be lowered on its own — `Pair<A>` holding `other: Pair<string>` — but a
+/// polymorphically recursive one (`Nest<T>` holding `Nest<Nest<T>>`) produces a
+/// fresh binding at every level and would never stop. Real DTOs nest a handful
+/// of levels at most, so the bound only ever bites on the pathological case.
+const MAX_INSTANTIATION_DEPTH: usize = 4;
+
 /// Identity of one generic instantiation: the declaration it expands, plus the
 /// lowered shapes bound to its parameters. Two references to the same generic
 /// with different arguments are different instantiations.
@@ -144,18 +153,14 @@ pub struct SchemaCtx<'a> {
     /// owner's name (`Party` + `Identity` -> `PartyIdentity`). `None` at the
     /// top level (route bodies/responses), so the first type keeps its bare name.
     pub current_owner: Option<String>,
-    /// Declarations whose body `instantiate_generic` is currently lowering.
-    /// Keyed on the declaration alone — *not* on its arguments — because a
-    /// polymorphically recursive type (`Nest<T>` holding `Nest<Nest<T>>`)
-    /// presents different arguments at every level and would never repeat an
-    /// argument-keyed entry. Reaching a declaration already being lowered means
-    /// the type has no finite inlining, so the reference becomes a `$ref` to
-    /// the name carried here: `.1` is the name to allocate from, `.0` the hint
-    /// it is built from, filled in only on the first such re-entry so a type
-    /// that never recurses is still inlined whole. Arguments are lowered before
-    /// the entry is made, so a finite nesting (`Box<Box<T>>`) completes and
-    /// unmarks before the outer level marks itself.
-    pub instantiating: HashMap<(std::path::PathBuf, String), (String, Option<String>)>,
+    /// The instantiations `instantiate_generic` is currently lowering, outermost
+    /// first: the identity, the component name to build if it is ever referred
+    /// back to, and that name once allocated. Allocating lazily keeps a
+    /// declaration that never refers to itself inlined whole. Arguments are
+    /// lowered before an entry is pushed, so a finite nesting (`Box<Box<T>>`)
+    /// completes and pops before the outer level pushes, and is never mistaken
+    /// for recursion.
+    pub instantiating: Vec<(InstantiationKey, String, Option<String>)>,
 }
 
 impl<'a> SchemaCtx<'a> {
@@ -577,41 +582,52 @@ impl<'a> SchemaCtx<'a> {
         if let Some(name) = self.components.instantiated.get(&key) {
             return Some(ref_value(name));
         }
-        let decl = (decl_file.to_path_buf(), type_name.to_string());
-        // This declaration is already being lowered further up the stack, so it
-        // reaches itself and has no finite inlining. Cut the cycle with a `$ref`
-        // to the enclosing instantiation, allocating its name on this first
-        // re-entry. Matching on the declaration alone is what makes a
-        // polymorphically recursive type terminate: its arguments grow at every
-        // level and would never match.
-        if let Some((hint, allocated)) = self.instantiating.get(&decl).cloned() {
-            let name = match allocated {
-                Some(name) => name,
-                None => {
-                    let name = self.components.fresh_name("", &hint);
-                    self.components.allocated.insert(name.clone());
-                    self.instantiating.insert(decl, (hint, Some(name.clone())));
-                    name
-                }
-            };
+        // The same declaration bound to the same arguments, still in flight:
+        // genuine recursion, with no finite inlining. Point at the instance
+        // already being lowered.
+        if let Some(i) = self.instantiating.iter().position(|(k, ..)| *k == key) {
+            let name = self.reserve_instantiation_name(i);
             return Some(ref_value(&name));
         }
-        // The name a re-entry would take, built from *this* level's arguments so
-        // the component is named after what it actually holds.
+        // A *different* binding of a declaration in flight is not recursion —
+        // `Pair<Project>` holding `other: Pair<string>` — so it is lowered on
+        // its own and keeps its own argument. Only a declaration that keeps
+        // producing fresh bindings fails to terminate that way, so past
+        // `MAX_INSTANTIATION_DEPTH` the expansion folds onto the outermost
+        // instance of it in flight.
+        let deep = self
+            .instantiating
+            .iter()
+            .filter(|(k, ..)| k.0 == decl_file && k.1 == type_name)
+            .count()
+            >= MAX_INSTANTIATION_DEPTH;
+        if deep
+            && let Some(i) = self
+                .instantiating
+                .iter()
+                .position(|(k, ..)| k.0 == decl_file && k.1 == type_name)
+        {
+            let name = self.reserve_instantiation_name(i);
+            return Some(ref_value(&name));
+        }
+        // The name this instance would take if something refers back to it,
+        // built from its own arguments so the component is named after what it
+        // actually holds.
         let hint = format!(
             "{}{}",
             sanitize_name(type_name),
             instantiation_suffix(&params, &new_env)
         );
-        self.instantiating.insert(decl.clone(), (hint, None));
+        self.instantiating.push((key.clone(), hint, None));
         let saved = self.type_env.replace(new_env);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.type_env = saved;
-        // A name is present only if the body reached back here. Registering the
-        // finished schema under it makes every level of the recursion share one
-        // component, and recording the instantiation makes later routes binding
-        // the same arguments reuse it instead of allocating a near-duplicate.
-        match self.instantiating.remove(&decl).and_then(|(_, name)| name) {
+        // A name is present only if something referred back to this instance.
+        // Registering the finished schema under it makes every level of the
+        // recursion share one component, and recording the instantiation makes
+        // a later route binding the same arguments reuse it.
+        let (_, _, name) = self.instantiating.pop().expect("instantiation in flight");
+        match name {
             Some(name) => {
                 self.components.schemas.insert(name.clone(), schema);
                 self.components.instantiated.insert(key, name.clone());
@@ -619,6 +635,19 @@ impl<'a> SchemaCtx<'a> {
             }
             None => Some(schema),
         }
+    }
+
+    /// The component name for the instantiation at `idx`, allocated on first
+    /// use: an instance nothing refers back to is inlined and never named.
+    fn reserve_instantiation_name(&mut self, idx: usize) -> String {
+        if let Some(name) = &self.instantiating[idx].2 {
+            return name.clone();
+        }
+        let hint = self.instantiating[idx].1.clone();
+        let name = self.components.fresh_name("", &hint);
+        self.components.allocated.insert(name.clone());
+        self.instantiating[idx].2 = Some(name.clone());
+        name
     }
 
     fn type_lit_schema(&mut self, file: &Path, lit: &TsTypeLit) -> Value {
@@ -1142,7 +1171,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let derived_file = dir.join("derived.ts");
@@ -1187,7 +1216,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &passthrough,
         };
         let holder_file = dir.join("holder.ts");
@@ -1228,7 +1257,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let holder_file = dir.join("holder.ts");
@@ -1294,7 +1323,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1356,7 +1385,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1396,7 +1425,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1482,7 +1511,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1515,7 +1544,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1546,7 +1575,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let iface_file = dir.join("iface.ts");
@@ -1588,7 +1617,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1627,7 +1656,7 @@ mod tests {
             components: &mut components2,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file2 = dir2.join("dto.ts");
@@ -1660,7 +1689,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
-            instantiating: HashMap::new(),
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
