@@ -837,15 +837,16 @@ impl<'a> SchemaCtx<'a> {
                 }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
-                        // A `static` member lives on the constructor, never on an
-                        // instance, so it is never part of the serialized body.
-                        // A `private` one is explicitly outside the public
-                        // contract — same intent as the `@private` JSDoc tag.
-                        // Both routinely hold internals (loggers, caches) whose
-                        // types would otherwise be dragged into the components.
-                        if p.is_static
-                            || p.accessibility == Some(swc_ecma_ast::Accessibility::Private)
-                        {
+                        // A `static` member lives on the constructor, never on
+                        // an instance, so it is never part of the serialized
+                        // body — and it routinely holds internals (a logger, a
+                        // cache) whose types would otherwise be dragged into the
+                        // components. Accessibility is deliberately *not*
+                        // considered: TypeScript erases `private`, so such a
+                        // field is still serialized and still belongs on the
+                        // wire. Use the `@internal`/`@private` JSDoc tag to drop
+                        // one on purpose.
+                        if p.is_static {
                             continue;
                         }
                         let name = match &p.key {
@@ -1482,20 +1483,22 @@ mod tests {
         (project, dir, sources, file_starts)
     }
 
-    /// `static` members live on the constructor and `private` ones are outside
-    /// the public contract, so neither belongs in a serialized body. Both are
-    /// common homes for internals (a logger, a cache) whose types would
-    /// otherwise be pulled into `components.schemas`.
+    /// `static` members live on the constructor and are never part of an
+    /// instance's JSON, so they do not belong in a body schema — they are also
+    /// where internals like a logger live, whose types would otherwise be
+    /// pulled into `components.schemas`. A `private` *instance* field is a
+    /// different matter: TypeScript erases it, so it is still serialized and is
+    /// kept.
     #[test]
-    fn static_and_private_class_props_are_omitted() {
+    fn static_class_props_are_omitted_but_private_instance_ones_are_kept() {
         let (project, dir) = project_from(&[(
             "dto.ts",
             r#"
             import { Logger } from '@nestjs/common';
             export class Account {
                 private static readonly logger: Logger = new Logger('Account');
-                private secret: string;
                 static VERSION: number;
+                private secret: string;
                 public id: string;
                 label?: string;
             }
@@ -1521,8 +1524,11 @@ mod tests {
         let props = schema.get("properties").unwrap();
         assert!(props.get("id").is_some(), "public instance prop kept");
         assert!(props.get("label").is_some(), "optional public prop kept");
+        assert!(
+            props.get("secret").is_some(),
+            "a private instance field is erased at runtime and still serialized",
+        );
         assert!(props.get("logger").is_none(), "private static prop dropped");
-        assert!(props.get("secret").is_none(), "private prop dropped");
         assert!(props.get("VERSION").is_none(), "static prop dropped");
         // The dropped members must not drag their types into the components.
         assert!(!components.schemas.contains_key("Logger"));
