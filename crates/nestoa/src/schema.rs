@@ -100,6 +100,11 @@ pub struct SchemaCtx<'a> {
     /// owner's name (`Party` + `Identity` -> `PartyIdentity`). `None` at the
     /// top level (route bodies/responses), so the first type keeps its bare name.
     pub current_owner: Option<String>,
+    /// Declarations currently being inlined by `instantiate_generic`. A generic
+    /// type whose body reaches itself (`TreeNode<T>` holding `TreeNode<T>[]`)
+    /// has no finite inlining, so a re-entrant instantiation is refused and
+    /// falls back to the shared `$ref` path, which terminates.
+    pub instantiating: HashSet<(std::path::PathBuf, String)>,
 }
 
 impl<'a> SchemaCtx<'a> {
@@ -384,7 +389,7 @@ impl<'a> SchemaCtx<'a> {
             // element types never collapse onto one shared `$ref` component.
             if self.type_env.is_some()
                 && let Some(args) = &r.type_params
-                && let Some(inlined) = self.instantiate_generic(file, &decl_file, &sym, args)
+                && let Some(inlined) = self.instantiate_generic(file, &decl_file, &name, &sym, args)
             {
                 return inlined;
             }
@@ -487,11 +492,22 @@ impl<'a> SchemaCtx<'a> {
         &mut self,
         file: &Path,
         decl_file: &Path,
+        type_name: &str,
         sym: &Symbol,
         args: &TsTypeParamInstantiation,
     ) -> Option<Value> {
         let params = generic_param_names(sym);
         if params.is_empty() {
+            return None;
+        }
+        // A generic type whose body reaches itself (`TreeNode<T>` holding
+        // `TreeNode<T>[]`) has no finite inlining — re-entering here would
+        // recurse until the stack is exhausted. Refuse the nested instantiation
+        // so the caller falls back to `component_ref`, which reserves the
+        // component name *before* lowering and therefore resolves the self
+        // reference to a `$ref` and terminates.
+        let key = (decl_file.to_path_buf(), type_name.to_string());
+        if !self.instantiating.insert(key.clone()) {
             return None;
         }
         let mut new_env: TypeEnv = HashMap::new();
@@ -509,6 +525,7 @@ impl<'a> SchemaCtx<'a> {
         let saved = self.type_env.replace(new_env);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.type_env = saved;
+        self.instantiating.remove(&key);
         Some(schema)
     }
 
@@ -1022,6 +1039,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let derived_file = dir.join("derived.ts");
@@ -1066,6 +1084,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &passthrough,
         };
         let holder_file = dir.join("holder.ts");
@@ -1106,6 +1125,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let holder_file = dir.join("holder.ts");
@@ -1171,6 +1191,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1232,6 +1253,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1271,6 +1293,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1343,6 +1366,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1373,6 +1397,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let iface_file = dir.join("iface.ts");
@@ -1414,6 +1439,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1452,6 +1478,7 @@ mod tests {
             components: &mut components2,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let dto_file2 = dir2.join("dto.ts");
@@ -1484,6 +1511,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: HashSet::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");

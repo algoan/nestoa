@@ -170,6 +170,7 @@ pub fn rewrite_response(
         components,
         type_env: Some(env),
         current_owner: None,
+        instantiating: HashSet::new(),
         passthrough_types: &config.passthrough_types,
     };
     let schema = lower_inline(&mut ctx, &current_file, &current_ty);
@@ -519,6 +520,72 @@ mod tests {
         let (project, _dir, paths) = build("nonexp", &[("pagination.d.ts", PAGINATION_DTS)]);
         let resolved = project.resolve(&paths[0], "PaginatedData");
         assert!(matches!(resolved, Some((_, Symbol::Interface(_)))));
+    }
+
+    const TREE_DTS: &str = r#"
+        export interface TreeNode<T> {
+            value: T;
+            children: TreeNode<T>[];
+        }
+        interface PaginatedData<T> {
+            resources: TreeNode<T>[];
+        }
+        export interface DataToPaginate<T> {
+            resources: T[];
+        }
+        export declare class PaginationBodyInterceptor<T>
+            implements NestInterceptor<DataToPaginate<T>, PaginatedData<T>> {
+            intercept(): unknown;
+        }
+    "#;
+
+    /// A generic type that reaches itself (`TreeNode<T>` holding `TreeNode<T>[]`)
+    /// cannot be inlined to a finite schema. Reached through an interceptor's
+    /// `Out`, instantiation used to re-enter it without a guard and recurse
+    /// until the stack was exhausted (SIGABRT). The outer instantiation is still
+    /// inlined; the self reference falls back to a shared `$ref`.
+    #[test]
+    fn recursive_generic_under_interceptor_terminates() {
+        let (project, _dir, paths) = build(
+            "rectree",
+            &[
+                ("pagination.d.ts", TREE_DTS),
+                ("project.dto.ts", PROJECT_DTO),
+                (
+                    "projects.controller.ts",
+                    &paginated_controller("Promise<DataToPaginate<Project>>"),
+                ),
+            ],
+        );
+        let config = Config::default();
+        let (routes, components) = extract(&config, &project, &[paths[2].clone()]);
+
+        let route = routes.iter().find(|r| r.path == "/projects").unwrap();
+        let resp = route.response.as_ref().expect("response schema");
+        let node = resp
+            .get("properties")
+            .and_then(|p| p.get("resources"))
+            .and_then(|r| r.get("items"))
+            .expect("resources items");
+
+        // The outer instantiation is still inlined, with T bound to the element DTO.
+        assert_eq!(
+            node.get("properties")
+                .and_then(|p| p.get("value"))
+                .and_then(|v| v.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/Project"),
+        );
+        // The self reference terminates as a `$ref` instead of recursing forever.
+        assert_eq!(
+            node.get("properties")
+                .and_then(|p| p.get("children"))
+                .and_then(|c| c.get("items"))
+                .and_then(|i| i.get("$ref"))
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/TreeNode"),
+        );
+        assert!(components.schemas.contains_key("TreeNode"));
     }
 
     #[test]
