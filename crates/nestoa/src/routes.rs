@@ -273,6 +273,7 @@ impl<'a> Extractor<'a> {
                         components: self.components,
                         type_env: None,
                         current_owner: None,
+                        instantiating: Vec::new(),
                         passthrough_types: &self.config.passthrough_types,
                     };
                     let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
@@ -296,6 +297,7 @@ impl<'a> Extractor<'a> {
                     components: self.components,
                     type_env: None,
                     current_owner: None,
+                    instantiating: Vec::new(),
                     passthrough_types: &self.config.passthrough_types,
                 };
                 method_doc
@@ -431,6 +433,7 @@ impl<'a> Extractor<'a> {
             components: self.components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &self.config.passthrough_types,
         };
         let schema = pat_info

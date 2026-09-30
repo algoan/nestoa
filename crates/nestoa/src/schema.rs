@@ -29,6 +29,12 @@ pub struct ComponentSchemas {
     /// Every component name currently in use (reserved while lowering, or
     /// committed). Guards against handing out a name that is already taken.
     allocated: HashSet<String>,
+    /// Recursive instantiations already lowered, keyed by declaration + the
+    /// arguments bound to it. Lives here rather than on `SchemaCtx` because a
+    /// context is built per interceptor rewrite: without it, a second route
+    /// instantiating `TreeNode<Project>` would lower a duplicate component
+    /// under a fresh name instead of reusing the first.
+    instantiated: HashMap<InstantiationKey, String>,
 }
 
 impl ComponentSchemas {
@@ -82,6 +88,53 @@ pub struct TypeBinding {
 /// Map of type-parameter name -> bound concrete type.
 pub type TypeEnv = HashMap<String, TypeBinding>;
 
+/// How deep one declaration may be re-instantiated with *fresh* arguments
+/// before the expansion is folded back onto the instance already in flight.
+/// A type that refers to itself with different arguments is not recursive and
+/// must be lowered on its own — `Pair<A>` holding `other: Pair<string>` — but a
+/// polymorphically recursive one (`Nest<T>` holding `Nest<Nest<T>>`) produces a
+/// fresh binding at every level and would never stop. Real DTOs nest a handful
+/// of levels at most, so the bound only ever bites on the pathological case.
+const MAX_INSTANTIATION_DEPTH: usize = 4;
+
+/// Identity of one generic instantiation: the declaration it expands, plus the
+/// lowered shapes bound to its parameters. Two references to the same generic
+/// with different arguments are different instantiations.
+pub type InstantiationKey = (std::path::PathBuf, String, String);
+
+/// Build an `InstantiationKey`, signing the bindings by their lowered schemas so
+/// the identity follows the concrete shape rather than how it was spelled.
+fn instantiation_key(
+    decl_file: &Path,
+    type_name: &str,
+    params: &[String],
+    env: &TypeEnv,
+) -> InstantiationKey {
+    let sig: Vec<&Value> = params
+        .iter()
+        .filter_map(|p| env.get(p)?.resolved.as_ref())
+        .collect();
+    (
+        decl_file.to_path_buf(),
+        type_name.to_string(),
+        serde_json::to_string(&sig).unwrap_or_default(),
+    )
+}
+
+/// Name a recursive instantiation after the components its arguments resolved
+/// to (`TreeNode` + `Project` -> `TreeNodeProject`), so sibling instantiations
+/// read apart instead of colliding on a numeric suffix.
+fn instantiation_suffix(params: &[String], env: &TypeEnv) -> String {
+    params
+        .iter()
+        .filter_map(|p| {
+            let r = env.get(p)?.resolved.as_ref()?;
+            let name = r.get("$ref")?.as_str()?.rsplit('/').next()?;
+            Some(sanitize_name(name))
+        })
+        .collect()
+}
+
 pub struct SchemaCtx<'a> {
     pub project: &'a Project,
     pub sources: &'a HashMap<std::path::PathBuf, String>,
@@ -100,6 +153,14 @@ pub struct SchemaCtx<'a> {
     /// owner's name (`Party` + `Identity` -> `PartyIdentity`). `None` at the
     /// top level (route bodies/responses), so the first type keeps its bare name.
     pub current_owner: Option<String>,
+    /// The instantiations `instantiate_generic` is currently lowering, outermost
+    /// first: the identity, the component name to build if it is ever referred
+    /// back to, and that name once allocated. Allocating lazily keeps a
+    /// declaration that never refers to itself inlined whole. Arguments are
+    /// lowered before an entry is pushed, so a finite nesting (`Box<Box<T>>`)
+    /// completes and pops before the outer level pushes, and is never mistaken
+    /// for recursion.
+    pub instantiating: Vec<(InstantiationKey, String, Option<String>)>,
 }
 
 impl<'a> SchemaCtx<'a> {
@@ -384,7 +445,7 @@ impl<'a> SchemaCtx<'a> {
             // element types never collapse onto one shared `$ref` component.
             if self.type_env.is_some()
                 && let Some(args) = &r.type_params
-                && let Some(inlined) = self.instantiate_generic(file, &decl_file, &sym, args)
+                && let Some(inlined) = self.instantiate_generic(file, &decl_file, &name, &sym, args)
             {
                 return inlined;
             }
@@ -482,11 +543,14 @@ impl<'a> SchemaCtx<'a> {
     /// scope it was written in even though the callee reuses the name `T` for
     /// its own parameter. The body is then lowered under only the fresh
     /// bindings, and inlined rather than `$ref`d so distinct instantiations
-    /// (different element types) do not collide on one component.
+    /// (different element types) do not collide on one component. The exception
+    /// is a declaration that reaches itself, which cannot be inlined finitely:
+    /// it becomes one component per distinct argument binding.
     fn instantiate_generic(
         &mut self,
         file: &Path,
         decl_file: &Path,
+        type_name: &str,
         sym: &Symbol,
         args: &TsTypeParamInstantiation,
     ) -> Option<Value> {
@@ -494,6 +558,11 @@ impl<'a> SchemaCtx<'a> {
         if params.is_empty() {
             return None;
         }
+        // Arguments are lowered in the *caller's* scope, before this
+        // declaration is marked active: they belong to the reference site, not
+        // to the body about to be expanded. Marking first would read a finite
+        // nesting like `Box<Box<T>>` as recursion and leave the inner
+        // argument's own parameter unbound.
         let mut new_env: TypeEnv = HashMap::new();
         for (param, arg) in params.iter().zip(args.params.iter()) {
             let resolved = self.ts_type_to_schema(file, arg);
@@ -506,10 +575,79 @@ impl<'a> SchemaCtx<'a> {
                 },
             );
         }
+        let key = instantiation_key(decl_file, type_name, &params, &new_env);
+        // Already lowered — by an earlier route, or an earlier field of this
+        // one. Recursive instantiations are components, so reuse the existing
+        // one rather than lowering a duplicate under a fresh name.
+        if let Some(name) = self.components.instantiated.get(&key) {
+            return Some(ref_value(name));
+        }
+        // The same declaration bound to the same arguments, still in flight:
+        // genuine recursion, with no finite inlining. Point at the instance
+        // already being lowered.
+        if let Some(i) = self.instantiating.iter().position(|(k, ..)| *k == key) {
+            let name = self.reserve_instantiation_name(i);
+            return Some(ref_value(&name));
+        }
+        // A *different* binding of a declaration in flight is not recursion —
+        // `Pair<Project>` holding `other: Pair<string>` — so it is lowered on
+        // its own and keeps its own argument. Only a declaration that keeps
+        // producing fresh bindings fails to terminate that way, so past
+        // `MAX_INSTANTIATION_DEPTH` the expansion folds onto the outermost
+        // instance of it in flight.
+        let deep = self
+            .instantiating
+            .iter()
+            .filter(|(k, ..)| k.0 == decl_file && k.1 == type_name)
+            .count()
+            >= MAX_INSTANTIATION_DEPTH;
+        if deep
+            && let Some(i) = self
+                .instantiating
+                .iter()
+                .position(|(k, ..)| k.0 == decl_file && k.1 == type_name)
+        {
+            let name = self.reserve_instantiation_name(i);
+            return Some(ref_value(&name));
+        }
+        // The name this instance would take if something refers back to it,
+        // built from its own arguments so the component is named after what it
+        // actually holds.
+        let hint = format!(
+            "{}{}",
+            sanitize_name(type_name),
+            instantiation_suffix(&params, &new_env)
+        );
+        self.instantiating.push((key.clone(), hint, None));
         let saved = self.type_env.replace(new_env);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.type_env = saved;
-        Some(schema)
+        // A name is present only if something referred back to this instance.
+        // Registering the finished schema under it makes every level of the
+        // recursion share one component, and recording the instantiation makes
+        // a later route binding the same arguments reuse it.
+        let (_, _, name) = self.instantiating.pop().expect("instantiation in flight");
+        match name {
+            Some(name) => {
+                self.components.schemas.insert(name.clone(), schema);
+                self.components.instantiated.insert(key, name.clone());
+                Some(ref_value(&name))
+            }
+            None => Some(schema),
+        }
+    }
+
+    /// The component name for the instantiation at `idx`, allocated on first
+    /// use: an instance nothing refers back to is inlined and never named.
+    fn reserve_instantiation_name(&mut self, idx: usize) -> String {
+        if let Some(name) = &self.instantiating[idx].2 {
+            return name.clone();
+        }
+        let hint = self.instantiating[idx].1.clone();
+        let name = self.components.fresh_name("", &hint);
+        self.components.allocated.insert(name.clone());
+        self.instantiating[idx].2 = Some(name.clone());
+        name
     }
 
     fn type_lit_schema(&mut self, file: &Path, lit: &TsTypeLit) -> Value {
@@ -699,6 +837,18 @@ impl<'a> SchemaCtx<'a> {
                 }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
+                        // A `static` member lives on the constructor, never on
+                        // an instance, so it is never part of the serialized
+                        // body — and it routinely holds internals (a logger, a
+                        // cache) whose types would otherwise be dragged into the
+                        // components. Accessibility is deliberately *not*
+                        // considered: TypeScript erases `private`, so such a
+                        // field is still serialized and still belongs on the
+                        // wire. Use the `@internal`/`@private` JSDoc tag to drop
+                        // one on purpose.
+                        if p.is_static {
+                            continue;
+                        }
                         let name = match &p.key {
                             swc_ecma_ast::PropName::Ident(i) => i.sym.to_string(),
                             swc_ecma_ast::PropName::Str(s) => {
@@ -1022,6 +1172,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let derived_file = dir.join("derived.ts");
@@ -1066,6 +1217,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &passthrough,
         };
         let holder_file = dir.join("holder.ts");
@@ -1106,6 +1258,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let holder_file = dir.join("holder.ts");
@@ -1171,6 +1324,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1232,6 +1386,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1271,6 +1426,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let root_file = dir.join("root.ts");
@@ -1327,6 +1483,57 @@ mod tests {
         (project, dir, sources, file_starts)
     }
 
+    /// `static` members live on the constructor and are never part of an
+    /// instance's JSON, so they do not belong in a body schema — they are also
+    /// where internals like a logger live, whose types would otherwise be
+    /// pulled into `components.schemas`. A `private` *instance* field is a
+    /// different matter: TypeScript erases it, so it is still serialized and is
+    /// kept.
+    #[test]
+    fn static_class_props_are_omitted_but_private_instance_ones_are_kept() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            r#"
+            import { Logger } from '@nestjs/common';
+            export class Account {
+                private static readonly logger: Logger = new Logger('Account');
+                static VERSION: number;
+                private secret: string;
+                public id: string;
+                label?: string;
+            }
+            "#,
+        )]);
+        let mut components = ComponentSchemas::default();
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let dto_file = dir.join("dto.ts");
+        let (decl_file, sym) = project.resolve(&dto_file, "Account").unwrap();
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+
+        let props = schema.get("properties").unwrap();
+        assert!(props.get("id").is_some(), "public instance prop kept");
+        assert!(props.get("label").is_some(), "optional public prop kept");
+        assert!(
+            props.get("secret").is_some(),
+            "a private instance field is erased at runtime and still serialized",
+        );
+        assert!(props.get("logger").is_none(), "private static prop dropped");
+        assert!(props.get("VERSION").is_none(), "static prop dropped");
+        // The dropped members must not drag their types into the components.
+        assert!(!components.schemas.contains_key("Logger"));
+    }
+
     #[test]
     fn internal_jsdoc_omits_property_from_schema() {
         // `@internal` and `@private` mark implementation-only members that are
@@ -1343,6 +1550,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1373,6 +1581,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let iface_file = dir.join("iface.ts");
@@ -1414,6 +1623,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
@@ -1452,6 +1662,7 @@ mod tests {
             components: &mut components2,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file2 = dir2.join("dto.ts");
@@ -1484,6 +1695,7 @@ mod tests {
             components: &mut components,
             type_env: None,
             current_owner: None,
+            instantiating: Vec::new(),
             passthrough_types: &[],
         };
         let dto_file = dir.join("dto.ts");
