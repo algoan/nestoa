@@ -116,8 +116,8 @@ pub struct Route {
     /// pipes, validation, and declared throws. Every one references the shared
     /// `Error` component. Sorted by status for deterministic output.
     pub errors: BTreeMap<u16, String>,
-    /// Registered by `@All` rather than an explicit verb decorator, so an
-    /// explicit handler for the same method and path takes precedence.
+    /// Registered by `@All` rather than an explicit verb decorator. Between
+    /// the two, whichever was registered first serves the method.
     pub catch_all: bool,
 }
 
@@ -924,7 +924,22 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             .or_insert_with(errors::error_schema);
     }
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
+    // NestJS registers handlers in declaration order and the router serves the
+    // first match, so an `@All` and an explicit verb on the same method and path
+    // resolve to whichever came first. Two explicit handlers keep last-wins.
+    let mut catch_all_slots: std::collections::HashSet<(&str, HttpMethod)> =
+        std::collections::HashSet::new();
     for r in routes {
+        let slot = (r.path.as_str(), r.method);
+        let taken = paths
+            .get(&r.path)
+            .is_some_and(|ops| ops.contains_key(r.method.as_lower()));
+        if catch_all_slots.contains(&slot) || (r.catch_all && taken) {
+            continue;
+        }
+        if r.catch_all {
+            catch_all_slots.insert(slot);
+        }
         let entry = paths.entry(r.path.clone()).or_default();
         let mut op = Map::new();
         if let Some(s) = &r.summary {
@@ -1021,12 +1036,7 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             responses.insert(code.to_string(), Value::Object(status));
         }
         op.insert("responses".into(), Value::Object(responses));
-        let method = r.method.as_lower().to_string();
-        if r.catch_all {
-            entry.entry(method).or_insert(Value::Object(op));
-        } else {
-            entry.insert(method, Value::Object(op));
-        }
+        entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
 
     // Sort paths, and the HTTP methods within each path, alphabetically. Routes
@@ -1639,9 +1649,33 @@ mod tests {
     }
 
     #[test]
-    fn explicit_verb_wins_over_all_on_the_same_path() {
-        let routes = extract_routes(
-            "first-wins",
+    fn first_of_all_and_explicit_verb_serves_the_method() {
+        let summaries = |name, body| {
+            let routes = extract_routes(name, body);
+            let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+            let ops = &doc["paths"]["/proxy"];
+            (
+                ops["get"]["summary"].clone(),
+                ops["post"]["summary"].clone(),
+            )
+        };
+        let explicit_first = summaries(
+            "explicit-first",
+            r#"
+            @Controller('proxy')
+            export class ProxyController {
+                /** Explicit read */
+                @Get()
+                read() {}
+                /** Catch-all */
+                @All()
+                forward() {}
+            }
+            "#,
+        );
+        assert_eq!(explicit_first, (json!("Explicit read"), json!("Catch-all")));
+        let all_first = summaries(
+            "all-first",
             r#"
             @Controller('proxy')
             export class ProxyController {
@@ -1654,9 +1688,7 @@ mod tests {
             }
             "#,
         );
-        let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
-        assert_eq!(doc["paths"]["/proxy"]["get"]["summary"], "Explicit read");
-        assert_eq!(doc["paths"]["/proxy"]["post"]["summary"], "Catch-all");
+        assert_eq!(all_first, (json!("Catch-all"), json!("Catch-all")));
     }
 
     #[test]
