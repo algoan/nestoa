@@ -187,11 +187,16 @@ impl<'a> Extractor<'a> {
                     // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
                     // where the argument names a numeric `const` (possibly
                     // imported from another module, e.g. `@algoan/multi-status`).
-                    http_code = numeric_arg(d).or_else(|| {
-                        ident_arg(d)
-                            .and_then(|c| self.project.resolve_const_number(file, &c))
-                            .map(|v| v as u16)
-                    });
+                    http_code = numeric_arg(d)
+                        .or_else(|| {
+                            ident_arg(d)
+                                .and_then(|c| self.project.resolve_const_number(file, &c))
+                                .map(|v| v as u16)
+                        })
+                        .or_else(|| {
+                            member_arg(d)
+                                .and_then(|(obj, prop)| self.member_status(file, &obj, &prop))
+                        });
                 }
             }
             let Some((method, sub_paths)) = http else {
@@ -388,6 +393,26 @@ impl<'a> Extractor<'a> {
                     ..template.clone()
                 });
             }
+        }
+    }
+
+    /// The status named by `@HttpCode(<Enum>.<MEMBER>)`: a member of an enum
+    /// in the symbol table, or of NestJS's `HttpStatus`, whose declarations are
+    /// not parsed unless `@nestjs/common` is in `resolvePackages`.
+    fn member_status(&self, file: &Path, enum_name: &str, member: &str) -> Option<u16> {
+        if let Some(v) = self
+            .project
+            .resolve_enum_member_number(file, enum_name, member)
+        {
+            return Some(v as u16);
+        }
+        let binding = self.project.symbols.get(file)?.imports.get(enum_name)?;
+        if binding.specifier == "@nestjs/common"
+            && binding.imported.as_deref() == Some("HttpStatus")
+        {
+            errors::nest_http_status(member)
+        } else {
+            None
         }
     }
 
@@ -615,6 +640,23 @@ fn ident_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
     };
     match call.args.first()?.expr.as_ref() {
         Expr::Ident(i) => Some(i.sym.to_string()),
+        _ => None,
+    }
+}
+
+/// The `(object, property)` names of a decorator's first argument when it is a
+/// plain member access, e.g. `("HttpStatus", "NO_CONTENT")`.
+fn member_arg(d: &swc_ecma_ast::Decorator) -> Option<(String, String)> {
+    let Expr::Call(call) = &*d.expr else {
+        return None;
+    };
+    let Expr::Member(m) = call.args.first()?.expr.as_ref() else {
+        return None;
+    };
+    match (m.obj.as_ref(), &m.prop) {
+        (Expr::Ident(obj), swc_ecma_ast::MemberProp::Ident(prop)) => {
+            Some((obj.sym.to_string(), prop.sym.to_string()))
+        }
         _ => None,
     }
 }
@@ -1390,6 +1432,52 @@ mod tests {
         ));
         assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/incomes".to_string()));
         assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/expenses".to_string()));
+    }
+
+    fn find<'r>(routes: &'r [Route], method: HttpMethod, path: &str) -> &'r Route {
+        routes
+            .iter()
+            .find(|r| r.method == method && r.path == path)
+            .unwrap_or_else(|| panic!("no {method:?} {path}"))
+    }
+
+    #[test]
+    fn http_code_resolves_enum_members() {
+        let controller = r#"
+            import { HttpStatus, HttpStatus as Status } from '@nestjs/common';
+            import { Codes } from './codes';
+            const settings = { code: 299 };
+
+            @Controller('items')
+            export class ItemsController {
+                @Delete(':id')
+                @HttpCode(HttpStatus.NO_CONTENT)
+                remove() {}
+                @Post()
+                @HttpCode(Status.OK)
+                create() {}
+                @Put(':id')
+                @HttpCode(Codes.Later)
+                replace() {}
+                @Patch(':id')
+                @HttpCode(settings.code)
+                update() {}
+            }
+        "#;
+        let (routes, _) = extract_with_sources(
+            "httpcode-enum",
+            &[
+                ("ctrl.ts", controller),
+                ("codes.ts", "export enum Codes { Accepted = 202, Later }"),
+            ],
+            "ctrl.ts",
+        );
+        let status = |m, p| find(&routes, m, p).status_code;
+        assert_eq!(status(HttpMethod::Delete, "/items/{id}"), 204);
+        assert_eq!(status(HttpMethod::Post, "/items"), 200);
+        assert_eq!(status(HttpMethod::Put, "/items/{id}"), 203);
+        // Not an enum: falls back to the method default.
+        assert_eq!(status(HttpMethod::Patch, "/items/{id}"), 200);
     }
 
     #[test]
