@@ -364,7 +364,20 @@ impl<'a> SchemaCtx<'a> {
                 }
                 return json!({ "type": "array" });
             }
-            "Partial" | "Required" | "Readonly" | "NonNullable" => {
+            "Partial" | "Required" => {
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    let base = self.ts_type_to_schema(file, first);
+                    let edit = if name == "Partial" {
+                        ObjectEdit::AllOptional
+                    } else {
+                        ObjectEdit::AllRequired
+                    };
+                    return self.reshape_object(base, &edit);
+                }
+            }
+            "Readonly" | "NonNullable" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
@@ -375,49 +388,18 @@ impl<'a> SchemaCtx<'a> {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
-                    let mut base = self.ts_type_to_schema(file, first);
-                    // If base ended up as a $ref, inline a clone of the referenced
-                    // schema so we can mutate its property set.
-                    if let Some(refname) = base
-                        .get("$ref")
-                        .and_then(|v| v.as_str())
-                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
-                        .map(|s| s.to_string())
-                        && let Some(inlined) = self.components.schemas.get(&refname).cloned()
-                    {
-                        base = inlined;
-                    }
-                    if name == "Omit" {
-                        if let (Some(second), Value::Object(obj)) = (args.params.get(1), &mut base)
-                        {
-                            let to_remove = collect_string_keys(second);
-                            if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                                for k in &to_remove {
-                                    props.remove(k);
-                                }
-                            }
-                            if let Some(Value::Array(req)) = obj.get_mut("required") {
-                                req.retain(|v| match v.as_str() {
-                                    Some(s) => !to_remove.iter().any(|k| k == s),
-                                    None => true,
-                                });
-                            }
-                        }
-                    } else if name == "Pick"
-                        && let (Some(second), Value::Object(obj)) = (args.params.get(1), &mut base)
-                    {
-                        let keep = collect_string_keys(second);
-                        if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                            props.retain(|k, _| keep.iter().any(|x| x == k));
-                        }
-                        if let Some(Value::Array(req)) = obj.get_mut("required") {
-                            req.retain(|v| match v.as_str() {
-                                Some(s) => keep.iter().any(|k| k == s),
-                                None => true,
-                            });
-                        }
-                    }
-                    return base;
+                    let base = self.ts_type_to_schema(file, first);
+                    let keys = args
+                        .params
+                        .get(1)
+                        .map(|k| collect_string_keys(k))
+                        .unwrap_or_default();
+                    let edit = if name == "Omit" {
+                        ObjectEdit::Omit(keys)
+                    } else {
+                        ObjectEdit::Pick(keys)
+                    };
+                    return self.reshape_object(base, &edit);
                 }
             }
             "Record" => {
@@ -696,6 +678,99 @@ impl<'a> SchemaCtx<'a> {
         Value::Object(out)
     }
 
+    /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
+    /// inlining it first so inherited properties are edited too. A schema that
+    /// cannot be flattened (a union, or a component still being lowered) is
+    /// returned unchanged.
+    fn reshape_object(&self, schema: Value, edit: &ObjectEdit) -> Value {
+        let Some(mut obj) = self.flatten_object(&schema, 0) else {
+            return schema;
+        };
+        let keys: Vec<String> = match obj.get("properties") {
+            Some(Value::Object(props)) => props.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let mut required: Vec<String> = match obj.remove("required") {
+            Some(Value::Array(r)) => r
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        match edit {
+            ObjectEdit::AllOptional => required.clear(),
+            ObjectEdit::AllRequired => required = keys,
+            ObjectEdit::Omit(drop) | ObjectEdit::Pick(drop) => {
+                let keep =
+                    |k: &str| drop.iter().any(|d| d == k) == matches!(edit, ObjectEdit::Pick(_));
+                if let Some(Value::Object(props)) = obj.get_mut("properties") {
+                    props.retain(|k, _| keep(k));
+                }
+                required.retain(|k| keep(k));
+            }
+        }
+        if !required.is_empty() {
+            obj.insert(
+                "required".into(),
+                Value::Array(required.into_iter().map(Value::String).collect()),
+            );
+        }
+        Value::Object(obj)
+    }
+
+    /// Inline `schema` into a single object: a `$ref` is replaced by its
+    /// component and `allOf` branches are merged, their `properties` and
+    /// `required` combined. `None` for anything that is not object-shaped.
+    fn flatten_object(&self, schema: &Value, depth: usize) -> Option<Map<String, Value>> {
+        const MAX_DEPTH: usize = 32;
+        let Value::Object(map) = schema else {
+            return None;
+        };
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let siblings = |skip: &str| -> Map<String, Value> {
+            let mut m = map.clone();
+            m.remove(skip);
+            m
+        };
+        if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+            let name = target.strip_prefix("#/components/schemas/")?;
+            let mut out = self.flatten_object(self.components.schemas.get(name)?, depth + 1)?;
+            out.extend(siblings("$ref"));
+            return Some(out);
+        }
+        if let Some(Value::Array(branches)) = map.get("allOf") {
+            let mut out = Map::new();
+            let mut props = Map::new();
+            let mut required: Vec<Value> = Vec::new();
+            for branch in branches {
+                let mut b = self.flatten_object(branch, depth + 1)?;
+                if let Some(Value::Object(p)) = b.remove("properties") {
+                    props.extend(p);
+                }
+                if let Some(Value::Array(r)) = b.remove("required") {
+                    for k in r {
+                        if !required.contains(&k) {
+                            required.push(k);
+                        }
+                    }
+                }
+                out.extend(b);
+            }
+            out.extend(siblings("allOf"));
+            out.insert("type".into(), Value::String("object".into()));
+            out.insert("properties".into(), Value::Object(props));
+            if !required.is_empty() {
+                out.insert("required".into(), Value::Array(required));
+            }
+            return Some(out);
+        }
+        let is_object = map.get("type").and_then(Value::as_str) == Some("object")
+            || map.contains_key("properties");
+        is_object.then(|| map.clone())
+    }
+
     pub fn symbol_to_schema(&mut self, file: &Path, sym: &Symbol) -> Value {
         match sym {
             Symbol::Interface(i) => {
@@ -958,6 +1033,15 @@ fn keyword_schema(k: TsKeywordTypeKind) -> Value {
     }
 }
 
+/// A property-set edit, as made by `Partial`/`Required`/`Omit`/`Pick` and
+/// their `@nestjs/mapped-types` counterparts.
+enum ObjectEdit {
+    AllOptional,
+    AllRequired,
+    Omit(Vec<String>),
+    Pick(Vec<String>),
+}
+
 /// Extract string literal keys from a TS type expression of the form
 /// `'a' | 'b'` or just `'a'`.
 fn collect_string_keys(ty: &TsType) -> Vec<String> {
@@ -1151,6 +1235,72 @@ mod tests {
             project.add(parser.parse_file(&path).unwrap());
         }
         (project, dir)
+    }
+
+    /// Lower each named declaration of `main.ts`, after writing `dto.ts` next to
+    /// it, and return the schemas in order.
+    fn lower_all(dto: &str, main: &str, names: &[&str]) -> Vec<Value> {
+        let (project, dir) = project_from(&[("dto.ts", dto), ("main.ts", main)]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let main_file = dir.join("main.ts");
+        names
+            .iter()
+            .map(|name| {
+                let (decl_file, sym) = project.resolve(&main_file, name).expect(name);
+                ctx.symbol_to_schema(&decl_file, &sym)
+            })
+            .collect()
+    }
+
+    fn prop_names(schema: &Value) -> Vec<&str> {
+        schema["properties"]
+            .as_object()
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    fn required_names(schema: &Value) -> Vec<&str> {
+        schema["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    const BASE_AND_CHILD: &str = "export class Base { id: string; secret: string; }\n\
+        export class Child extends Base { extra: string; note?: string; }";
+
+    #[test]
+    fn utility_types_edit_inherited_properties() {
+        let [partial, required, omit, pick] = lower_all(
+            BASE_AND_CHILD,
+            "import { Child } from './dto';\n\
+             export type P = Partial<Child>;\n\
+             export type R = Required<Child>;\n\
+             export type O = Omit<Child, 'secret' | 'note'>;\n\
+             export type K = Pick<Child, 'id' | 'note'>;",
+            &["P", "R", "O", "K"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&partial), ["id", "secret", "extra", "note"]);
+        assert!(required_names(&partial).is_empty());
+        assert_eq!(required_names(&required), ["id", "secret", "extra", "note"]);
+        assert_eq!(prop_names(&omit), ["id", "extra"]);
+        assert_eq!(required_names(&omit), ["id", "extra"]);
+        assert_eq!(prop_names(&pick), ["id", "note"]);
+        assert_eq!(required_names(&pick), ["id"]);
     }
 
     #[test]
