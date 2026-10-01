@@ -35,9 +35,56 @@ pub struct ComponentSchemas {
     /// instantiating `TreeNode<Project>` would lower a duplicate component
     /// under a fresh name instead of reusing the first.
     instantiated: HashMap<InstantiationKey, String>,
+    /// Property-set edits whose operand was still being lowered: the
+    /// component name reserved for the result, the operand, and the edit.
+    deferred: Vec<(String, Value, ObjectEdit)>,
 }
 
 impl ComponentSchemas {
+    /// Apply the property-set edits deferred while their operand was being
+    /// lowered, now that every component is complete. One deferred edit may
+    /// operate on another's result, so this repeats until nothing changes;
+    /// an operand that still cannot be flattened is emitted unchanged.
+    pub fn resolve_deferred(&mut self) {
+        let mut pending = std::mem::take(&mut self.deferred);
+        loop {
+            let before = pending.len();
+            pending.retain(
+                |(name, base, edit)| match flatten_object(&self.schemas, base, 0) {
+                    Some(obj) => {
+                        self.schemas.insert(name.clone(), apply_edit(obj, edit));
+                        false
+                    }
+                    None => true,
+                },
+            );
+            if pending.len() == before {
+                break;
+            }
+        }
+        for (name, base, _) in pending {
+            self.schemas.insert(name, base);
+        }
+    }
+
+    /// The name of a component `schema` references, directly or through an
+    /// `allOf` branch, that is reserved but not yet lowered.
+    fn pending_ref(&self, schema: &Value) -> Option<String> {
+        if let Some(name) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        {
+            let pending = self.allocated.contains(name) && !self.schemas.contains_key(name);
+            return pending.then(|| name.to_string());
+        }
+        schema
+            .get("allOf")?
+            .as_array()?
+            .iter()
+            .find_map(|branch| self.pending_ref(branch))
+    }
+
     /// Seed a schema under an exact name (used by tests). Production code goes
     /// through `SchemaCtx::component_ref`, which handles naming and dedup.
     #[cfg(test)]
@@ -730,107 +777,27 @@ impl<'a> SchemaCtx<'a> {
     }
 
     /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
-    /// inlining it first so inherited properties are edited too. A schema that
-    /// cannot be flattened (a union, or a component still being lowered) is
-    /// returned unchanged.
-    fn reshape_object(&self, schema: Value, edit: &ObjectEdit) -> Value {
-        let Some(mut obj) = self.flatten_object(&schema, 0) else {
+    /// inlining it first so inherited properties are edited too. An operand
+    /// that is a component still being lowered (a recursive `Partial<Node>`
+    /// inside `Node`) cannot be inlined yet, so the edit is registered as its
+    /// own component and applied by `ComponentSchemas::resolve_deferred`. Any
+    /// other schema that cannot be flattened, such as a union, is returned
+    /// unchanged.
+    fn reshape_object(&mut self, schema: Value, edit: &ObjectEdit) -> Value {
+        if let Some(obj) = flatten_object(&self.components.schemas, &schema, 0) {
+            return apply_edit(obj, edit);
+        }
+        let Some(base) = self.components.pending_ref(&schema) else {
             return schema;
         };
-        let keys: Vec<String> = match obj.get("properties") {
-            Some(Value::Object(props)) => props.keys().cloned().collect(),
-            _ => Vec::new(),
-        };
-        let mut required: Vec<String> = match obj.remove("required") {
-            Some(Value::Array(r)) => r
-                .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-            _ => Vec::new(),
-        };
-        match edit {
-            ObjectEdit::AllOptional => required.clear(),
-            ObjectEdit::AllRequired => required = keys,
-            ObjectEdit::Omit(drop) | ObjectEdit::Pick(drop) => {
-                let keep =
-                    |k: &str| drop.iter().any(|d| d == k) == matches!(edit, ObjectEdit::Pick(_));
-                if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                    props.retain(|k, _| keep(k));
-                }
-                required.retain(|k| keep(k));
-            }
-        }
-        if !required.is_empty() {
-            obj.insert(
-                "required".into(),
-                Value::Array(required.into_iter().map(Value::String).collect()),
-            );
-        }
-        Value::Object(obj)
-    }
-
-    /// Inline `schema` into a single object: a `$ref` is replaced by its
-    /// component and `allOf` branches are merged, their `properties` and
-    /// `required` combined; a property several branches declare keeps every
-    /// constraint, as an `allOf`. `None` for anything that is not object-shaped.
-    fn flatten_object(&self, schema: &Value, depth: usize) -> Option<Map<String, Value>> {
-        const MAX_DEPTH: usize = 32;
-        let Value::Object(map) = schema else {
-            return None;
-        };
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let siblings = |skip: &str| -> Map<String, Value> {
-            let mut m = map.clone();
-            m.remove(skip);
-            m
-        };
-        if let Some(target) = map.get("$ref").and_then(Value::as_str) {
-            let name = target.strip_prefix("#/components/schemas/")?;
-            let mut out = self.flatten_object(self.components.schemas.get(name)?, depth + 1)?;
-            out.extend(siblings("$ref"));
-            return Some(out);
-        }
-        if let Some(Value::Array(branches)) = map.get("allOf") {
-            let mut out = Map::new();
-            let mut props = Map::new();
-            let mut required: Vec<Value> = Vec::new();
-            for branch in branches {
-                let mut b = self.flatten_object(branch, depth + 1)?;
-                if let Some(Value::Object(p)) = b.remove("properties") {
-                    for (k, v) in p {
-                        match props.get_mut(&k) {
-                            Some(existing) if *existing != v => {
-                                *existing = json!({ "allOf": [existing.take(), v] });
-                            }
-                            Some(_) => {}
-                            None => {
-                                props.insert(k, v);
-                            }
-                        }
-                    }
-                }
-                if let Some(Value::Array(r)) = b.remove("required") {
-                    for k in r {
-                        if !required.contains(&k) {
-                            required.push(k);
-                        }
-                    }
-                }
-                out.extend(b);
-            }
-            out.extend(siblings("allOf"));
-            out.insert("type".into(), Value::String("object".into()));
-            out.insert("properties".into(), Value::Object(props));
-            if !required.is_empty() {
-                out.insert("required".into(), Value::Array(required));
-            }
-            return Some(out);
-        }
-        let is_object = map.get("type").and_then(Value::as_str) == Some("object")
-            || map.contains_key("properties");
-        is_object.then(|| map.clone())
+        let name = self
+            .components
+            .fresh_name("", &format!("{}{base}", edit.prefix()));
+        self.components.allocated.insert(name.clone());
+        self.components
+            .deferred
+            .push((name.clone(), schema, edit.clone()));
+        ref_value(&name)
     }
 
     pub fn symbol_to_schema(&mut self, file: &Path, sym: &Symbol) -> Value {
@@ -1093,11 +1060,125 @@ fn keyword_schema(k: TsKeywordTypeKind) -> Value {
 
 /// A property-set edit, as made by `Partial`/`Required`/`Omit`/`Pick` and
 /// their `@nestjs/mapped-types` counterparts.
+#[derive(Clone)]
 enum ObjectEdit {
     AllOptional,
     AllRequired,
     Omit(Vec<String>),
     Pick(Vec<String>),
+}
+
+impl ObjectEdit {
+    /// Prefix of the component name a deferred edit is registered under.
+    fn prefix(&self) -> &'static str {
+        match self {
+            Self::AllOptional => "Partial",
+            Self::AllRequired => "Required",
+            Self::Omit(_) => "Omit",
+            Self::Pick(_) => "Pick",
+        }
+    }
+}
+
+/// Edit the property set of a flattened object schema.
+fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
+    let keys: Vec<String> = match obj.get("properties") {
+        Some(Value::Object(props)) => props.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let mut required: Vec<String> = match obj.remove("required") {
+        Some(Value::Array(r)) => r
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    match edit {
+        ObjectEdit::AllOptional => required.clear(),
+        ObjectEdit::AllRequired => required = keys,
+        ObjectEdit::Omit(drop) | ObjectEdit::Pick(drop) => {
+            let keep = |k: &str| drop.iter().any(|d| d == k) == matches!(edit, ObjectEdit::Pick(_));
+            if let Some(Value::Object(props)) = obj.get_mut("properties") {
+                props.retain(|k, _| keep(k));
+            }
+            required.retain(|k| keep(k));
+        }
+    }
+    if !required.is_empty() {
+        obj.insert(
+            "required".into(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(obj)
+}
+
+/// Inline `schema` into a single object: a `$ref` is replaced by its
+/// component and `allOf` branches are merged, their `properties` and
+/// `required` combined; a property several branches declare keeps every
+/// constraint, as an `allOf`. `None` for anything that is not object-shaped.
+fn flatten_object(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    depth: usize,
+) -> Option<Map<String, Value>> {
+    const MAX_DEPTH: usize = 32;
+    let Value::Object(map) = schema else {
+        return None;
+    };
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let siblings = |skip: &str| -> Map<String, Value> {
+        let mut m = map.clone();
+        m.remove(skip);
+        m
+    };
+    if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+        let name = target.strip_prefix("#/components/schemas/")?;
+        let mut out = flatten_object(schemas, schemas.get(name)?, depth + 1)?;
+        out.extend(siblings("$ref"));
+        return Some(out);
+    }
+    if let Some(Value::Array(branches)) = map.get("allOf") {
+        let mut out = Map::new();
+        let mut props = Map::new();
+        let mut required: Vec<Value> = Vec::new();
+        for branch in branches {
+            let mut b = flatten_object(schemas, branch, depth + 1)?;
+            if let Some(Value::Object(p)) = b.remove("properties") {
+                for (k, v) in p {
+                    match props.get_mut(&k) {
+                        Some(existing) if *existing != v => {
+                            *existing = json!({ "allOf": [existing.take(), v] });
+                        }
+                        Some(_) => {}
+                        None => {
+                            props.insert(k, v);
+                        }
+                    }
+                }
+            }
+            if let Some(Value::Array(r)) = b.remove("required") {
+                for k in r {
+                    if !required.contains(&k) {
+                        required.push(k);
+                    }
+                }
+            }
+            out.extend(b);
+        }
+        out.extend(siblings("allOf"));
+        out.insert("type".into(), Value::String("object".into()));
+        out.insert("properties".into(), Value::Object(props));
+        if !required.is_empty() {
+            out.insert("required".into(), Value::Array(required));
+        }
+        return Some(out);
+    }
+    let is_object =
+        map.get("type").and_then(Value::as_str) == Some("object") || map.contains_key("properties");
+    is_object.then(|| map.clone())
 }
 
 /// The string literals of an array expression such as the key list of
@@ -1419,6 +1500,39 @@ mod tests {
             .as_array()
             .expect("allOf of both classes");
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn edit_on_a_component_still_being_lowered_is_deferred() {
+        let (project, dir) = project_from(&[(
+            "node.ts",
+            "export class Node { id: string; name: string; child?: Partial<Node>; }",
+        )]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let node = ctx.named_type_to_schema(&dir.join("node.ts"), "Node");
+        assert_eq!(node, json!({ "$ref": "#/components/schemas/Node" }));
+        components.resolve_deferred();
+        let child = &components.schemas["Node"]["properties"]["child"];
+        assert_eq!(
+            *child,
+            json!({ "$ref": "#/components/schemas/PartialNode" })
+        );
+        let partial = &components.schemas["PartialNode"];
+        assert_eq!(prop_names(partial), ["id", "name", "child"]);
+        assert!(required_names(partial).is_empty());
+        assert_eq!(partial["properties"]["child"], *child);
     }
 
     #[test]

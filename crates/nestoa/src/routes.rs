@@ -971,6 +971,7 @@ fn normalize_segment(s: &str) -> String {
 /// Convert routes + components into an OpenAPI document, in the version
 /// `config.openapi_version` selects (3.1 natively; 3.0.3 via `dialect`).
 pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
+    components.resolve_deferred();
     // Register the shared error-body schema once, if any route emits an error
     // response. Tree-shaking below drops it if nothing ends up referencing it.
     if routes.iter().any(|r| !r.errors.is_empty()) {
