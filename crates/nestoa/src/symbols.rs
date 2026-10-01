@@ -129,19 +129,45 @@ impl Project {
         self.import_origin_inner(file, name, &mut visited)
     }
 
-    /// `import_origin` for `ns.member`, where `ns` is a namespace import.
+    /// `import_origin` for `ns.member`, where `ns` is a namespace: an
+    /// `import * as ns`, or an `export * as ns` reached through in-repo
+    /// barrels.
     pub fn namespace_member_origin(
         &self,
         file: &Path,
         ns: &str,
         member: &str,
     ) -> Option<(String, String)> {
-        let binding = self.symbols.get(file)?.imports.get(ns)?;
-        if !binding.is_namespace {
+        let mut seen = std::collections::HashSet::new();
+        let (module_file, specifier) = self.namespace_specifier(file, ns, &mut seen)?;
+        let mut visited = std::collections::HashSet::new();
+        self.follow_specifier(&module_file, &specifier, member, &mut visited)
+    }
+
+    /// The module specifier namespace `ns` stands for, and the file it is
+    /// written in.
+    fn namespace_specifier(
+        &self,
+        file: &Path,
+        ns: &str,
+        seen: &mut std::collections::HashSet<(PathBuf, String)>,
+    ) -> Option<(PathBuf, String)> {
+        if !seen.insert((file.to_path_buf(), ns.to_string())) {
             return None;
         }
-        let mut visited = std::collections::HashSet::new();
-        self.follow_specifier(file, &binding.specifier, member, &mut visited)
+        let fs = self.symbols.get(file)?;
+        if let Some(spec) = fs.namespace_re_exports.get(ns) {
+            return Some((file.to_path_buf(), spec.clone()));
+        }
+        let binding = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns))?;
+        if binding.is_namespace {
+            return Some((file.to_path_buf(), binding.specifier.clone()));
+        }
+        let target = resolve_module_path(file, &binding.specifier)
+            .or_else(|| self.resolve_alias(&binding.specifier))
+            .filter(|t| self.symbols.contains_key(t))?;
+        let exported = binding.imported.as_deref().unwrap_or(ns);
+        self.namespace_specifier(&target, exported, seen)
     }
 
     fn import_origin_inner(

@@ -1743,22 +1743,25 @@ mod tests {
                 ("dto.ts", BASE_AND_CHILD),
                 (
                     "barrel.ts",
-                    "export { PartialType } from '@nestjs/swagger';",
+                    "export { PartialType } from '@nestjs/swagger';\n\
+                     export * as swagger from '@nestjs/swagger';",
                 ),
                 (
                     "own.ts",
                     "export function PickType(base: any, keys: any) { return base; }",
                 ),
             ],
-            "import { PartialType } from './barrel';\n\
+            "import { PartialType, swagger } from './barrel';\n\
              import { PickType } from './own';\n\
              import { Child } from './dto';\n\
              function OmitType(base: any, keys: any) { return base; }\n\
              export class ViaBarrel extends PartialType(Child) {}\n\
              export class Imported extends PickType(Child, ['id']) {}\n\
-             export class Local extends OmitType(Child, ['id']) {}",
-            &["ViaBarrel", "Imported", "Local"],
+             export class Local extends OmitType(Child, ['id']) {}\n\
+             export class NamespaceBarrel extends swagger.PickType(Child, ['id']) {}",
+            &["ViaBarrel", "Imported", "Local", "NamespaceBarrel"],
         );
+        assert_eq!(prop_names(&schemas[3]["allOf"][0]), ["id"]);
         assert_eq!(
             prop_names(&schemas[0]["allOf"][0]),
             ["id", "secret", "extra", "note"]
