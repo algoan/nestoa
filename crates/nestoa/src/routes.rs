@@ -29,7 +29,6 @@ pub enum HttpMethod {
     Delete,
     Head,
     Options,
-    All,
 }
 
 impl HttpMethod {
@@ -42,7 +41,6 @@ impl HttpMethod {
             HttpMethod::Delete => "delete",
             HttpMethod::Head => "head",
             HttpMethod::Options => "options",
-            HttpMethod::All => "all",
         }
     }
     fn from_decorator(name: &str) -> Option<HttpMethod> {
@@ -54,9 +52,51 @@ impl HttpMethod {
             "Delete" => HttpMethod::Delete,
             "Head" => HttpMethod::Head,
             "Options" => HttpMethod::Options,
-            "All" => HttpMethod::All,
             _ => return None,
         })
+    }
+}
+
+/// The methods NestJS's `RequestMethod` routes; `@All` registers every one.
+const ALL_METHODS: [HttpMethod; 7] = [
+    HttpMethod::Get,
+    HttpMethod::Post,
+    HttpMethod::Put,
+    HttpMethod::Patch,
+    HttpMethod::Delete,
+    HttpMethod::Head,
+    HttpMethod::Options,
+];
+
+/// A handler's HTTP-verb decorator: a single method, or `@All`.
+#[derive(Clone, Copy)]
+enum VerbDecorator {
+    One(HttpMethod),
+    All,
+}
+
+impl VerbDecorator {
+    fn from_name(name: &str) -> Option<Self> {
+        if name == "All" {
+            return Some(Self::All);
+        }
+        HttpMethod::from_decorator(name).map(Self::One)
+    }
+
+    fn methods(&self) -> &[HttpMethod] {
+        match self {
+            Self::One(m) => std::slice::from_ref(m),
+            Self::All => &ALL_METHODS,
+        }
+    }
+
+    /// NestJS's status when no `@HttpCode` is set: 201 for `@Post`, 200 for
+    /// everything else — `@All` included, even when it answers a POST.
+    fn default_status(self) -> u16 {
+        match self {
+            Self::One(HttpMethod::Post) => 201,
+            _ => 200,
+        }
     }
 }
 
@@ -76,6 +116,9 @@ pub struct Route {
     /// pipes, validation, and declared throws. Every one references the shared
     /// `Error` component. Sorted by status for deterministic output.
     pub errors: BTreeMap<u16, String>,
+    /// Registered by `@All` rather than an explicit verb decorator, so an
+    /// explicit handler for the same method and path takes precedence.
+    pub catch_all: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,14 +216,14 @@ impl<'a> Extractor<'a> {
                 continue;
             }
             // Find HTTP verb decorator.
-            let mut http: Option<(HttpMethod, Vec<String>)> = None;
+            let mut http: Option<(VerbDecorator, Vec<String>)> = None;
             let mut deprecated = false;
             let mut http_code: Option<u16> = None;
             for d in &m.function.decorators {
                 let name = decorator_name(d);
-                if let Some(method) = HttpMethod::from_decorator(&name) {
+                if let Some(verb) = VerbDecorator::from_name(&name) {
                     let paths = path_args(d);
-                    http = Some((method, paths));
+                    http = Some((verb, paths));
                     continue;
                 }
                 if name == "HttpCode" {
@@ -199,7 +242,7 @@ impl<'a> Extractor<'a> {
                         });
                 }
             }
-            let Some((method, sub_paths)) = http else {
+            let Some((verb, sub_paths)) = http else {
                 continue;
             };
             let mut interceptor_names = class_interceptors.clone();
@@ -314,11 +357,7 @@ impl<'a> Extractor<'a> {
                     .collect()
             };
 
-            let status_code = http_code.unwrap_or(match method {
-                HttpMethod::Post => 201,
-                HttpMethod::Delete => 204,
-                _ => 200,
-            });
+            let status_code = http_code.unwrap_or(verb.default_status());
 
             // Error-response signals for this method (path-independent parts).
             // The auth opt-out and role decorators apply if present on either the
@@ -352,7 +391,7 @@ impl<'a> Extractor<'a> {
             // it for only some of the route's sibling paths (e.g. a signing
             // interceptor that rewrites the body solely on the `/jws` variant).
             let template = Route {
-                method,
+                method: HttpMethod::Get,
                 path: String::new(),
                 summary: method_doc.summary.clone(),
                 description: method_doc.description.clone(),
@@ -363,9 +402,14 @@ impl<'a> Extractor<'a> {
                 status_code,
                 tags: vec![tag.to_string()],
                 errors: BTreeMap::new(),
+                catch_all: matches!(verb, VerbDecorator::All),
             };
             let has_body = template.request_body.is_some();
-            for full_path in full_paths {
+            for (&method, full_path) in verb
+                .methods()
+                .iter()
+                .flat_map(|m| full_paths.iter().map(move |p| (m, p.clone())))
+            {
                 // A `@route-mapping` match is the most specific author intent, so
                 // it wins over an interceptor override or the declared return type.
                 let response = route_mapping
@@ -387,6 +431,7 @@ impl<'a> Extractor<'a> {
                 };
                 let route_errors = errors::compute(&signals, er);
                 out.push(Route {
+                    method,
                     path: full_path,
                     response,
                     errors: route_errors,
@@ -941,7 +986,12 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             responses.insert(code.to_string(), Value::Object(status));
         }
         op.insert("responses".into(), Value::Object(responses));
-        entry.insert(r.method.as_lower().to_string(), Value::Object(op));
+        let method = r.method.as_lower().to_string();
+        if r.catch_all {
+            entry.entry(method).or_insert(Value::Object(op));
+        } else {
+            entry.insert(method, Value::Object(op));
+        }
     }
 
     // Sort paths, and the HTTP methods within each path, alphabetically. Routes
@@ -1434,11 +1484,43 @@ mod tests {
         assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/expenses".to_string()));
     }
 
+    /// Extract the routes of a single in-memory controller file.
+    fn extract_routes(name: &str, body: &str) -> Vec<Route> {
+        extract_with_sources(name, &[("ctrl.ts", body)], "ctrl.ts").0
+    }
+
     fn find<'r>(routes: &'r [Route], method: HttpMethod, path: &str) -> &'r Route {
         routes
             .iter()
             .find(|r| r.method == method && r.path == path)
             .unwrap_or_else(|| panic!("no {method:?} {path}"))
+    }
+
+    #[test]
+    fn default_status_is_201_for_post_and_200_otherwise() {
+        let routes = extract_routes(
+            "default-status",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                @Post()
+                create() {}
+                @Delete(':id')
+                remove() {}
+                @Put(':id')
+                replace() {}
+            }
+            "#,
+        );
+        assert_eq!(find(&routes, HttpMethod::Post, "/items").status_code, 201);
+        assert_eq!(
+            find(&routes, HttpMethod::Delete, "/items/{id}").status_code,
+            200
+        );
+        assert_eq!(
+            find(&routes, HttpMethod::Put, "/items/{id}").status_code,
+            200
+        );
     }
 
     #[test]
@@ -1481,6 +1563,51 @@ mod tests {
     }
 
     #[test]
+    fn all_expands_to_every_method_with_status_200() {
+        let routes = extract_routes(
+            "all",
+            r#"
+            @Controller('proxy')
+            export class ProxyController {
+                @All()
+                forward() {}
+            }
+            "#,
+        );
+        assert_eq!(routes.len(), ALL_METHODS.len());
+        for method in ALL_METHODS {
+            assert_eq!(find(&routes, method, "/proxy").status_code, 200);
+        }
+        let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        let ops: Vec<&String> = doc["paths"]["/proxy"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            ops,
+            ["delete", "get", "head", "options", "patch", "post", "put"]
+        );
+    }
+
+    #[test]
+    fn explicit_verb_wins_over_all_on_the_same_path() {
+        let routes = extract_routes(
+            "first-wins",
+            r#"
+            @Controller('proxy')
+            export class ProxyController {
+                /** Catch-all */
+                @All()
+                forward() {}
+                /** Explicit read */
+                @Get()
+                read() {}
+            }
+            "#,
+        );
+        let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        assert_eq!(doc["paths"]["/proxy"]["get"]["summary"], "Explicit read");
+        assert_eq!(doc["paths"]["/proxy"]["post"]["summary"], "Catch-all");
+    }
+
+    #[test]
     fn single_path_controller_still_yields_one_route() {
         let routes = extract_paths(
             "single",
@@ -1510,6 +1637,7 @@ mod tests {
             status_code: 200,
             tags: vec![],
             errors: BTreeMap::new(),
+            catch_all: false,
         }
     }
 
