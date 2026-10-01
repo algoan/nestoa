@@ -432,6 +432,7 @@ impl<'a> Extractor<'a> {
                 let route_errors = errors::compute(&signals, er);
                 out.push(Route {
                     method,
+                    parameters: params_for_path(&template.parameters, &full_path),
                     path: full_path,
                     response,
                     errors: route_errors,
@@ -809,6 +810,40 @@ fn collect_class_idents(expr: &Expr, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// The handler's parameters as they apply to one concrete `path`. A handler
+/// serving several paths (`@Get([':id', 'all'])`) declares the union of their
+/// parameters, so a path parameter absent from this path is dropped; a
+/// templated segment the handler never binds (e.g. read through a whole-object
+/// `@Param()`) is declared as a plain string, since OpenAPI requires every
+/// template to have one.
+fn params_for_path(params: &[RouteParam], path: &str) -> Vec<RouteParam> {
+    let templated: Vec<&str> = path
+        .split('{')
+        .skip(1)
+        .filter_map(|rest| rest.split_once('}').map(|(name, _)| name))
+        .collect();
+    let mut out: Vec<RouteParam> = params
+        .iter()
+        .filter(|p| p.location != ParamLocation::Path || templated.contains(&p.name.as_str()))
+        .cloned()
+        .collect();
+    for name in templated {
+        if !out
+            .iter()
+            .any(|p| p.location == ParamLocation::Path && p.name == name)
+        {
+            out.push(RouteParam {
+                name: name.to_string(),
+                location: ParamLocation::Path,
+                required: true,
+                schema: json!({ "type": "string" }),
+                description: None,
+            });
+        }
+    }
+    out
 }
 
 fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
@@ -1496,6 +1531,15 @@ mod tests {
             .unwrap_or_else(|| panic!("no {method:?} {path}"))
     }
 
+    fn path_param_names(route: &Route) -> Vec<&str> {
+        route
+            .parameters
+            .iter()
+            .filter(|p| p.location == ParamLocation::Path)
+            .map(|p| p.name.as_str())
+            .collect()
+    }
+
     #[test]
     fn default_status_is_201_for_post_and_200_otherwise() {
         let routes = extract_routes(
@@ -1605,6 +1649,29 @@ mod tests {
         let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
         assert_eq!(doc["paths"]["/proxy"]["get"]["summary"], "Explicit read");
         assert_eq!(doc["paths"]["/proxy"]["post"]["summary"], "Catch-all");
+    }
+
+    #[test]
+    fn path_params_follow_each_concrete_path() {
+        let routes = extract_routes(
+            "sibling-params",
+            r#"
+            @Controller('orgs/:orgId/items')
+            export class ItemsController {
+                @Get([':id', 'all'])
+                get(@Param('id') id: string, @Query('q') q?: string) {}
+            }
+            "#,
+        );
+        let one = find(&routes, HttpMethod::Get, "/orgs/{orgId}/items/{id}");
+        assert_eq!(path_param_names(one), ["id", "orgId"]);
+        let all = find(&routes, HttpMethod::Get, "/orgs/{orgId}/items/all");
+        assert_eq!(path_param_names(all), ["orgId"]);
+        // Non-path parameters are untouched.
+        assert!(all.parameters.iter().any(|p| p.name == "q"));
+        let synthesized = all.parameters.iter().find(|p| p.name == "orgId").unwrap();
+        assert!(synthesized.required);
+        assert_eq!(synthesized.schema, json!({ "type": "string" }));
     }
 
     #[test]
