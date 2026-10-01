@@ -1248,6 +1248,16 @@ fn ref_to_allof(m: &mut Map<String, Value>) {
     m.insert("allOf".into(), Value::Array(branches));
 }
 
+/// Give `schema` a `description`, unless it already has one.
+pub fn describe(schema: &mut Value, description: &str) {
+    if let Value::Object(m) = schema
+        && !m.contains_key("description")
+    {
+        ref_to_allof(m);
+        m.insert("description".into(), Value::String(description.to_string()));
+    }
+}
+
 fn attach_doc(schema: &mut Value, doc: &JsDoc) {
     if let Value::Object(m) = schema {
         attach_doc_to_map(m, doc);
