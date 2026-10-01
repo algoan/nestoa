@@ -135,6 +135,38 @@ impl Project {
         self.resolve_const_inner(file, name, &mut visited)
     }
 
+    /// Resolve the numeric value of `enum_name.member`, following imports the
+    /// way type resolution does. A member without an initialiser continues
+    /// from the previous numeric one, as in TypeScript.
+    pub fn resolve_enum_member_number(
+        &self,
+        file: &Path,
+        enum_name: &str,
+        member: &str,
+    ) -> Option<f64> {
+        let (_, Symbol::Enum(e)) = self.resolve(file, enum_name)? else {
+            return None;
+        };
+        // `None` once an unsupported initialiser makes the implicit value
+        // unknowable; a later numeric initialiser restores it.
+        let mut next = Some(0.0);
+        for m in &e.members {
+            let value = match m.init.as_deref() {
+                Some(init) => numeric_expr(init),
+                None => next,
+            };
+            let name = match &m.id {
+                swc_ecma_ast::TsEnumMemberId::Ident(i) => i.sym.to_string(),
+                swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
+            };
+            if name == member {
+                return value;
+            }
+            next = value.map(|v| v + 1.0);
+        }
+        None
+    }
+
     fn resolve_const_inner(
         &self,
         file: &Path,

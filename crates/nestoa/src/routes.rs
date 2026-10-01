@@ -29,7 +29,8 @@ pub enum HttpMethod {
     Delete,
     Head,
     Options,
-    All,
+    /// Reachable only through `@All`: NestJS has no `@Trace()` decorator.
+    Trace,
 }
 
 impl HttpMethod {
@@ -42,7 +43,7 @@ impl HttpMethod {
             HttpMethod::Delete => "delete",
             HttpMethod::Head => "head",
             HttpMethod::Options => "options",
-            HttpMethod::All => "all",
+            HttpMethod::Trace => "trace",
         }
     }
     fn from_decorator(name: &str) -> Option<HttpMethod> {
@@ -54,9 +55,53 @@ impl HttpMethod {
             "Delete" => HttpMethod::Delete,
             "Head" => HttpMethod::Head,
             "Options" => HttpMethod::Options,
-            "All" => HttpMethod::All,
             _ => return None,
         })
+    }
+}
+
+/// The operations an `@All` handler answers: the router's `all` route matches
+/// every method, TRACE included.
+const ALL_METHODS: [HttpMethod; 8] = [
+    HttpMethod::Get,
+    HttpMethod::Post,
+    HttpMethod::Put,
+    HttpMethod::Patch,
+    HttpMethod::Delete,
+    HttpMethod::Head,
+    HttpMethod::Options,
+    HttpMethod::Trace,
+];
+
+/// A handler's HTTP-verb decorator: a single method, or `@All`.
+#[derive(Clone, Copy)]
+enum VerbDecorator {
+    One(HttpMethod),
+    All,
+}
+
+impl VerbDecorator {
+    fn from_name(name: &str) -> Option<Self> {
+        if name == "All" {
+            return Some(Self::All);
+        }
+        HttpMethod::from_decorator(name).map(Self::One)
+    }
+
+    fn methods(&self) -> &[HttpMethod] {
+        match self {
+            Self::One(m) => std::slice::from_ref(m),
+            Self::All => &ALL_METHODS,
+        }
+    }
+
+    /// NestJS's status when no `@HttpCode` is set: 201 for `@Post`, 200 for
+    /// everything else — `@All` included, even when it answers a POST.
+    fn default_status(self) -> u16 {
+        match self {
+            Self::One(HttpMethod::Post) => 201,
+            _ => 200,
+        }
     }
 }
 
@@ -76,6 +121,9 @@ pub struct Route {
     /// pipes, validation, and declared throws. Every one references the shared
     /// `Error` component. Sorted by status for deterministic output.
     pub errors: BTreeMap<u16, String>,
+    /// Registered by `@All` rather than an explicit verb decorator. Between
+    /// the two, whichever was registered first serves the method.
+    pub catch_all: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,28 +221,33 @@ impl<'a> Extractor<'a> {
                 continue;
             }
             // Find HTTP verb decorator.
-            let mut http: Option<(HttpMethod, Vec<String>)> = None;
+            let mut http: Option<(VerbDecorator, Vec<String>)> = None;
             let mut deprecated = false;
             let mut http_code: Option<u16> = None;
             for d in &m.function.decorators {
                 let name = decorator_name(d);
-                if let Some(method) = HttpMethod::from_decorator(&name) {
+                if let Some(verb) = VerbDecorator::from_name(&name) {
                     let paths = path_args(d);
-                    http = Some((method, paths));
+                    http = Some((verb, paths));
                     continue;
                 }
                 if name == "HttpCode" {
                     // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
                     // where the argument names a numeric `const` (possibly
                     // imported from another module, e.g. `@algoan/multi-status`).
-                    http_code = numeric_arg(d).or_else(|| {
-                        ident_arg(d)
-                            .and_then(|c| self.project.resolve_const_number(file, &c))
-                            .map(|v| v as u16)
-                    });
+                    http_code = numeric_arg(d)
+                        .or_else(|| {
+                            ident_arg(d)
+                                .and_then(|c| self.project.resolve_const_number(file, &c))
+                                .map(|v| v as u16)
+                        })
+                        .or_else(|| {
+                            member_arg(d)
+                                .and_then(|(obj, prop)| self.member_status(file, &obj, &prop))
+                        });
                 }
             }
-            let Some((method, sub_paths)) = http else {
+            let Some((verb, sub_paths)) = http else {
                 continue;
             };
             let mut interceptor_names = class_interceptors.clone();
@@ -309,11 +362,7 @@ impl<'a> Extractor<'a> {
                     .collect()
             };
 
-            let status_code = http_code.unwrap_or(match method {
-                HttpMethod::Post => 201,
-                HttpMethod::Delete => 204,
-                _ => 200,
-            });
+            let status_code = http_code.unwrap_or(verb.default_status());
 
             // Error-response signals for this method (path-independent parts).
             // The auth opt-out and role decorators apply if present on either the
@@ -347,7 +396,7 @@ impl<'a> Extractor<'a> {
             // it for only some of the route's sibling paths (e.g. a signing
             // interceptor that rewrites the body solely on the `/jws` variant).
             let template = Route {
-                method,
+                method: HttpMethod::Get,
                 path: String::new(),
                 summary: method_doc.summary.clone(),
                 description: method_doc.description.clone(),
@@ -358,9 +407,14 @@ impl<'a> Extractor<'a> {
                 status_code,
                 tags: vec![tag.to_string()],
                 errors: BTreeMap::new(),
+                catch_all: matches!(verb, VerbDecorator::All),
             };
             let has_body = template.request_body.is_some();
-            for full_path in full_paths {
+            for (&method, full_path) in verb
+                .methods()
+                .iter()
+                .flat_map(|m| full_paths.iter().map(move |p| (m, p.clone())))
+            {
                 // A `@route-mapping` match is the most specific author intent, so
                 // it wins over an interceptor override or the declared return type.
                 let response = route_mapping
@@ -382,12 +436,34 @@ impl<'a> Extractor<'a> {
                 };
                 let route_errors = errors::compute(&signals, er);
                 out.push(Route {
+                    method,
+                    parameters: params_for_path(&template.parameters, &full_path),
                     path: full_path,
                     response,
                     errors: route_errors,
                     ..template.clone()
                 });
             }
+        }
+    }
+
+    /// The status named by `@HttpCode(<Enum>.<MEMBER>)`: a member of an enum
+    /// in the symbol table, or of NestJS's `HttpStatus`, whose declarations are
+    /// not parsed unless `@nestjs/common` is in `resolvePackages`.
+    fn member_status(&self, file: &Path, enum_name: &str, member: &str) -> Option<u16> {
+        if let Some(v) = self
+            .project
+            .resolve_enum_member_number(file, enum_name, member)
+        {
+            return Some(v as u16);
+        }
+        let binding = self.project.symbols.get(file)?.imports.get(enum_name)?;
+        if binding.specifier == "@nestjs/common"
+            && binding.imported.as_deref() == Some("HttpStatus")
+        {
+            errors::nest_http_status(member)
+        } else {
+            None
         }
     }
 
@@ -619,6 +695,23 @@ fn ident_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
     }
 }
 
+/// The `(object, property)` names of a decorator's first argument when it is a
+/// plain member access, e.g. `("HttpStatus", "NO_CONTENT")`.
+fn member_arg(d: &swc_ecma_ast::Decorator) -> Option<(String, String)> {
+    let Expr::Call(call) = &*d.expr else {
+        return None;
+    };
+    let Expr::Member(m) = call.args.first()?.expr.as_ref() else {
+        return None;
+    };
+    match (m.obj.as_ref(), &m.prop) {
+        (Expr::Ident(obj), swc_ecma_ast::MemberProp::Ident(prop)) => {
+            Some((obj.sym.to_string(), prop.sym.to_string()))
+        }
+        _ => None,
+    }
+}
+
 fn string_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
     let call = match &*d.expr {
         Expr::Call(c) => c,
@@ -724,6 +817,40 @@ fn collect_class_idents(expr: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// The handler's parameters as they apply to one concrete `path`. A handler
+/// serving several paths (`@Get([':id', 'all'])`) declares the union of their
+/// parameters, so a path parameter absent from this path is dropped; a
+/// templated segment the handler never binds (e.g. read through a whole-object
+/// `@Param()`) is declared as a plain string, since OpenAPI requires every
+/// template to have one.
+fn params_for_path(params: &[RouteParam], path: &str) -> Vec<RouteParam> {
+    let templated: Vec<&str> = path
+        .split('{')
+        .skip(1)
+        .filter_map(|rest| rest.split_once('}').map(|(name, _)| name))
+        .collect();
+    let mut out: Vec<RouteParam> = params
+        .iter()
+        .filter(|p| p.location != ParamLocation::Path || templated.contains(&p.name.as_str()))
+        .cloned()
+        .collect();
+    for name in templated {
+        if !out
+            .iter()
+            .any(|p| p.location == ParamLocation::Path && p.name == name)
+        {
+            out.push(RouteParam {
+                name: name.to_string(),
+                location: ParamLocation::Path,
+                required: true,
+                schema: json!({ "type": "string" }),
+                description: None,
+            });
+        }
+    }
+    out
+}
+
 fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
     if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
         &s[..s.len() - suffix.len()]
@@ -802,7 +929,22 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             .or_insert_with(errors::error_schema);
     }
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
+    // NestJS registers handlers in declaration order and the router serves the
+    // first match, so an `@All` and an explicit verb on the same method and path
+    // resolve to whichever came first. Two explicit handlers keep last-wins.
+    let mut catch_all_slots: std::collections::HashSet<(&str, HttpMethod)> =
+        std::collections::HashSet::new();
     for r in routes {
+        let slot = (r.path.as_str(), r.method);
+        let taken = paths
+            .get(&r.path)
+            .is_some_and(|ops| ops.contains_key(r.method.as_lower()));
+        if catch_all_slots.contains(&slot) || (r.catch_all && taken) {
+            continue;
+        }
+        if r.catch_all {
+            catch_all_slots.insert(slot);
+        }
         let entry = paths.entry(r.path.clone()).or_default();
         let mut op = Map::new();
         if let Some(s) = &r.summary {
@@ -1392,6 +1534,193 @@ mod tests {
         assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/expenses".to_string()));
     }
 
+    /// Extract the routes of a single in-memory controller file.
+    fn extract_routes(name: &str, body: &str) -> Vec<Route> {
+        extract_with_sources(name, &[("ctrl.ts", body)], "ctrl.ts").0
+    }
+
+    fn find<'r>(routes: &'r [Route], method: HttpMethod, path: &str) -> &'r Route {
+        routes
+            .iter()
+            .find(|r| r.method == method && r.path == path)
+            .unwrap_or_else(|| panic!("no {method:?} {path}"))
+    }
+
+    fn path_param_names(route: &Route) -> Vec<&str> {
+        route
+            .parameters
+            .iter()
+            .filter(|p| p.location == ParamLocation::Path)
+            .map(|p| p.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn default_status_is_201_for_post_and_200_otherwise() {
+        let routes = extract_routes(
+            "default-status",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                @Post()
+                create() {}
+                @Delete(':id')
+                remove() {}
+                @Put(':id')
+                replace() {}
+            }
+            "#,
+        );
+        assert_eq!(find(&routes, HttpMethod::Post, "/items").status_code, 201);
+        assert_eq!(
+            find(&routes, HttpMethod::Delete, "/items/{id}").status_code,
+            200
+        );
+        assert_eq!(
+            find(&routes, HttpMethod::Put, "/items/{id}").status_code,
+            200
+        );
+    }
+
+    #[test]
+    fn http_code_resolves_enum_members() {
+        let controller = r#"
+            import { HttpStatus, HttpStatus as Status } from '@nestjs/common';
+            import { Codes } from './codes';
+            const settings = { code: 299 };
+
+            @Controller('items')
+            export class ItemsController {
+                @Delete(':id')
+                @HttpCode(HttpStatus.NO_CONTENT)
+                remove() {}
+                @Post()
+                @HttpCode(Status.OK)
+                create() {}
+                @Put(':id')
+                @HttpCode(Codes.Later)
+                replace() {}
+                @Patch(':id')
+                @HttpCode(settings.code)
+                update() {}
+                @Get(':id')
+                @HttpCode(Codes.Next)
+                read() {}
+            }
+        "#;
+        let (routes, _) = extract_with_sources(
+            "httpcode-enum",
+            &[
+                ("ctrl.ts", controller),
+                (
+                    "codes.ts",
+                    "export enum Codes { Label = 'x', Accepted = 202, Later, Sum = 1 + 1, Next }",
+                ),
+            ],
+            "ctrl.ts",
+        );
+        let status = |m, p| find(&routes, m, p).status_code;
+        assert_eq!(status(HttpMethod::Delete, "/items/{id}"), 204);
+        assert_eq!(status(HttpMethod::Post, "/items"), 200);
+        assert_eq!(status(HttpMethod::Put, "/items/{id}"), 203);
+        // Not an enum, or a member whose implicit value follows an unsupported
+        // initialiser: falls back to the method default.
+        assert_eq!(status(HttpMethod::Patch, "/items/{id}"), 200);
+        assert_eq!(status(HttpMethod::Get, "/items/{id}"), 200);
+    }
+
+    #[test]
+    fn all_expands_to_every_method_with_status_200() {
+        let routes = extract_routes(
+            "all",
+            r#"
+            @Controller('proxy')
+            export class ProxyController {
+                @All()
+                forward() {}
+            }
+            "#,
+        );
+        assert_eq!(routes.len(), ALL_METHODS.len());
+        for method in ALL_METHODS {
+            assert_eq!(find(&routes, method, "/proxy").status_code, 200);
+        }
+        let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        let ops: Vec<&String> = doc["paths"]["/proxy"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            ops,
+            [
+                "delete", "get", "head", "options", "patch", "post", "put", "trace"
+            ]
+        );
+    }
+
+    #[test]
+    fn first_of_all_and_explicit_verb_serves_the_method() {
+        let summaries = |name, body| {
+            let routes = extract_routes(name, body);
+            let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+            let ops = &doc["paths"]["/proxy"];
+            (
+                ops["get"]["summary"].clone(),
+                ops["post"]["summary"].clone(),
+            )
+        };
+        let explicit_first = summaries(
+            "explicit-first",
+            r#"
+            @Controller('proxy')
+            export class ProxyController {
+                /** Explicit read */
+                @Get()
+                read() {}
+                /** Catch-all */
+                @All()
+                forward() {}
+            }
+            "#,
+        );
+        assert_eq!(explicit_first, (json!("Explicit read"), json!("Catch-all")));
+        let all_first = summaries(
+            "all-first",
+            r#"
+            @Controller('proxy')
+            export class ProxyController {
+                /** Catch-all */
+                @All()
+                forward() {}
+                /** Explicit read */
+                @Get()
+                read() {}
+            }
+            "#,
+        );
+        assert_eq!(all_first, (json!("Catch-all"), json!("Catch-all")));
+    }
+
+    #[test]
+    fn path_params_follow_each_concrete_path() {
+        let routes = extract_routes(
+            "sibling-params",
+            r#"
+            @Controller('orgs/:orgId/items')
+            export class ItemsController {
+                @Get([':id', 'all'])
+                get(@Param('id') id: string, @Query('q') q?: string) {}
+            }
+            "#,
+        );
+        let one = find(&routes, HttpMethod::Get, "/orgs/{orgId}/items/{id}");
+        assert_eq!(path_param_names(one), ["id", "orgId"]);
+        let all = find(&routes, HttpMethod::Get, "/orgs/{orgId}/items/all");
+        assert_eq!(path_param_names(all), ["orgId"]);
+        // Non-path parameters are untouched.
+        assert!(all.parameters.iter().any(|p| p.name == "q"));
+        let synthesized = all.parameters.iter().find(|p| p.name == "orgId").unwrap();
+        assert!(synthesized.required);
+        assert_eq!(synthesized.schema, json!({ "type": "string" }));
+    }
+
     #[test]
     fn single_path_controller_still_yields_one_route() {
         let routes = extract_paths(
@@ -1422,6 +1751,7 @@ mod tests {
             status_code: 200,
             tags: vec![],
             errors: BTreeMap::new(),
+            catch_all: false,
         }
     }
 
