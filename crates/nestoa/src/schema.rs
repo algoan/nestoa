@@ -1118,7 +1118,7 @@ fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
 /// `properties` and `required` are combined, a property several branches
 /// declare keeps every schema, and other keywords go through `merge_keyword`.
 /// `None` for anything that is not object-shaped, or whose branches carry
-/// constraints one object cannot combine.
+/// constraints one object cannot combine (including any dictionary keyword).
 fn flatten_object(
     schemas: &IndexMap<String, Value>,
     schema: &Value,
@@ -1148,6 +1148,13 @@ fn flatten_object(
         let mut required: Vec<Value> = Vec::new();
         for branch in branches {
             let mut b = flatten_object(schemas, branch, depth + 1)?;
+            // A dictionary keyword only governs the properties its own branch
+            // does not declare; beside merged `properties` it would stop
+            // applying to the other branches' fields, so such a shape stays
+            // unflattened.
+            if branches.len() > 1 && DICTIONARY_KEYWORDS.iter().any(|k| b.contains_key(*k)) {
+                return None;
+            }
             if let Some(Value::Object(p)) = b.remove("properties") {
                 intersect_schema_map(&mut props, p);
             }
@@ -1175,9 +1182,8 @@ fn flatten_object(
     is_object.then(|| map.clone())
 }
 
-/// Merge `incoming` into a name -> schema map (`properties`,
-/// `patternProperties`), as an intersection: a name both declare keeps both
-/// schemas, combined with `allOf`.
+/// Merge `incoming` into a `properties` map as an intersection: a name both
+/// declare keeps both schemas, combined with `allOf`.
 fn intersect_schema_map(into: &mut Map<String, Value>, incoming: Map<String, Value>) {
     for (k, v) in incoming {
         match into.get_mut(&k) {
@@ -1192,30 +1198,25 @@ fn intersect_schema_map(into: &mut Map<String, Value>, incoming: Map<String, Val
     }
 }
 
-/// Merge one keyword of an `allOf` branch into the flattened object, keeping
-/// the intersection's meaning: subschema keywords are combined with `allOf`,
-/// annotations keep the later value, and `None` means two constraints
-/// conflict in a way a single object cannot express.
+/// Keywords constraining the properties a schema does not declare by name.
+const DICTIONARY_KEYWORDS: [&str; 4] = [
+    "additionalProperties",
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+];
+
+/// Merge one keyword of an `allOf` branch into the flattened object.
+/// Annotations keep the later value; `None` means two constraints differ in a
+/// way a single object cannot express.
 fn merge_keyword(out: &mut Map<String, Value>, key: String, value: Value) -> Option<()> {
-    let Some(existing) = out.get_mut(&key) else {
-        out.insert(key, value);
-        return Some(());
-    };
-    if *existing == value {
-        return Some(());
-    }
-    match key.as_str() {
-        "additionalProperties" | "propertyNames" | "unevaluatedProperties" => {
-            *existing = json!({ "allOf": [existing.take(), value] });
+    match out.get_mut(&key) {
+        None => {
+            out.insert(key, value);
         }
-        "patternProperties" => {
-            let (Value::Object(into), Value::Object(incoming)) = (existing, value) else {
-                return None;
-            };
-            intersect_schema_map(into, incoming);
-        }
-        k if is_annotation(k) => *existing = value,
-        _ => return None,
+        Some(existing) if *existing == value => {}
+        Some(existing) if is_annotation(&key) => *existing = value,
+        Some(_) => return None,
     }
     Some(())
 }
@@ -1550,18 +1551,24 @@ mod tests {
     }
 
     #[test]
-    fn flattening_intersects_branch_keywords() {
-        let [partial] = lower_all(
+    fn flattening_declines_branches_with_dictionary_keywords() {
+        let [records, mixed] = lower_all(
             "export class Base { id: string; }",
-            "export type R = Partial<Record<string, string> & Record<string, number>>;",
-            &["R"],
+            "export type R = Partial<Record<string, string> & Record<string, number>>;\n\
+             export type M = Partial<Record<string, string> & { count: number }>;",
+            &["R", "M"],
         )
         .try_into()
         .unwrap();
-        assert_eq!(partial["type"], "object");
+        // Hoisting `additionalProperties` beside merged properties would stop
+        // it from applying to `count`, so both stay intersections.
+        assert_eq!(records["allOf"].as_array().map(Vec::len), Some(2));
         assert_eq!(
-            partial["additionalProperties"],
-            json!({ "allOf": [{ "type": "string" }, { "type": "number" }] })
+            mixed,
+            json!({ "allOf": [
+                { "type": "object", "additionalProperties": { "type": "string" } },
+                { "type": "object", "properties": { "count": { "type": "number" } }, "required": ["count"] },
+            ] })
         );
 
         let mut out = Map::new();
