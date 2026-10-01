@@ -593,7 +593,15 @@ fn body_from_fields(fields: Vec<BodyField>) -> RequestBody {
         if f.required && !required.contains(&name) {
             required.push(name);
         }
-        properties.insert(f.name, schema);
+        match properties.get_mut(&f.name) {
+            Some(existing) if *existing != schema => {
+                *existing = json!({ "allOf": [existing.take(), schema] });
+            }
+            Some(_) => {}
+            None => {
+                properties.insert(f.name, schema);
+            }
+        }
     }
     let any_required = !required.is_empty();
     let mut schema = json!({ "type": "object", "properties": properties });
@@ -1793,7 +1801,7 @@ mod tests {
                 whole(@Body() dto: Dto, @Body('name') name: string) {}
 
                 @Patch('twice')
-                twice(@Body('name') a: string, @Body('name') b: string) {}
+                twice(@Body('name') a: string, @Body('name') b: 'x') {}
             }
             "#,
         );
@@ -1823,6 +1831,10 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(twice.schema["required"], json!(["name"]));
+        assert_eq!(
+            twice.schema["properties"]["name"],
+            json!({ "allOf": [{ "type": "string" }, { "type": "string", "enum": ["x"] }] })
+        );
     }
 
     #[test]
