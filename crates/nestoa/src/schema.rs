@@ -1114,9 +1114,11 @@ fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
 }
 
 /// Inline `schema` into a single object: a `$ref` is replaced by its
-/// component and `allOf` branches are merged, their `properties` and
-/// `required` combined; a property several branches declare keeps every
-/// constraint, as an `allOf`. `None` for anything that is not object-shaped.
+/// component and `allOf` branches are merged as an intersection: their
+/// `properties` and `required` are combined, a property several branches
+/// declare keeps every schema, and other keywords go through `merge_keyword`.
+/// `None` for anything that is not object-shaped, or whose branches carry
+/// constraints one object cannot combine.
 fn flatten_object(
     schemas: &IndexMap<String, Value>,
     schema: &Value,
@@ -1147,17 +1149,7 @@ fn flatten_object(
         for branch in branches {
             let mut b = flatten_object(schemas, branch, depth + 1)?;
             if let Some(Value::Object(p)) = b.remove("properties") {
-                for (k, v) in p {
-                    match props.get_mut(&k) {
-                        Some(existing) if *existing != v => {
-                            *existing = json!({ "allOf": [existing.take(), v] });
-                        }
-                        Some(_) => {}
-                        None => {
-                            props.insert(k, v);
-                        }
-                    }
-                }
+                intersect_schema_map(&mut props, p);
             }
             if let Some(Value::Array(r)) = b.remove("required") {
                 for k in r {
@@ -1166,7 +1158,9 @@ fn flatten_object(
                     }
                 }
             }
-            out.extend(b);
+            for (k, v) in b {
+                merge_keyword(&mut out, k, v)?;
+            }
         }
         out.extend(siblings("allOf"));
         out.insert("type".into(), Value::String("object".into()));
@@ -1179,6 +1173,59 @@ fn flatten_object(
     let is_object =
         map.get("type").and_then(Value::as_str) == Some("object") || map.contains_key("properties");
     is_object.then(|| map.clone())
+}
+
+/// Merge `incoming` into a name -> schema map (`properties`,
+/// `patternProperties`), as an intersection: a name both declare keeps both
+/// schemas, combined with `allOf`.
+fn intersect_schema_map(into: &mut Map<String, Value>, incoming: Map<String, Value>) {
+    for (k, v) in incoming {
+        match into.get_mut(&k) {
+            Some(existing) if *existing != v => {
+                *existing = json!({ "allOf": [existing.take(), v] });
+            }
+            Some(_) => {}
+            None => {
+                into.insert(k, v);
+            }
+        }
+    }
+}
+
+/// Merge one keyword of an `allOf` branch into the flattened object, keeping
+/// the intersection's meaning: subschema keywords are combined with `allOf`,
+/// annotations keep the later value, and `None` means two constraints
+/// conflict in a way a single object cannot express.
+fn merge_keyword(out: &mut Map<String, Value>, key: String, value: Value) -> Option<()> {
+    let Some(existing) = out.get_mut(&key) else {
+        out.insert(key, value);
+        return Some(());
+    };
+    if *existing == value {
+        return Some(());
+    }
+    match key.as_str() {
+        "additionalProperties" | "propertyNames" | "unevaluatedProperties" => {
+            *existing = json!({ "allOf": [existing.take(), value] });
+        }
+        "patternProperties" => {
+            let (Value::Object(into), Value::Object(incoming)) = (existing, value) else {
+                return None;
+            };
+            intersect_schema_map(into, incoming);
+        }
+        k if is_annotation(k) => *existing = value,
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Keywords that document a schema without constraining its instances.
+fn is_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        "title" | "description" | "example" | "examples" | "default" | "deprecated"
+    ) || key.starts_with("x-")
 }
 
 /// The string literals of an array expression such as the key list of
@@ -1500,6 +1547,29 @@ mod tests {
             .as_array()
             .expect("allOf of both classes");
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn flattening_intersects_branch_keywords() {
+        let [partial] = lower_all(
+            "export class Base { id: string; }",
+            "export type R = Partial<Record<string, string> & Record<string, number>>;",
+            &["R"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(partial["type"], "object");
+        assert_eq!(
+            partial["additionalProperties"],
+            json!({ "allOf": [{ "type": "string" }, { "type": "number" }] })
+        );
+
+        let mut out = Map::new();
+        merge_keyword(&mut out, "maxProperties".into(), json!(1)).unwrap();
+        assert!(merge_keyword(&mut out, "maxProperties".into(), json!(2)).is_none());
+        merge_keyword(&mut out, "description".into(), json!("a")).unwrap();
+        merge_keyword(&mut out, "description".into(), json!("b")).unwrap();
+        assert_eq!(out["description"], "b");
     }
 
     #[test]
