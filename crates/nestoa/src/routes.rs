@@ -589,8 +589,9 @@ fn body_from_fields(fields: Vec<BodyField>) -> RequestBody {
         if let Some(d) = &f.description {
             describe(&mut schema, d);
         }
-        if f.required {
-            required.push(Value::String(f.name.clone()));
+        let name = Value::String(f.name.clone());
+        if f.required && !required.contains(&name) {
+            required.push(name);
         }
         properties.insert(f.name, schema);
     }
@@ -1790,6 +1791,9 @@ mod tests {
 
                 @Post('whole')
                 whole(@Body() dto: Dto, @Body('name') name: string) {}
+
+                @Patch('twice')
+                twice(@Body('name') a: string, @Body('name') b: string) {}
             }
             "#,
         );
@@ -1814,6 +1818,11 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(whole.schema, json!({ "$ref": "#/components/schemas/Dto" }));
+        let twice = find(&routes, HttpMethod::Patch, "/items/twice")
+            .request_body
+            .as_ref()
+            .unwrap();
+        assert_eq!(twice.schema["required"], json!(["name"]));
     }
 
     #[test]
