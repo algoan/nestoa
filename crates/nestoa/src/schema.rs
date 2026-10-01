@@ -437,11 +437,13 @@ impl<'a> SchemaCtx<'a> {
                     && let Some(first) = args.params.first()
                 {
                     let base = self.ts_type_to_schema(file, first);
-                    let keys = args
+                    let Some(keys) = args
                         .params
                         .get(1)
-                        .map(|k| collect_string_keys(k))
-                        .unwrap_or_default();
+                        .and_then(|k| self.string_union_keys(file, k, 0))
+                    else {
+                        return json!({ "x-unresolved": format!("{name}<…>") });
+                    };
                     let edit = if name == "Omit" {
                         ObjectEdit::Omit(keys)
                     } else {
@@ -771,31 +773,66 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
-    /// The mapped-type helper a call's callee names, looked through the
-    /// file's imports so an aliased (`PartialType as MakePartial`) or
-    /// namespaced (`swagger.PartialType`) helper is recognized too.
+    /// The mapped-type helper a call's callee names, when it is imported from
+    /// a NestJS package — directly, under an alias (`PartialType as
+    /// MakePartial`), through a namespace (`swagger.PartialType`) or an in-repo
+    /// barrel. A same-named helper of the project's own is not one.
     fn mapped_type_helper(&self, file: &Path, callee: &Expr) -> Option<String> {
-        let name = match callee {
-            Expr::Ident(id) => {
-                let local = id.sym.to_string();
+        let (package, name) = match callee {
+            Expr::Ident(id) => self.project.import_origin(file, id.sym.as_ref())?,
+            Expr::Member(m) => {
+                let (Expr::Ident(ns), swc_ecma_ast::MemberProp::Ident(prop)) =
+                    (m.obj.as_ref(), &m.prop)
+                else {
+                    return None;
+                };
                 self.project
-                    .symbols
-                    .get(file)
-                    .and_then(|fs| fs.imports.get(&local))
-                    .and_then(|b| b.imported.clone())
-                    .unwrap_or(local)
+                    .namespace_member_origin(file, ns.sym.as_ref(), prop.sym.as_ref())?
             }
-            Expr::Member(m) => match &m.prop {
-                swc_ecma_ast::MemberProp::Ident(prop) => prop.sym.to_string(),
-                _ => return None,
-            },
             _ => return None,
         };
-        matches!(
+        let from_nest = matches!(
+            package.as_str(),
+            "@nestjs/mapped-types" | "@nestjs/swagger" | "@nestjs/graphql"
+        );
+        let helper = matches!(
             name.as_str(),
             "PartialType" | "OmitType" | "PickType" | "IntersectionType"
-        )
-        .then_some(name)
+        );
+        (from_nest && helper).then_some(name)
+    }
+
+    /// The keys a `Pick`/`Omit` key type names: string literals, unions of
+    /// them, and type aliases of either. `None` for anything else (`keyof`,
+    /// a template literal), so the key set is never partial.
+    fn string_union_keys(&self, file: &Path, ty: &TsType, depth: usize) -> Option<Vec<String>> {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        match ty {
+            TsType::TsLitType(l) => match &l.lit {
+                TsLit::Str(s) => Some(vec![s.value.to_string_lossy().into_owned()]),
+                _ => None,
+            },
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
+                let mut keys = Vec::new();
+                for t in &u.types {
+                    keys.extend(self.string_union_keys(file, t, depth)?);
+                }
+                Some(keys)
+            }
+            TsType::TsParenthesizedType(p) => self.string_union_keys(file, &p.type_ann, depth),
+            TsType::TsTypeRef(r) if r.type_params.is_none() && depth < MAX_ALIAS_DEPTH => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return None;
+                };
+                let (decl_file, Symbol::TypeAlias(alias)) =
+                    self.project.resolve(file, id.sym.as_ref())?
+                else {
+                    return None;
+                };
+                self.string_union_keys(&decl_file, &alias.type_ann, depth + 1)
+            }
+            _ => None,
+        }
     }
 
     /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
@@ -1311,29 +1348,6 @@ fn heritage_label(expr: &Expr) -> String {
     }
 }
 
-/// Extract string literal keys from a TS type expression of the form
-/// `'a' | 'b'` or just `'a'`.
-fn collect_string_keys(ty: &TsType) -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(ty: &TsType, out: &mut Vec<String>) {
-        match ty {
-            TsType::TsLitType(l) => {
-                if let TsLit::Str(s) = &l.lit {
-                    out.push(s.value.to_string_lossy().into_owned());
-                }
-            }
-            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
-                for t in &u.types {
-                    walk(t, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    walk(ty, &mut out);
-    out
-}
-
 /// Build a `$ref` JSON value pointing at a named component schema.
 fn ref_value(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{name}") })
@@ -1519,7 +1533,14 @@ mod tests {
     /// Lower each named declaration of `main.ts`, after writing `dto.ts` next to
     /// it, and return the schemas in order.
     fn lower_all(dto: &str, main: &str, names: &[&str]) -> Vec<Value> {
-        let (project, dir) = project_from(&[("dto.ts", dto), ("main.ts", main)]);
+        lower_with(&[("dto.ts", dto)], main, names)
+    }
+
+    /// `lower_all` with any set of sibling files next to `main.ts`.
+    fn lower_with(files: &[(&str, &str)], main: &str, names: &[&str]) -> Vec<Value> {
+        let mut all = files.to_vec();
+        all.push(("main.ts", main));
+        let (project, dir) = project_from(&all);
         let sources = HashMap::new();
         let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
@@ -1713,6 +1734,62 @@ mod tests {
             partial_operand,
             json!({ "x-unresolved": "IntersectionType(…)" })
         );
+    }
+
+    #[test]
+    fn only_nest_mapped_type_helpers_get_their_semantics() {
+        let schemas = lower_with(
+            &[
+                ("dto.ts", BASE_AND_CHILD),
+                (
+                    "barrel.ts",
+                    "export { PartialType } from '@nestjs/swagger';",
+                ),
+                (
+                    "own.ts",
+                    "export function PickType(base: any, keys: any) { return base; }",
+                ),
+            ],
+            "import { PartialType } from './barrel';\n\
+             import { PickType } from './own';\n\
+             import { Child } from './dto';\n\
+             function OmitType(base: any, keys: any) { return base; }\n\
+             export class ViaBarrel extends PartialType(Child) {}\n\
+             export class Imported extends PickType(Child, ['id']) {}\n\
+             export class Local extends OmitType(Child, ['id']) {}",
+            &["ViaBarrel", "Imported", "Local"],
+        );
+        assert_eq!(
+            prop_names(&schemas[0]["allOf"][0]),
+            ["id", "secret", "extra", "note"]
+        );
+        assert_eq!(
+            schemas[1]["allOf"][0],
+            json!({ "x-unresolved": "PickType(…)" })
+        );
+        assert_eq!(
+            schemas[2]["allOf"][0],
+            json!({ "x-unresolved": "OmitType(…)" })
+        );
+    }
+
+    #[test]
+    fn utility_keys_resolve_aliases_and_never_apply_partially() {
+        let [aliased, keyof, mixed] = lower_all(
+            BASE_AND_CHILD,
+            "import { Child } from './dto';\n\
+             type Keys = 'id' | Extra;\n\
+             type Extra = 'note';\n\
+             export type A = Pick<Child, Keys>;\n\
+             export type K = Pick<Child, keyof Child>;\n\
+             export type M = Omit<Child, 'id' | keyof Child>;",
+            &["A", "K", "M"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&aliased), ["id", "note"]);
+        assert_eq!(keyof, json!({ "x-unresolved": "Pick<…>" }));
+        assert_eq!(mixed, json!({ "x-unresolved": "Omit<…>" }));
     }
 
     #[test]
