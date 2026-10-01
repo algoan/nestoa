@@ -3,6 +3,7 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
+use swc_common::Spanned;
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
     TsTypeLit, TsTypeParamInstantiation, TsTypeRef, TsUnionOrIntersectionType,
@@ -35,9 +36,56 @@ pub struct ComponentSchemas {
     /// instantiating `TreeNode<Project>` would lower a duplicate component
     /// under a fresh name instead of reusing the first.
     instantiated: HashMap<InstantiationKey, String>,
+    /// Property-set edits whose operand was still being lowered: the
+    /// component name reserved for the result, the operand, and the edit.
+    deferred: Vec<(String, Value, ObjectEdit)>,
 }
 
 impl ComponentSchemas {
+    /// Apply the property-set edits deferred while their operand was being
+    /// lowered, now that every component is complete. One deferred edit may
+    /// operate on another's result, so this repeats until nothing changes;
+    /// an operand that still cannot be flattened is emitted unchanged.
+    pub fn resolve_deferred(&mut self) {
+        let mut pending = std::mem::take(&mut self.deferred);
+        loop {
+            let before = pending.len();
+            pending.retain(
+                |(name, base, edit)| match flatten_object(&self.schemas, base, 0) {
+                    Some(obj) => {
+                        self.schemas.insert(name.clone(), apply_edit(obj, edit));
+                        false
+                    }
+                    None => true,
+                },
+            );
+            if pending.len() == before {
+                break;
+            }
+        }
+        for (name, base, _) in pending {
+            self.schemas.insert(name, base);
+        }
+    }
+
+    /// The name of a component `schema` references, directly or through an
+    /// `allOf` branch, that is reserved but not yet lowered.
+    fn pending_ref(&self, schema: &Value) -> Option<String> {
+        if let Some(name) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        {
+            let pending = self.allocated.contains(name) && !self.schemas.contains_key(name);
+            return pending.then(|| name.to_string());
+        }
+        schema
+            .get("allOf")?
+            .as_array()?
+            .iter()
+            .find_map(|branch| self.pending_ref(branch))
+    }
+
     /// Seed a schema under an exact name (used by tests). Production code goes
     /// through `SchemaCtx::component_ref`, which handles naming and dedup.
     #[cfg(test)]
@@ -364,7 +412,20 @@ impl<'a> SchemaCtx<'a> {
                 }
                 return json!({ "type": "array" });
             }
-            "Partial" | "Required" | "Readonly" | "NonNullable" => {
+            "Partial" | "Required" => {
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    let base = self.ts_type_to_schema(file, first);
+                    let edit = if name == "Partial" {
+                        ObjectEdit::AllOptional
+                    } else {
+                        ObjectEdit::AllRequired
+                    };
+                    return self.reshape_object(base, &edit);
+                }
+            }
+            "Readonly" | "NonNullable" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
@@ -375,49 +436,20 @@ impl<'a> SchemaCtx<'a> {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
-                    let mut base = self.ts_type_to_schema(file, first);
-                    // If base ended up as a $ref, inline a clone of the referenced
-                    // schema so we can mutate its property set.
-                    if let Some(refname) = base
-                        .get("$ref")
-                        .and_then(|v| v.as_str())
-                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
-                        .map(|s| s.to_string())
-                        && let Some(inlined) = self.components.schemas.get(&refname).cloned()
-                    {
-                        base = inlined;
-                    }
-                    if name == "Omit" {
-                        if let (Some(second), Value::Object(obj)) = (args.params.get(1), &mut base)
-                        {
-                            let to_remove = collect_string_keys(second);
-                            if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                                for k in &to_remove {
-                                    props.remove(k);
-                                }
-                            }
-                            if let Some(Value::Array(req)) = obj.get_mut("required") {
-                                req.retain(|v| match v.as_str() {
-                                    Some(s) => !to_remove.iter().any(|k| k == s),
-                                    None => true,
-                                });
-                            }
-                        }
-                    } else if name == "Pick"
-                        && let (Some(second), Value::Object(obj)) = (args.params.get(1), &mut base)
-                    {
-                        let keep = collect_string_keys(second);
-                        if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                            props.retain(|k, _| keep.iter().any(|x| x == k));
-                        }
-                        if let Some(Value::Array(req)) = obj.get_mut("required") {
-                            req.retain(|v| match v.as_str() {
-                                Some(s) => keep.iter().any(|k| k == s),
-                                None => true,
-                            });
-                        }
-                    }
-                    return base;
+                    let base = self.ts_type_to_schema(file, first);
+                    let Some(keys) = args
+                        .params
+                        .get(1)
+                        .and_then(|k| self.string_union_keys(file, k, 0))
+                    else {
+                        return json!({ "x-unresolved": format!("{name}<…>") });
+                    };
+                    let edit = if name == "Omit" {
+                        ObjectEdit::Omit(keys)
+                    } else {
+                        ObjectEdit::Pick(keys)
+                    };
+                    return self.reshape_object(base, &edit);
                 }
             }
             "Record" => {
@@ -696,6 +728,137 @@ impl<'a> SchemaCtx<'a> {
         Value::Object(out)
     }
 
+    /// The schema a class inherits from its `extends` clause: a plain or
+    /// namespace-qualified class, or a `@nestjs/mapped-types` /
+    /// `@nestjs/swagger` helper call, which may nest
+    /// (`PartialType(OmitType(CreateDto, ['id']))`). `None` when any part of it
+    /// cannot be lowered, rather than a partial result.
+    fn heritage_schema(
+        &mut self,
+        file: &Path,
+        expr: &Expr,
+        type_args: Option<&TsTypeParamInstantiation>,
+    ) -> Option<Value> {
+        match expr {
+            Expr::Ident(_) | Expr::Member(_) => {
+                let reference = TsTypeRef {
+                    span: expr.span(),
+                    type_name: entity_name_of(expr)?,
+                    type_params: type_args.map(|a| Box::new(a.clone())),
+                };
+                Some(self.type_ref_schema(file, &reference))
+            }
+            Expr::Paren(p) => self.heritage_schema(file, &p.expr, type_args),
+            Expr::Call(call) => {
+                let swc_ecma_ast::Callee::Expr(callee) = &call.callee else {
+                    return None;
+                };
+                let helper = self.mapped_type_helper(file, callee)?;
+                let mut args = call.args.iter().map(|a| a.expr.as_ref());
+                if helper == "IntersectionType" {
+                    let parts = args
+                        .map(|a| self.heritage_schema(file, a, None))
+                        .collect::<Option<Vec<Value>>>()?;
+                    return Some(json!({ "allOf": parts }));
+                }
+                let base = self.heritage_schema(file, args.next()?, None)?;
+                let edit = match helper.as_str() {
+                    "PartialType" => ObjectEdit::AllOptional,
+                    "OmitType" => ObjectEdit::Omit(string_array_keys(args.next()?)?),
+                    _ => ObjectEdit::Pick(string_array_keys(args.next()?)?),
+                };
+                Some(self.reshape_object(base, &edit))
+            }
+            _ => None,
+        }
+    }
+
+    /// The mapped-type helper a call's callee names, when it is imported from
+    /// a NestJS package — directly, under an alias (`PartialType as
+    /// MakePartial`), through a namespace (`swagger.PartialType`) or an in-repo
+    /// barrel. A same-named helper of the project's own is not one.
+    fn mapped_type_helper(&self, file: &Path, callee: &Expr) -> Option<String> {
+        let (package, name) = match callee {
+            Expr::Ident(id) => self.project.import_origin(file, id.sym.as_ref())?,
+            Expr::Member(m) => {
+                let (Expr::Ident(ns), swc_ecma_ast::MemberProp::Ident(prop)) =
+                    (m.obj.as_ref(), &m.prop)
+                else {
+                    return None;
+                };
+                self.project
+                    .namespace_member_origin(file, ns.sym.as_ref(), prop.sym.as_ref())?
+            }
+            _ => return None,
+        };
+        let from_nest = matches!(
+            package.as_str(),
+            "@nestjs/mapped-types" | "@nestjs/swagger" | "@nestjs/graphql"
+        );
+        let helper = matches!(
+            name.as_str(),
+            "PartialType" | "OmitType" | "PickType" | "IntersectionType"
+        );
+        (from_nest && helper).then_some(name)
+    }
+
+    /// The keys a `Pick`/`Omit` key type names: string literals, unions of
+    /// them, and type aliases of either. `None` for anything else (`keyof`,
+    /// a template literal), so the key set is never partial.
+    fn string_union_keys(&self, file: &Path, ty: &TsType, depth: usize) -> Option<Vec<String>> {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        match ty {
+            TsType::TsLitType(l) => match &l.lit {
+                TsLit::Str(s) => Some(vec![s.value.to_string_lossy().into_owned()]),
+                _ => None,
+            },
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
+                let mut keys = Vec::new();
+                for t in &u.types {
+                    keys.extend(self.string_union_keys(file, t, depth)?);
+                }
+                Some(keys)
+            }
+            TsType::TsParenthesizedType(p) => self.string_union_keys(file, &p.type_ann, depth),
+            TsType::TsTypeRef(r) if r.type_params.is_none() && depth < MAX_ALIAS_DEPTH => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return None;
+                };
+                let (decl_file, Symbol::TypeAlias(alias)) =
+                    self.project.resolve(file, id.sym.as_ref())?
+                else {
+                    return None;
+                };
+                self.string_union_keys(&decl_file, &alias.type_ann, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
+    /// inlining it first so inherited properties are edited too. An operand
+    /// that is a component still being lowered (a recursive `Partial<Node>`
+    /// inside `Node`) cannot be inlined yet, so the edit is registered as its
+    /// own component and applied by `ComponentSchemas::resolve_deferred`. Any
+    /// other schema that cannot be flattened, such as a union, is returned
+    /// unchanged.
+    fn reshape_object(&mut self, schema: Value, edit: &ObjectEdit) -> Value {
+        if let Some(obj) = flatten_object(&self.components.schemas, &schema, 0) {
+            return apply_edit(obj, edit);
+        }
+        let Some(base) = self.components.pending_ref(&schema) else {
+            return schema;
+        };
+        let name = self
+            .components
+            .fresh_name("", &format!("{}{base}", edit.prefix()));
+        self.components.allocated.insert(name.clone());
+        self.components
+            .deferred
+            .push((name.clone(), schema, edit.clone()));
+        ref_value(&name)
+    }
+
     pub fn symbol_to_schema(&mut self, file: &Path, sym: &Symbol) -> Value {
         match sym {
             Symbol::Interface(i) => {
@@ -825,15 +988,11 @@ impl<'a> SchemaCtx<'a> {
                 // A `class X extends Y` carries Y's members too. Mirror the
                 // interface-`extends` handling: emit Y as an allOf branch.
                 let mut all_of: Vec<Value> = Vec::new();
-                if let Some(super_expr) = &c.class.super_class
-                    && let Expr::Ident(id) = &**super_expr
-                {
-                    let dummy_ref = TsTypeRef {
-                        span: c.class.span,
-                        type_name: TsEntityName::Ident(id.clone()),
-                        type_params: c.class.super_type_params.clone(),
-                    };
-                    all_of.push(self.type_ref_schema(file, &dummy_ref));
+                if let Some(super_expr) = &c.class.super_class {
+                    let parent = self
+                        .heritage_schema(file, super_expr, c.class.super_type_params.as_deref())
+                        .unwrap_or_else(|| json!({ "x-unresolved": heritage_label(super_expr) }));
+                    all_of.push(parent);
                 }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
@@ -958,27 +1117,235 @@ fn keyword_schema(k: TsKeywordTypeKind) -> Value {
     }
 }
 
-/// Extract string literal keys from a TS type expression of the form
-/// `'a' | 'b'` or just `'a'`.
-fn collect_string_keys(ty: &TsType) -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(ty: &TsType, out: &mut Vec<String>) {
-        match ty {
-            TsType::TsLitType(l) => {
-                if let TsLit::Str(s) = &l.lit {
-                    out.push(s.value.to_string_lossy().into_owned());
-                }
-            }
-            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
-                for t in &u.types {
-                    walk(t, out);
-                }
-            }
-            _ => {}
+/// A property-set edit, as made by `Partial`/`Required`/`Omit`/`Pick` and
+/// their `@nestjs/mapped-types` counterparts.
+#[derive(Clone)]
+enum ObjectEdit {
+    AllOptional,
+    AllRequired,
+    Omit(Vec<String>),
+    Pick(Vec<String>),
+}
+
+impl ObjectEdit {
+    /// Prefix of the component name a deferred edit is registered under.
+    fn prefix(&self) -> &'static str {
+        match self {
+            Self::AllOptional => "Partial",
+            Self::AllRequired => "Required",
+            Self::Omit(_) => "Omit",
+            Self::Pick(_) => "Pick",
         }
     }
-    walk(ty, &mut out);
-    out
+}
+
+/// Edit the property set of a flattened object schema.
+fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
+    let keys: Vec<String> = match obj.get("properties") {
+        Some(Value::Object(props)) => props.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let mut required: Vec<String> = match obj.remove("required") {
+        Some(Value::Array(r)) => r
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    match edit {
+        ObjectEdit::AllOptional => required.clear(),
+        ObjectEdit::AllRequired => required = keys,
+        ObjectEdit::Omit(drop) | ObjectEdit::Pick(drop) => {
+            let keep = |k: &str| drop.iter().any(|d| d == k) == matches!(edit, ObjectEdit::Pick(_));
+            if let Some(Value::Object(props)) = obj.get_mut("properties") {
+                props.retain(|k, _| keep(k));
+            }
+            required.retain(|k| keep(k));
+        }
+    }
+    if !required.is_empty() {
+        obj.insert(
+            "required".into(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(obj)
+}
+
+/// Inline `schema` into a single object: a `$ref` is replaced by its
+/// component and `allOf` branches are merged as an intersection: their
+/// `properties` and `required` are combined, a property several branches
+/// declare keeps every schema, and other keywords go through `merge_keyword`.
+/// `None` for anything that is not object-shaped, or whose branches carry
+/// constraints one object cannot combine (including any dictionary keyword).
+fn flatten_object(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    depth: usize,
+) -> Option<Map<String, Value>> {
+    const MAX_DEPTH: usize = 32;
+    let Value::Object(map) = schema else {
+        return None;
+    };
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let siblings = |skip: &str| -> Map<String, Value> {
+        let mut m = map.clone();
+        m.remove(skip);
+        m
+    };
+    if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+        let name = target.strip_prefix("#/components/schemas/")?;
+        let mut out = flatten_object(schemas, schemas.get(name)?, depth + 1)?;
+        out.extend(siblings("$ref"));
+        return Some(out);
+    }
+    if let Some(Value::Array(branches)) = map.get("allOf") {
+        let mut out = Map::new();
+        let mut props = Map::new();
+        let mut required: Vec<Value> = Vec::new();
+        for branch in branches {
+            let mut b = flatten_object(schemas, branch, depth + 1)?;
+            // A dictionary keyword only governs the properties its own branch
+            // does not declare; beside merged `properties` it would stop
+            // applying to the other branches' fields, so such a shape stays
+            // unflattened.
+            if branches.len() > 1 && DICTIONARY_KEYWORDS.iter().any(|k| b.contains_key(*k)) {
+                return None;
+            }
+            if let Some(Value::Object(p)) = b.remove("properties") {
+                intersect_schema_map(&mut props, p);
+            }
+            if let Some(Value::Array(r)) = b.remove("required") {
+                for k in r {
+                    if !required.contains(&k) {
+                        required.push(k);
+                    }
+                }
+            }
+            for (k, v) in b {
+                merge_keyword(&mut out, k, v)?;
+            }
+        }
+        out.extend(siblings("allOf"));
+        out.insert("type".into(), Value::String("object".into()));
+        out.insert("properties".into(), Value::Object(props));
+        if !required.is_empty() {
+            out.insert("required".into(), Value::Array(required));
+        }
+        return Some(out);
+    }
+    let is_object =
+        map.get("type").and_then(Value::as_str) == Some("object") || map.contains_key("properties");
+    is_object.then(|| map.clone())
+}
+
+/// Merge `incoming` into a `properties` map as an intersection: a name both
+/// declare keeps both schemas, combined with `allOf`.
+fn intersect_schema_map(into: &mut Map<String, Value>, incoming: Map<String, Value>) {
+    for (k, v) in incoming {
+        match into.get_mut(&k) {
+            Some(existing) if *existing != v => {
+                *existing = json!({ "allOf": [existing.take(), v] });
+            }
+            Some(_) => {}
+            None => {
+                into.insert(k, v);
+            }
+        }
+    }
+}
+
+/// Keywords constraining the properties a schema does not declare by name.
+const DICTIONARY_KEYWORDS: [&str; 4] = [
+    "additionalProperties",
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+];
+
+/// Merge one keyword of an `allOf` branch into the flattened object.
+/// Annotations keep the later value; `None` means two constraints differ in a
+/// way a single object cannot express.
+fn merge_keyword(out: &mut Map<String, Value>, key: String, value: Value) -> Option<()> {
+    match out.get_mut(&key) {
+        None => {
+            out.insert(key, value);
+        }
+        Some(existing) if *existing == value => {}
+        Some(existing) if is_annotation(&key) => *existing = value,
+        Some(_) => return None,
+    }
+    Some(())
+}
+
+/// Keywords that document a schema without constraining its instances.
+fn is_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        "title" | "description" | "example" | "examples" | "default" | "deprecated"
+    ) || key.starts_with("x-")
+}
+
+/// The string literals of an array expression such as the key list of
+/// `OmitType(Dto, ['a', 'b'] as const)`. `None` if any entry is not a string
+/// literal (a constant, a spread), so the key set is never partial.
+fn string_array_keys(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::TsConstAssertion(c) => string_array_keys(&c.expr),
+        Expr::TsAs(a) => string_array_keys(&a.expr),
+        Expr::Paren(p) => string_array_keys(&p.expr),
+        Expr::Array(arr) => arr
+            .elems
+            .iter()
+            .map(|el| match el {
+                Some(el) if el.spread.is_none() => match el.expr.as_ref() {
+                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// A class reference (`Dto`, `Models.Dto`) as a type-entity name.
+fn entity_name_of(expr: &Expr) -> Option<TsEntityName> {
+    match expr {
+        Expr::Ident(id) => Some(TsEntityName::Ident(id.clone())),
+        Expr::Member(m) => {
+            let swc_ecma_ast::MemberProp::Ident(prop) = &m.prop else {
+                return None;
+            };
+            Some(TsEntityName::TsQualifiedName(Box::new(
+                swc_ecma_ast::TsQualifiedName {
+                    span: m.span,
+                    left: entity_name_of(&m.obj)?,
+                    right: prop.clone(),
+                },
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// How an `extends` clause nestoa cannot lower is named in `x-unresolved`.
+fn heritage_label(expr: &Expr) -> String {
+    match expr {
+        Expr::Call(call) => match &call.callee {
+            swc_ecma_ast::Callee::Expr(callee) => match entity_name_of(callee) {
+                Some(name) => format!("{}(…)", entity_name(&name)),
+                None => "extends".to_string(),
+            },
+            _ => "extends".to_string(),
+        },
+        Expr::Paren(p) => heritage_label(&p.expr),
+        _ => entity_name_of(expr)
+            .map(|n| entity_name(&n))
+            .unwrap_or_else(|| "extends".to_string()),
+    }
 }
 
 /// Build a `$ref` JSON value pointing at a named component schema.
@@ -1097,6 +1464,16 @@ fn ref_to_allof(m: &mut Map<String, Value>) {
     m.insert("allOf".into(), Value::Array(branches));
 }
 
+/// Give `schema` a `description`, unless it already has one.
+pub fn describe(schema: &mut Value, description: &str) {
+    if let Value::Object(m) = schema
+        && !m.contains_key("description")
+    {
+        ref_to_allof(m);
+        m.insert("description".into(), Value::String(description.to_string()));
+    }
+}
+
 fn attach_doc(schema: &mut Value, doc: &JsDoc) {
     if let Value::Object(m) = schema {
         attach_doc_to_map(m, doc);
@@ -1151,6 +1528,291 @@ mod tests {
             project.add(parser.parse_file(&path).unwrap());
         }
         (project, dir)
+    }
+
+    /// Lower each named declaration of `main.ts`, after writing `dto.ts` next to
+    /// it, and return the schemas in order.
+    fn lower_all(dto: &str, main: &str, names: &[&str]) -> Vec<Value> {
+        lower_with(&[("dto.ts", dto)], main, names)
+    }
+
+    /// `lower_all` with any set of sibling files next to `main.ts`.
+    fn lower_with(files: &[(&str, &str)], main: &str, names: &[&str]) -> Vec<Value> {
+        let mut all = files.to_vec();
+        all.push(("main.ts", main));
+        let (project, dir) = project_from(&all);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let main_file = dir.join("main.ts");
+        names
+            .iter()
+            .map(|name| {
+                let (decl_file, sym) = project.resolve(&main_file, name).expect(name);
+                ctx.symbol_to_schema(&decl_file, &sym)
+            })
+            .collect()
+    }
+
+    fn prop_names(schema: &Value) -> Vec<&str> {
+        schema["properties"]
+            .as_object()
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    fn required_names(schema: &Value) -> Vec<&str> {
+        schema["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    const BASE_AND_CHILD: &str = "export class Base { id: string; secret: string; }\n\
+        export class Child extends Base { extra: string; note?: string; }";
+
+    #[test]
+    fn utility_types_edit_inherited_properties() {
+        let [partial, required, omit, pick] = lower_all(
+            BASE_AND_CHILD,
+            "import { Child } from './dto';\n\
+             export type P = Partial<Child>;\n\
+             export type R = Required<Child>;\n\
+             export type O = Omit<Child, 'secret' | 'note'>;\n\
+             export type K = Pick<Child, 'id' | 'note'>;",
+            &["P", "R", "O", "K"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&partial), ["id", "secret", "extra", "note"]);
+        assert!(required_names(&partial).is_empty());
+        assert_eq!(required_names(&required), ["id", "secret", "extra", "note"]);
+        assert_eq!(prop_names(&omit), ["id", "extra"]);
+        assert_eq!(required_names(&omit), ["id", "extra"]);
+        assert_eq!(prop_names(&pick), ["id", "note"]);
+        assert_eq!(required_names(&pick), ["id"]);
+    }
+
+    #[test]
+    fn mapped_type_helpers_lower_like_their_utility_types() {
+        let schemas = lower_all(
+            BASE_AND_CHILD,
+            "import { PartialType, OmitType, PickType, IntersectionType } from '@nestjs/swagger';\n\
+             import { Base, Child } from './dto';\n\
+             class Extra { tag: string; }\n\
+             export class U extends PartialType(Child) {}\n\
+             export class O extends OmitType(Child, ['secret'] as const) {}\n\
+             export class K extends PickType(Child, ['extra']) {}\n\
+             export class N extends PartialType(OmitType(Child, ['secret'])) {}\n\
+             export class I extends IntersectionType(Base, Extra) {}",
+            &["U", "O", "K", "N", "I"],
+        );
+        let parent = |s: &Value| s["allOf"][0].clone();
+        let [update, omit, pick, nested, intersection] =
+            <[Value; 5]>::try_from(schemas.iter().map(parent).collect::<Vec<_>>()).unwrap();
+        assert_eq!(prop_names(&update), ["id", "secret", "extra", "note"]);
+        assert!(required_names(&update).is_empty());
+        assert_eq!(prop_names(&omit), ["id", "extra", "note"]);
+        assert_eq!(required_names(&omit), ["id", "extra"]);
+        assert_eq!(prop_names(&pick), ["extra"]);
+        assert_eq!(prop_names(&nested), ["id", "extra", "note"]);
+        assert!(required_names(&nested).is_empty());
+        let parts = intersection["allOf"]
+            .as_array()
+            .expect("allOf of both classes");
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn flattening_declines_branches_with_dictionary_keywords() {
+        let [records, mixed] = lower_all(
+            "export class Base { id: string; }",
+            "export type R = Partial<Record<string, string> & Record<string, number>>;\n\
+             export type M = Partial<Record<string, string> & { count: number }>;",
+            &["R", "M"],
+        )
+        .try_into()
+        .unwrap();
+        // Hoisting `additionalProperties` beside merged properties would stop
+        // it from applying to `count`, so both stay intersections.
+        assert_eq!(records["allOf"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            mixed,
+            json!({ "allOf": [
+                { "type": "object", "additionalProperties": { "type": "string" } },
+                { "type": "object", "properties": { "count": { "type": "number" } }, "required": ["count"] },
+            ] })
+        );
+
+        let mut out = Map::new();
+        merge_keyword(&mut out, "maxProperties".into(), json!(1)).unwrap();
+        assert!(merge_keyword(&mut out, "maxProperties".into(), json!(2)).is_none());
+        merge_keyword(&mut out, "description".into(), json!("a")).unwrap();
+        merge_keyword(&mut out, "description".into(), json!("b")).unwrap();
+        assert_eq!(out["description"], "b");
+    }
+
+    #[test]
+    fn edit_on_a_component_still_being_lowered_is_deferred() {
+        let (project, dir) = project_from(&[(
+            "node.ts",
+            "export class Node { id: string; name: string; child?: Partial<Node>; }",
+        )]);
+        let sources = HashMap::new();
+        let file_starts = HashMap::new();
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let node = ctx.named_type_to_schema(&dir.join("node.ts"), "Node");
+        assert_eq!(node, json!({ "$ref": "#/components/schemas/Node" }));
+        components.resolve_deferred();
+        let child = &components.schemas["Node"]["properties"]["child"];
+        assert_eq!(
+            *child,
+            json!({ "$ref": "#/components/schemas/PartialNode" })
+        );
+        let partial = &components.schemas["PartialNode"];
+        assert_eq!(prop_names(partial), ["id", "name", "child"]);
+        assert!(required_names(partial).is_empty());
+        assert_eq!(partial["properties"]["child"], *child);
+    }
+
+    #[test]
+    fn mapped_type_helpers_resolve_through_imports_or_stay_visible() {
+        let schemas = lower_all(
+            BASE_AND_CHILD,
+            "import { PartialType as MakePartial, PickType, IntersectionType } from '@nestjs/mapped-types';\n\
+             import * as swagger from '@nestjs/swagger';\n\
+             import * as Models from './dto';\n\
+             import { Child } from './dto';\n\
+             class Extra { tag: string; }\n\
+             const KEY = 'id';\n\
+             export class Aliased extends MakePartial(Child) {}\n\
+             export class Namespaced extends swagger.PickType(Child, ['id']) {}\n\
+             export class Qualified extends IntersectionType(Models.Base, Extra) {}\n\
+             export class DynamicKeys extends PickType(Child, [KEY]) {}\n\
+             export class PartialOperand extends IntersectionType(Child, makeMixin()) {}",
+            &[
+                "Aliased",
+                "Namespaced",
+                "Qualified",
+                "DynamicKeys",
+                "PartialOperand",
+            ],
+        );
+        let parent = |s: &Value| s["allOf"][0].clone();
+        let [aliased, namespaced, qualified, dynamic, partial_operand] =
+            <[Value; 5]>::try_from(schemas.iter().map(parent).collect::<Vec<_>>()).unwrap();
+        assert_eq!(prop_names(&aliased), ["id", "secret", "extra", "note"]);
+        assert!(required_names(&aliased).is_empty());
+        assert_eq!(prop_names(&namespaced), ["id"]);
+        assert_eq!(
+            qualified["allOf"][0],
+            json!({ "$ref": "#/components/schemas/Base" })
+        );
+        // Never a partial edit or a silently dropped operand.
+        assert_eq!(dynamic, json!({ "x-unresolved": "PickType(…)" }));
+        assert_eq!(
+            partial_operand,
+            json!({ "x-unresolved": "IntersectionType(…)" })
+        );
+    }
+
+    #[test]
+    fn only_nest_mapped_type_helpers_get_their_semantics() {
+        let schemas = lower_with(
+            &[
+                ("dto.ts", BASE_AND_CHILD),
+                (
+                    "barrel.ts",
+                    "export { PartialType } from '@nestjs/swagger';\n\
+                     export * as swagger from '@nestjs/swagger';",
+                ),
+                (
+                    "own.ts",
+                    "export function PickType(base: any, keys: any) { return base; }",
+                ),
+            ],
+            "import { PartialType, swagger } from './barrel';\n\
+             import { PickType } from './own';\n\
+             import { Child } from './dto';\n\
+             function OmitType(base: any, keys: any) { return base; }\n\
+             export class ViaBarrel extends PartialType(Child) {}\n\
+             export class Imported extends PickType(Child, ['id']) {}\n\
+             export class Local extends OmitType(Child, ['id']) {}\n\
+             export class NamespaceBarrel extends swagger.PickType(Child, ['id']) {}",
+            &["ViaBarrel", "Imported", "Local", "NamespaceBarrel"],
+        );
+        assert_eq!(prop_names(&schemas[3]["allOf"][0]), ["id"]);
+        assert_eq!(
+            prop_names(&schemas[0]["allOf"][0]),
+            ["id", "secret", "extra", "note"]
+        );
+        assert_eq!(
+            schemas[1]["allOf"][0],
+            json!({ "x-unresolved": "PickType(…)" })
+        );
+        assert_eq!(
+            schemas[2]["allOf"][0],
+            json!({ "x-unresolved": "OmitType(…)" })
+        );
+    }
+
+    #[test]
+    fn utility_keys_resolve_aliases_and_never_apply_partially() {
+        let [aliased, keyof, mixed] = lower_all(
+            BASE_AND_CHILD,
+            "import { Child } from './dto';\n\
+             type Keys = 'id' | Extra;\n\
+             type Extra = 'note';\n\
+             export type A = Pick<Child, Keys>;\n\
+             export type K = Pick<Child, keyof Child>;\n\
+             export type M = Omit<Child, 'id' | keyof Child>;",
+            &["A", "K", "M"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&aliased), ["id", "note"]);
+        assert_eq!(keyof, json!({ "x-unresolved": "Pick<…>" }));
+        assert_eq!(mixed, json!({ "x-unresolved": "Omit<…>" }));
+    }
+
+    #[test]
+    fn flattening_keeps_every_constraint_on_a_shared_property() {
+        let [partial] = lower_all(
+            "export class Narrow { value: 'x'; }\nexport class Wide { value: string; extra: number; }",
+            "import { PartialType, IntersectionType } from '@nestjs/swagger';\n\
+             import { Narrow, Wide } from './dto';\n\
+             export class P extends PartialType(IntersectionType(Narrow, Wide)) {}",
+            &["P"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            partial["allOf"][0]["properties"]["value"],
+            json!({ "allOf": [
+                { "type": "string", "enum": ["x"] },
+                { "type": "string" },
+            ] })
+        );
     }
 
     #[test]

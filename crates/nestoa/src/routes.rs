@@ -17,7 +17,7 @@ use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
 use crate::jsdoc::{JsDoc, jsdoc_before};
-use crate::schema::{ComponentSchemas, SchemaCtx, decorator_name};
+use crate::schema::{ComponentSchemas, SchemaCtx, decorator_name, describe};
 use crate::symbols::Project;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -281,14 +281,21 @@ impl<'a> Extractor<'a> {
             // Parameters
             let mut params: Vec<RouteParam> = Vec::new();
             let mut request_body: Option<RequestBody> = None;
+            let mut body_fields: Vec<BodyField> = Vec::new();
             for p in &m.function.params {
                 if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                     match parsed {
                         ParsedParam::Routed(rp) => params.push(rp),
                         ParsedParam::Body(b) => request_body = Some(b),
+                        ParsedParam::BodyField(f) => body_fields.push(f),
                         ParsedParam::Ignored => {}
                     }
                 }
+            }
+            // `@Body('field')` reads one property of the body; a whole-body
+            // `@Body()` alongside already describes all of them.
+            if request_body.is_none() && !body_fields.is_empty() {
+                request_body = Some(body_from_fields(body_fields));
             }
             // Interceptors may accept a request body in a different shape than
             // the handler's `@Body` parameter (e.g. single-object-or-array).
@@ -501,6 +508,7 @@ impl<'a> Extractor<'a> {
         let location = location?;
 
         let pat_info = extract_pat(&p.pat);
+        let body_field = decorator_arg.clone();
         let name = decorator_arg.unwrap_or_else(|| pat_info.name.clone());
         let mut ctx = SchemaCtx {
             project: self.project,
@@ -519,6 +527,14 @@ impl<'a> Extractor<'a> {
             .unwrap_or_else(|| json!({}));
         let description = method_doc.params.get(&pat_info.name).cloned();
         match location {
+            DecoratorKind::Body if body_field.is_some() => {
+                Some(ParsedParam::BodyField(BodyField {
+                    name,
+                    required: !pat_info.optional,
+                    schema,
+                    description,
+                }))
+            }
             DecoratorKind::Body => Some(ParsedParam::Body(RequestBody {
                 schema,
                 required: !pat_info.optional,
@@ -552,7 +568,51 @@ impl<'a> Extractor<'a> {
 enum ParsedParam {
     Routed(RouteParam),
     Body(RequestBody),
+    BodyField(BodyField),
     Ignored,
+}
+
+/// A `@Body('field')` parameter: one property of the request body.
+struct BodyField {
+    name: String,
+    required: bool,
+    schema: Value,
+    description: Option<String>,
+}
+
+/// The object body assembled from a handler's `@Body('field')` parameters.
+fn body_from_fields(fields: Vec<BodyField>) -> RequestBody {
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    for f in fields {
+        let mut schema = f.schema;
+        if let Some(d) = &f.description {
+            describe(&mut schema, d);
+        }
+        let name = Value::String(f.name.clone());
+        if f.required && !required.contains(&name) {
+            required.push(name);
+        }
+        match properties.get_mut(&f.name) {
+            Some(existing) if *existing != schema => {
+                *existing = json!({ "allOf": [existing.take(), schema] });
+            }
+            Some(_) => {}
+            None => {
+                properties.insert(f.name, schema);
+            }
+        }
+    }
+    let any_required = !required.is_empty();
+    let mut schema = json!({ "type": "object", "properties": properties });
+    if any_required {
+        schema["required"] = Value::Array(required);
+    }
+    RequestBody {
+        schema,
+        required: any_required,
+        description: None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -920,6 +980,7 @@ fn normalize_segment(s: &str) -> String {
 /// Convert routes + components into an OpenAPI document, in the version
 /// `config.openapi_version` selects (3.1 natively; 3.0.3 via `dialect`).
 pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
+    components.resolve_deferred();
     // Register the shared error-body schema once, if any route emits an error
     // response. Tree-shaking below drops it if nothing ends up referencing it.
     if routes.iter().any(|r| !r.errors.is_empty()) {
@@ -1719,6 +1780,61 @@ mod tests {
         let synthesized = all.parameters.iter().find(|p| p.name == "orgId").unwrap();
         assert!(synthesized.required);
         assert_eq!(synthesized.schema, json!({ "type": "string" }));
+    }
+
+    #[test]
+    fn body_fields_form_one_object_body() {
+        let routes = extract_routes(
+            "body-fields",
+            r#"
+            export class Dto { name: string; }
+            @Controller('items')
+            export class ItemsController {
+                /**
+                 * Rename
+                 * @param name the new name
+                 */
+                @Put('fields')
+                fields(@Body('name') name: string, @Body('age') age?: number) {}
+
+                @Post('whole')
+                whole(@Body() dto: Dto, @Body('name') name: string) {}
+
+                @Patch('twice')
+                twice(@Body('name') a: string, @Body('name') b: 'x') {}
+            }
+            "#,
+        );
+        let body = find(&routes, HttpMethod::Put, "/items/fields")
+            .request_body
+            .as_ref()
+            .unwrap();
+        assert!(body.required);
+        assert_eq!(
+            body.schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "the new name" },
+                    "age": { "type": "number" },
+                },
+                "required": ["name"],
+            })
+        );
+        let whole = find(&routes, HttpMethod::Post, "/items/whole")
+            .request_body
+            .as_ref()
+            .unwrap();
+        assert_eq!(whole.schema, json!({ "$ref": "#/components/schemas/Dto" }));
+        let twice = find(&routes, HttpMethod::Patch, "/items/twice")
+            .request_body
+            .as_ref()
+            .unwrap();
+        assert_eq!(twice.schema["required"], json!(["name"]));
+        assert_eq!(
+            twice.schema["properties"]["name"],
+            json!({ "allOf": [{ "type": "string" }, { "type": "string", "enum": ["x"] }] })
+        );
     }
 
     #[test]

@@ -118,6 +118,99 @@ impl Project {
         }
     }
 
+    /// The package a value binding ultimately comes from, and its exported
+    /// name there: `import { PartialType as P } from '@nestjs/swagger'` gives
+    /// `("@nestjs/swagger", "PartialType")` for `P`. In-repo modules (relative
+    /// or tsconfig-aliased barrels, namespace imports) are followed through
+    /// their imports and re-exports; a package specifier ends the walk. `None`
+    /// for a name not imported from any package, e.g. declared locally.
+    pub fn import_origin(&self, file: &Path, name: &str) -> Option<(String, String)> {
+        let mut visited = std::collections::HashSet::new();
+        self.import_origin_inner(file, name, &mut visited)
+    }
+
+    /// `import_origin` for `ns.member`, where `ns` is a namespace: an
+    /// `import * as ns`, or an `export * as ns` reached through in-repo
+    /// barrels.
+    pub fn namespace_member_origin(
+        &self,
+        file: &Path,
+        ns: &str,
+        member: &str,
+    ) -> Option<(String, String)> {
+        let mut seen = std::collections::HashSet::new();
+        let (module_file, specifier) = self.namespace_specifier(file, ns, &mut seen)?;
+        let mut visited = std::collections::HashSet::new();
+        self.follow_specifier(&module_file, &specifier, member, &mut visited)
+    }
+
+    /// The module specifier namespace `ns` stands for, and the file it is
+    /// written in.
+    fn namespace_specifier(
+        &self,
+        file: &Path,
+        ns: &str,
+        seen: &mut std::collections::HashSet<(PathBuf, String)>,
+    ) -> Option<(PathBuf, String)> {
+        if !seen.insert((file.to_path_buf(), ns.to_string())) {
+            return None;
+        }
+        let fs = self.symbols.get(file)?;
+        if let Some(spec) = fs.namespace_re_exports.get(ns) {
+            return Some((file.to_path_buf(), spec.clone()));
+        }
+        let binding = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns))?;
+        if binding.is_namespace {
+            return Some((file.to_path_buf(), binding.specifier.clone()));
+        }
+        let target = resolve_module_path(file, &binding.specifier)
+            .or_else(|| self.resolve_alias(&binding.specifier))
+            .filter(|t| self.symbols.contains_key(t))?;
+        let exported = binding.imported.as_deref().unwrap_or(ns);
+        self.namespace_specifier(&target, exported, seen)
+    }
+
+    fn import_origin_inner(
+        &self,
+        file: &Path,
+        name: &str,
+        visited: &mut std::collections::HashSet<(PathBuf, String)>,
+    ) -> Option<(String, String)> {
+        if !visited.insert((file.to_path_buf(), name.to_string())) {
+            return None;
+        }
+        let fs = self.symbols.get(file)?;
+        if let Some(b) = fs.imports.get(name).or_else(|| fs.re_exports.get(name))
+            && !b.is_namespace
+        {
+            let imported = b.imported.clone().unwrap_or_else(|| name.to_string());
+            return self.follow_specifier(file, &b.specifier, &imported, visited);
+        }
+        fs.star_re_exports
+            .iter()
+            .find_map(|spec| self.follow_specifier(file, spec, name, visited))
+    }
+
+    /// Continue `import_origin` into `specifier`: into the module when it is
+    /// an in-repo one nestoa parsed, otherwise stop at the package.
+    fn follow_specifier(
+        &self,
+        file: &Path,
+        specifier: &str,
+        name: &str,
+        visited: &mut std::collections::HashSet<(PathBuf, String)>,
+    ) -> Option<(String, String)> {
+        let in_repo =
+            resolve_module_path(file, specifier).or_else(|| self.resolve_alias(specifier));
+        match in_repo {
+            Some(target) if self.symbols.contains_key(&target) => {
+                self.import_origin_inner(&target, name, visited)
+            }
+            Some(_) => None,
+            None => Some((specifier.to_string(), name.to_string())),
+        }
+    }
+
     /// Resolve a name referenced inside `file` to the (declaring file, symbol).
     pub fn resolve(&self, file: &Path, name: &str) -> Option<(PathBuf, Symbol)> {
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
