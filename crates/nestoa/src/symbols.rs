@@ -147,10 +147,12 @@ impl Project {
         let (_, Symbol::Enum(e)) = self.resolve(file, enum_name)? else {
             return None;
         };
-        let mut next = 0.0;
+        // `None` once an unsupported initialiser makes the implicit value
+        // unknowable; a later numeric initialiser restores it.
+        let mut next = Some(0.0);
         for m in &e.members {
             let value = match m.init.as_deref() {
-                Some(init) => numeric_expr(init)?,
+                Some(init) => numeric_expr(init),
                 None => next,
             };
             let name = match &m.id {
@@ -158,9 +160,9 @@ impl Project {
                 swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
             };
             if name == member {
-                return Some(value);
+                return value;
             }
-            next = value + 1.0;
+            next = value.map(|v| v + 1.0);
         }
         None
     }

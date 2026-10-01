@@ -1588,13 +1588,19 @@ mod tests {
                 @Patch(':id')
                 @HttpCode(settings.code)
                 update() {}
+                @Get(':id')
+                @HttpCode(Codes.Next)
+                read() {}
             }
         "#;
         let (routes, _) = extract_with_sources(
             "httpcode-enum",
             &[
                 ("ctrl.ts", controller),
-                ("codes.ts", "export enum Codes { Accepted = 202, Later }"),
+                (
+                    "codes.ts",
+                    "export enum Codes { Label = 'x', Accepted = 202, Later, Sum = 1 + 1, Next }",
+                ),
             ],
             "ctrl.ts",
         );
@@ -1602,8 +1608,10 @@ mod tests {
         assert_eq!(status(HttpMethod::Delete, "/items/{id}"), 204);
         assert_eq!(status(HttpMethod::Post, "/items"), 200);
         assert_eq!(status(HttpMethod::Put, "/items/{id}"), 203);
-        // Not an enum: falls back to the method default.
+        // Not an enum, or a member whose implicit value follows an unsupported
+        // initialiser: falls back to the method default.
         assert_eq!(status(HttpMethod::Patch, "/items/{id}"), 200);
+        assert_eq!(status(HttpMethod::Get, "/items/{id}"), 200);
     }
 
     #[test]
