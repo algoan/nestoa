@@ -678,6 +678,57 @@ impl<'a> SchemaCtx<'a> {
         Value::Object(out)
     }
 
+    /// The schema a class inherits from its `extends` clause: a plain class,
+    /// or a `@nestjs/mapped-types` / `@nestjs/swagger` helper call, which may
+    /// nest (`PartialType(OmitType(CreateDto, ['id']))`).
+    fn heritage_schema(
+        &mut self,
+        file: &Path,
+        expr: &Expr,
+        type_args: Option<&TsTypeParamInstantiation>,
+    ) -> Option<Value> {
+        match expr {
+            Expr::Ident(id) => {
+                let reference = TsTypeRef {
+                    span: id.span,
+                    type_name: TsEntityName::Ident(id.clone()),
+                    type_params: type_args.map(|a| Box::new(a.clone())),
+                };
+                Some(self.type_ref_schema(file, &reference))
+            }
+            Expr::Paren(p) => self.heritage_schema(file, &p.expr, type_args),
+            Expr::Call(call) => {
+                let swc_ecma_ast::Callee::Expr(callee) = &call.callee else {
+                    return None;
+                };
+                let Expr::Ident(helper) = callee.as_ref() else {
+                    return None;
+                };
+                let mut args = call.args.iter().map(|a| a.expr.as_ref());
+                match helper.sym.as_ref() {
+                    "IntersectionType" => {
+                        let parts: Vec<Value> = args
+                            .filter_map(|a| self.heritage_schema(file, a, None))
+                            .collect();
+                        Some(json!({ "allOf": parts }))
+                    }
+                    "PartialType" | "OmitType" | "PickType" => {
+                        let base = self.heritage_schema(file, args.next()?, None)?;
+                        let keys = args.next().map(string_array_keys).unwrap_or_default();
+                        let edit = match helper.sym.as_ref() {
+                            "PartialType" => ObjectEdit::AllOptional,
+                            "OmitType" => ObjectEdit::Omit(keys),
+                            _ => ObjectEdit::Pick(keys),
+                        };
+                        Some(self.reshape_object(base, &edit))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
     /// inlining it first so inherited properties are edited too. A schema that
     /// cannot be flattened (a union, or a component still being lowered) is
@@ -901,14 +952,10 @@ impl<'a> SchemaCtx<'a> {
                 // interface-`extends` handling: emit Y as an allOf branch.
                 let mut all_of: Vec<Value> = Vec::new();
                 if let Some(super_expr) = &c.class.super_class
-                    && let Expr::Ident(id) = &**super_expr
+                    && let Some(parent) =
+                        self.heritage_schema(file, super_expr, c.class.super_type_params.as_deref())
                 {
-                    let dummy_ref = TsTypeRef {
-                        span: c.class.span,
-                        type_name: TsEntityName::Ident(id.clone()),
-                        type_params: c.class.super_type_params.clone(),
-                    };
-                    all_of.push(self.type_ref_schema(file, &dummy_ref));
+                    all_of.push(parent);
                 }
                 for member in &c.class.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
@@ -1040,6 +1087,26 @@ enum ObjectEdit {
     AllRequired,
     Omit(Vec<String>),
     Pick(Vec<String>),
+}
+
+/// The string literals of an array expression such as the key list of
+/// `OmitType(Dto, ['a', 'b'] as const)`.
+fn string_array_keys(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::TsConstAssertion(c) => string_array_keys(&c.expr),
+        Expr::TsAs(a) => string_array_keys(&a.expr),
+        Expr::Paren(p) => string_array_keys(&p.expr),
+        Expr::Array(arr) => arr
+            .elems
+            .iter()
+            .flatten()
+            .filter_map(|el| match el.expr.as_ref() {
+                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Extract string literal keys from a TS type expression of the form
@@ -1301,6 +1368,36 @@ mod tests {
         assert_eq!(required_names(&omit), ["id", "extra"]);
         assert_eq!(prop_names(&pick), ["id", "note"]);
         assert_eq!(required_names(&pick), ["id"]);
+    }
+
+    #[test]
+    fn mapped_type_helpers_lower_like_their_utility_types() {
+        let schemas = lower_all(
+            BASE_AND_CHILD,
+            "import { PartialType, OmitType, PickType, IntersectionType } from '@nestjs/swagger';\n\
+             import { Base, Child } from './dto';\n\
+             class Extra { tag: string; }\n\
+             export class U extends PartialType(Child) {}\n\
+             export class O extends OmitType(Child, ['secret'] as const) {}\n\
+             export class K extends PickType(Child, ['extra']) {}\n\
+             export class N extends PartialType(OmitType(Child, ['secret'])) {}\n\
+             export class I extends IntersectionType(Base, Extra) {}",
+            &["U", "O", "K", "N", "I"],
+        );
+        let parent = |s: &Value| s["allOf"][0].clone();
+        let [update, omit, pick, nested, intersection] =
+            <[Value; 5]>::try_from(schemas.iter().map(parent).collect::<Vec<_>>()).unwrap();
+        assert_eq!(prop_names(&update), ["id", "secret", "extra", "note"]);
+        assert!(required_names(&update).is_empty());
+        assert_eq!(prop_names(&omit), ["id", "extra", "note"]);
+        assert_eq!(required_names(&omit), ["id", "extra"]);
+        assert_eq!(prop_names(&pick), ["extra"]);
+        assert_eq!(prop_names(&nested), ["id", "extra", "note"]);
+        assert!(required_names(&nested).is_empty());
+        let parts = intersection["allOf"]
+            .as_array()
+            .expect("allOf of both classes");
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]
