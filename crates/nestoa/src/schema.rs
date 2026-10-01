@@ -771,7 +771,8 @@ impl<'a> SchemaCtx<'a> {
 
     /// Inline `schema` into a single object: a `$ref` is replaced by its
     /// component and `allOf` branches are merged, their `properties` and
-    /// `required` combined. `None` for anything that is not object-shaped.
+    /// `required` combined; a property several branches declare keeps every
+    /// constraint, as an `allOf`. `None` for anything that is not object-shaped.
     fn flatten_object(&self, schema: &Value, depth: usize) -> Option<Map<String, Value>> {
         const MAX_DEPTH: usize = 32;
         let Value::Object(map) = schema else {
@@ -798,7 +799,17 @@ impl<'a> SchemaCtx<'a> {
             for branch in branches {
                 let mut b = self.flatten_object(branch, depth + 1)?;
                 if let Some(Value::Object(p)) = b.remove("properties") {
-                    props.extend(p);
+                    for (k, v) in p {
+                        match props.get_mut(&k) {
+                            Some(existing) if *existing != v => {
+                                *existing = json!({ "allOf": [existing.take(), v] });
+                            }
+                            Some(_) => {}
+                            None => {
+                                props.insert(k, v);
+                            }
+                        }
+                    }
                 }
                 if let Some(Value::Array(r)) = b.remove("required") {
                     for k in r {
@@ -1408,6 +1419,26 @@ mod tests {
             .as_array()
             .expect("allOf of both classes");
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn flattening_keeps_every_constraint_on_a_shared_property() {
+        let [partial] = lower_all(
+            "export class Narrow { value: 'x'; }\nexport class Wide { value: string; extra: number; }",
+            "import { PartialType, IntersectionType } from '@nestjs/swagger';\n\
+             import { Narrow, Wide } from './dto';\n\
+             export class P extends PartialType(IntersectionType(Narrow, Wide)) {}",
+            &["P"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            partial["allOf"][0]["properties"]["value"],
+            json!({ "allOf": [
+                { "type": "string", "enum": ["x"] },
+                { "type": "string" },
+            ] })
+        );
     }
 
     #[test]
