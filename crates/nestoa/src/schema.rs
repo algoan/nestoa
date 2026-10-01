@@ -3,6 +3,7 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
+use swc_common::Spanned;
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
     TsTypeLit, TsTypeParamInstantiation, TsTypeRef, TsUnionOrIntersectionType,
@@ -725,9 +726,11 @@ impl<'a> SchemaCtx<'a> {
         Value::Object(out)
     }
 
-    /// The schema a class inherits from its `extends` clause: a plain class,
-    /// or a `@nestjs/mapped-types` / `@nestjs/swagger` helper call, which may
-    /// nest (`PartialType(OmitType(CreateDto, ['id']))`).
+    /// The schema a class inherits from its `extends` clause: a plain or
+    /// namespace-qualified class, or a `@nestjs/mapped-types` /
+    /// `@nestjs/swagger` helper call, which may nest
+    /// (`PartialType(OmitType(CreateDto, ['id']))`). `None` when any part of it
+    /// cannot be lowered, rather than a partial result.
     fn heritage_schema(
         &mut self,
         file: &Path,
@@ -735,10 +738,10 @@ impl<'a> SchemaCtx<'a> {
         type_args: Option<&TsTypeParamInstantiation>,
     ) -> Option<Value> {
         match expr {
-            Expr::Ident(id) => {
+            Expr::Ident(_) | Expr::Member(_) => {
                 let reference = TsTypeRef {
-                    span: id.span,
-                    type_name: TsEntityName::Ident(id.clone()),
+                    span: expr.span(),
+                    type_name: entity_name_of(expr)?,
                     type_params: type_args.map(|a| Box::new(a.clone())),
                 };
                 Some(self.type_ref_schema(file, &reference))
@@ -748,32 +751,51 @@ impl<'a> SchemaCtx<'a> {
                 let swc_ecma_ast::Callee::Expr(callee) = &call.callee else {
                     return None;
                 };
-                let Expr::Ident(helper) = callee.as_ref() else {
-                    return None;
-                };
+                let helper = self.mapped_type_helper(file, callee)?;
                 let mut args = call.args.iter().map(|a| a.expr.as_ref());
-                match helper.sym.as_ref() {
-                    "IntersectionType" => {
-                        let parts: Vec<Value> = args
-                            .filter_map(|a| self.heritage_schema(file, a, None))
-                            .collect();
-                        Some(json!({ "allOf": parts }))
-                    }
-                    "PartialType" | "OmitType" | "PickType" => {
-                        let base = self.heritage_schema(file, args.next()?, None)?;
-                        let keys = args.next().map(string_array_keys).unwrap_or_default();
-                        let edit = match helper.sym.as_ref() {
-                            "PartialType" => ObjectEdit::AllOptional,
-                            "OmitType" => ObjectEdit::Omit(keys),
-                            _ => ObjectEdit::Pick(keys),
-                        };
-                        Some(self.reshape_object(base, &edit))
-                    }
-                    _ => None,
+                if helper == "IntersectionType" {
+                    let parts = args
+                        .map(|a| self.heritage_schema(file, a, None))
+                        .collect::<Option<Vec<Value>>>()?;
+                    return Some(json!({ "allOf": parts }));
                 }
+                let base = self.heritage_schema(file, args.next()?, None)?;
+                let edit = match helper.as_str() {
+                    "PartialType" => ObjectEdit::AllOptional,
+                    "OmitType" => ObjectEdit::Omit(string_array_keys(args.next()?)?),
+                    _ => ObjectEdit::Pick(string_array_keys(args.next()?)?),
+                };
+                Some(self.reshape_object(base, &edit))
             }
             _ => None,
         }
+    }
+
+    /// The mapped-type helper a call's callee names, looked through the
+    /// file's imports so an aliased (`PartialType as MakePartial`) or
+    /// namespaced (`swagger.PartialType`) helper is recognized too.
+    fn mapped_type_helper(&self, file: &Path, callee: &Expr) -> Option<String> {
+        let name = match callee {
+            Expr::Ident(id) => {
+                let local = id.sym.to_string();
+                self.project
+                    .symbols
+                    .get(file)
+                    .and_then(|fs| fs.imports.get(&local))
+                    .and_then(|b| b.imported.clone())
+                    .unwrap_or(local)
+            }
+            Expr::Member(m) => match &m.prop {
+                swc_ecma_ast::MemberProp::Ident(prop) => prop.sym.to_string(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        matches!(
+            name.as_str(),
+            "PartialType" | "OmitType" | "PickType" | "IntersectionType"
+        )
+        .then_some(name)
     }
 
     /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
@@ -929,10 +951,10 @@ impl<'a> SchemaCtx<'a> {
                 // A `class X extends Y` carries Y's members too. Mirror the
                 // interface-`extends` handling: emit Y as an allOf branch.
                 let mut all_of: Vec<Value> = Vec::new();
-                if let Some(super_expr) = &c.class.super_class
-                    && let Some(parent) =
-                        self.heritage_schema(file, super_expr, c.class.super_type_params.as_deref())
-                {
+                if let Some(super_expr) = &c.class.super_class {
+                    let parent = self
+                        .heritage_schema(file, super_expr, c.class.super_type_params.as_deref())
+                        .unwrap_or_else(|| json!({ "x-unresolved": heritage_label(super_expr) }));
                     all_of.push(parent);
                 }
                 for member in &c.class.body {
@@ -1230,8 +1252,9 @@ fn is_annotation(key: &str) -> bool {
 }
 
 /// The string literals of an array expression such as the key list of
-/// `OmitType(Dto, ['a', 'b'] as const)`.
-fn string_array_keys(expr: &Expr) -> Vec<String> {
+/// `OmitType(Dto, ['a', 'b'] as const)`. `None` if any entry is not a string
+/// literal (a constant, a spread), so the key set is never partial.
+fn string_array_keys(expr: &Expr) -> Option<Vec<String>> {
     match expr {
         Expr::TsConstAssertion(c) => string_array_keys(&c.expr),
         Expr::TsAs(a) => string_array_keys(&a.expr),
@@ -1239,13 +1262,52 @@ fn string_array_keys(expr: &Expr) -> Vec<String> {
         Expr::Array(arr) => arr
             .elems
             .iter()
-            .flatten()
-            .filter_map(|el| match el.expr.as_ref() {
-                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+            .map(|el| match el {
+                Some(el) if el.spread.is_none() => match el.expr.as_ref() {
+                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect(),
-        _ => Vec::new(),
+        _ => None,
+    }
+}
+
+/// A class reference (`Dto`, `Models.Dto`) as a type-entity name.
+fn entity_name_of(expr: &Expr) -> Option<TsEntityName> {
+    match expr {
+        Expr::Ident(id) => Some(TsEntityName::Ident(id.clone())),
+        Expr::Member(m) => {
+            let swc_ecma_ast::MemberProp::Ident(prop) = &m.prop else {
+                return None;
+            };
+            Some(TsEntityName::TsQualifiedName(Box::new(
+                swc_ecma_ast::TsQualifiedName {
+                    span: m.span,
+                    left: entity_name_of(&m.obj)?,
+                    right: prop.clone(),
+                },
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// How an `extends` clause nestoa cannot lower is named in `x-unresolved`.
+fn heritage_label(expr: &Expr) -> String {
+    match expr {
+        Expr::Call(call) => match &call.callee {
+            swc_ecma_ast::Callee::Expr(callee) => match entity_name_of(callee) {
+                Some(name) => format!("{}(…)", entity_name(&name)),
+                None => "extends".to_string(),
+            },
+            _ => "extends".to_string(),
+        },
+        Expr::Paren(p) => heritage_label(&p.expr),
+        _ => entity_name_of(expr)
+            .map(|n| entity_name(&n))
+            .unwrap_or_else(|| "extends".to_string()),
     }
 }
 
@@ -1610,6 +1672,47 @@ mod tests {
         assert_eq!(prop_names(partial), ["id", "name", "child"]);
         assert!(required_names(partial).is_empty());
         assert_eq!(partial["properties"]["child"], *child);
+    }
+
+    #[test]
+    fn mapped_type_helpers_resolve_through_imports_or_stay_visible() {
+        let schemas = lower_all(
+            BASE_AND_CHILD,
+            "import { PartialType as MakePartial, PickType, IntersectionType } from '@nestjs/mapped-types';\n\
+             import * as swagger from '@nestjs/swagger';\n\
+             import * as Models from './dto';\n\
+             import { Child } from './dto';\n\
+             class Extra { tag: string; }\n\
+             const KEY = 'id';\n\
+             export class Aliased extends MakePartial(Child) {}\n\
+             export class Namespaced extends swagger.PickType(Child, ['id']) {}\n\
+             export class Qualified extends IntersectionType(Models.Base, Extra) {}\n\
+             export class DynamicKeys extends PickType(Child, [KEY]) {}\n\
+             export class PartialOperand extends IntersectionType(Child, makeMixin()) {}",
+            &[
+                "Aliased",
+                "Namespaced",
+                "Qualified",
+                "DynamicKeys",
+                "PartialOperand",
+            ],
+        );
+        let parent = |s: &Value| s["allOf"][0].clone();
+        let [aliased, namespaced, qualified, dynamic, partial_operand] =
+            <[Value; 5]>::try_from(schemas.iter().map(parent).collect::<Vec<_>>()).unwrap();
+        assert_eq!(prop_names(&aliased), ["id", "secret", "extra", "note"]);
+        assert!(required_names(&aliased).is_empty());
+        assert_eq!(prop_names(&namespaced), ["id"]);
+        assert_eq!(
+            qualified["allOf"][0],
+            json!({ "$ref": "#/components/schemas/Base" })
+        );
+        // Never a partial edit or a silently dropped operand.
+        assert_eq!(dynamic, json!({ "x-unresolved": "PickType(…)" }));
+        assert_eq!(
+            partial_operand,
+            json!({ "x-unresolved": "IntersectionType(…)" })
+        );
     }
 
     #[test]
