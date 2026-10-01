@@ -29,6 +29,8 @@ pub enum HttpMethod {
     Delete,
     Head,
     Options,
+    /// Reachable only through `@All`: NestJS has no `@Trace()` decorator.
+    Trace,
 }
 
 impl HttpMethod {
@@ -41,6 +43,7 @@ impl HttpMethod {
             HttpMethod::Delete => "delete",
             HttpMethod::Head => "head",
             HttpMethod::Options => "options",
+            HttpMethod::Trace => "trace",
         }
     }
     fn from_decorator(name: &str) -> Option<HttpMethod> {
@@ -57,8 +60,9 @@ impl HttpMethod {
     }
 }
 
-/// The methods NestJS's `RequestMethod` routes; `@All` registers every one.
-const ALL_METHODS: [HttpMethod; 7] = [
+/// The operations an `@All` handler answers: the router's `all` route matches
+/// every method, TRACE included.
+const ALL_METHODS: [HttpMethod; 8] = [
     HttpMethod::Get,
     HttpMethod::Post,
     HttpMethod::Put,
@@ -66,6 +70,7 @@ const ALL_METHODS: [HttpMethod; 7] = [
     HttpMethod::Delete,
     HttpMethod::Head,
     HttpMethod::Options,
+    HttpMethod::Trace,
 ];
 
 /// A handler's HTTP-verb decorator: a single method, or `@All`.
@@ -1644,7 +1649,9 @@ mod tests {
         let ops: Vec<&String> = doc["paths"]["/proxy"].as_object().unwrap().keys().collect();
         assert_eq!(
             ops,
-            ["delete", "get", "head", "options", "patch", "post", "put"]
+            [
+                "delete", "get", "head", "options", "patch", "post", "put", "trace"
+            ]
         );
     }
 
