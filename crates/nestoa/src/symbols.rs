@@ -19,6 +19,18 @@ pub enum Symbol {
     Class(Arc<ClassDecl>),
 }
 
+impl Symbol {
+    /// The name the declaration itself was given, whatever it is imported as.
+    pub fn name(&self) -> String {
+        match self {
+            Symbol::Interface(i) => i.id.sym.to_string(),
+            Symbol::TypeAlias(t) => t.id.sym.to_string(),
+            Symbol::Enum(e) => e.id.sym.to_string(),
+            Symbol::Class(c) => c.ident.sym.to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ImportBinding {
     /// The exported name on the other side. None for default imports / namespace imports.

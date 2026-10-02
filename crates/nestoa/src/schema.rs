@@ -488,8 +488,13 @@ impl<'a> SchemaCtx<'a> {
     ///   either deduped against a structurally-equal sibling, or — when its
     ///   shape differs — registered under a fresh name prefixed with the
     ///   enclosing type's name (`Party` + `Identity` -> `PartyIdentity`).
+    ///
+    /// A declaration is identified by its own name, so references through
+    /// different import aliases share one component; it is *named* after the
+    /// first reference, keeping an alias chosen to tell same-named declarations
+    /// apart (`Account as MastercardAccount`).
     fn component_ref(&mut self, decl_file: &Path, type_name: &str, sym: &Symbol) -> Value {
-        let key = (decl_file.to_path_buf(), type_name.to_string());
+        let key = (decl_file.to_path_buf(), sym.name());
         // Already assigned: a repeat reference, or an in-progress recursion
         // that must resolve to the name reserved below.
         if let Some(name) = self.components.by_decl.get(&key) {
@@ -1557,6 +1562,29 @@ mod tests {
 
     const BASE_AND_CHILD: &str = "export class Base { id: string; secret: string; }\n\
         export class Child extends Base { extra: string; note?: string; }";
+
+    #[test]
+    fn import_aliases_share_the_declaration_component() {
+        let [first, second, direct] = lower_with(
+            &[
+                ("dto.ts", "export class Base { id: string; }"),
+                ("other.ts", "export class Base { name: string; }"),
+            ],
+            "import { Base as First, Base } from './dto';\n\
+             import { Base as Second } from './other';\n\
+             export type A = First;\n\
+             export type B = Second;\n\
+             export type C = Base;",
+            &["A", "B", "C"],
+        )
+        .try_into()
+        .unwrap();
+        // Distinct declarations keep the aliases that tell them apart…
+        assert_eq!(first, json!({ "$ref": "#/components/schemas/First" }));
+        assert_eq!(second, json!({ "$ref": "#/components/schemas/Second" }));
+        // …and a direct reference reuses its declaration's component.
+        assert_eq!(direct, first);
+    }
 
     #[test]
     fn enums_follow_typescript_member_values() {
