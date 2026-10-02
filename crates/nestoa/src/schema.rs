@@ -929,15 +929,25 @@ impl<'a> SchemaCtx<'a> {
                                 types.push(t);
                             }
                         }
-                        let ty = match types.as_slice() {
-                            [one] => json!(one),
-                            _ => json!(types),
-                        };
-                        obj.insert("type".into(), ty);
-                        obj.insert(
-                            "enum".into(),
-                            Value::Array(values.iter().map(enum_value_json).collect()),
-                        );
+                        match types.as_slice() {
+                            // `enum Empty {}` admits no value; `type`/`enum`
+                            // arrays must be non-empty, so say it with `not`.
+                            [] => {
+                                obj.insert("not".into(), json!({}));
+                            }
+                            [one] => {
+                                obj.insert("type".into(), json!(one));
+                            }
+                            _ => {
+                                obj.insert("type".into(), json!(types));
+                            }
+                        }
+                        if !values.is_empty() {
+                            obj.insert(
+                                "enum".into(),
+                                Value::Array(values.iter().map(enum_value_json).collect()),
+                            );
+                        }
                     }
                     // A member whose value nestoa cannot compute: listing the
                     // others would reject it, so the constraint is left out.
@@ -1611,6 +1621,18 @@ mod tests {
         assert_eq!(computed, json!({ "x-unresolved": "Computed" }));
         assert_eq!(member, json!({ "type": "number", "enum": [3] }));
         assert_eq!(unknown_member, json!({ "x-unresolved": "Computed.B" }));
+    }
+
+    #[test]
+    fn empty_enum_admits_no_value() {
+        let [empty] = lower_all(
+            "export enum Empty {}",
+            "export { Empty } from './dto';",
+            &["Empty"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(empty, json!({ "not": {} }));
     }
 
     #[test]
