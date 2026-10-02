@@ -187,7 +187,11 @@ pub fn jsdoc_before(source: &str, file_start: BytePos, span: Span) -> Option<JsD
         if i >= 2 && &bytes[i - 2..i] == b"*/" {
             let end = i - 2;
             let after_prev_close = head[..end].rfind("*/").map_or(0, |p| p + 2);
-            let open = after_prev_close + head[after_prev_close..end].find("/*")?;
+            let open = after_prev_close
+                + head[after_prev_close..end]
+                    .match_indices("/*")
+                    .map(|(p, _)| p)
+                    .find(|&p| opens_comment(head, after_prev_close + p))?;
             let block = &head[open..end];
             if block.starts_with("/**") && !block.starts_with("/**/") {
                 return Some(JsDoc::parse(&block[3..]));
@@ -251,6 +255,27 @@ pub fn jsdoc_before(source: &str, file_start: BytePos, span: Span) -> Option<JsD
     None
 }
 
+/// Whether the `/*` at `pos` opens a comment rather than sitting in a string
+/// or a `//` comment earlier on its line. A line-local heuristic (quotes are
+/// balanced per line), not a lexer: enough to find a member's leading comment.
+fn opens_comment(source: &str, pos: usize) -> bool {
+    let line = &source[source[..pos].rfind('\n').map_or(0, |p| p + 1)..pos];
+    let mut open_quote: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (open_quote, c) {
+            (Some(_), _) if escaped => escaped = false,
+            (Some(_), '\\') => escaped = true,
+            (Some(q), c) if c == q => open_quote = None,
+            (None, '"' | '\'' | '`') => open_quote = Some(c),
+            (None, '/') if chars.peek() == Some(&'/') => return false,
+            _ => {}
+        }
+    }
+    open_quote.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +297,16 @@ mod tests {
         let source = "/** Read */\n/* note */\n@Get()\nread() {}";
         let doc = doc_before(source, "read").expect("doc");
         assert_eq!(doc.summary.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn comment_opener_in_a_string_or_line_comment_is_ignored() {
+        let source = "const marker = \"/*\"; // see /*\n/** Read */\nread() {}";
+        let doc = doc_before(source, "read").expect("doc");
+        assert_eq!(doc.summary.as_deref(), Some("Read"));
+        let url = "const u = \"http://x\"; /** Write */\nwrite() {}";
+        let doc = doc_before(url, "write").expect("doc");
+        assert_eq!(doc.summary.as_deref(), Some("Write"));
     }
 
     #[test]
