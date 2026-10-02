@@ -444,9 +444,12 @@ pub enum EnumValue {
 /// (possibly negative) numeric initializer is taken as written, and a member
 /// without one continues from the previous numeric member, starting at 0.
 /// `None` for a computed initializer, and for an implicit member after one
-/// or after a string member, whose value nestoa cannot know.
+/// or after a string member, whose value nestoa cannot know. In an ambient
+/// (`declare`) non-const enum TypeScript treats every implicit member as
+/// computed, so those are `None` too.
 pub fn enum_member_values(e: &TsEnumDecl) -> Vec<(String, Option<EnumValue>)> {
-    let mut next = Some(0.0);
+    let implicit_known = !e.declare || e.is_const;
+    let mut next = implicit_known.then_some(0.0);
     e.members
         .iter()
         .map(|m| {
@@ -462,7 +465,7 @@ pub fn enum_member_values(e: &TsEnumDecl) -> Vec<(String, Option<EnumValue>)> {
                 None => next.map(EnumValue::Num),
             };
             next = match &value {
-                Some(EnumValue::Num(v)) => Some(v + 1.0),
+                Some(EnumValue::Num(v)) if implicit_known => Some(v + 1.0),
                 _ => None,
             };
             (name, value)

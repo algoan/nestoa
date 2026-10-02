@@ -1624,6 +1624,20 @@ mod tests {
     }
 
     #[test]
+    fn ambient_enum_implicit_members_are_unknown() {
+        let [ambient, constant] = lower_all(
+            "export declare enum Ambient { A = 1, B }\n\
+             export declare const enum Constant { A = 1, B }",
+            "export { Ambient, Constant } from './dto';",
+            &["Ambient", "Constant"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(ambient, json!({ "x-unresolved": "Ambient" }));
+        assert_eq!(constant, json!({ "type": "number", "enum": [1, 2] }));
+    }
+
+    #[test]
     fn empty_enum_admits_no_value() {
         let [empty] = lower_all(
             "export enum Empty {}",
