@@ -10,7 +10,7 @@ use swc_ecma_ast::{
 };
 
 use crate::jsdoc::{JsDoc, jsdoc_before};
-use crate::symbols::{Project, Symbol};
+use crate::symbols::{EnumValue, Project, Symbol, enum_member_values};
 
 /// Mutable container for the components/schemas section of the OpenAPI doc.
 #[derive(Default)]
@@ -318,40 +318,17 @@ impl<'a> SchemaCtx<'a> {
         if let TsEntityName::TsQualifiedName(q) = &r.type_name {
             let parent = entity_name(&q.left);
             let member = q.right.sym.to_string();
-            if let Some((decl_file, Symbol::Enum(e))) = self.project.resolve(file, &parent) {
-                let _ = decl_file;
-                let mut auto: i64 = 0;
-                let mut is_string;
-                for m in &e.members {
-                    let mname = match &m.id {
-                        swc_ecma_ast::TsEnumMemberId::Ident(i) => i.sym.to_string(),
-                        swc_ecma_ast::TsEnumMemberId::Str(s) => {
-                            s.value.to_string_lossy().into_owned()
-                        }
-                    };
-                    let value = match m.init.as_deref() {
-                        Some(Expr::Lit(Lit::Str(s))) => {
-                            is_string = true;
-                            Value::String(s.value.to_string_lossy().into_owned())
-                        }
-                        Some(Expr::Lit(Lit::Num(n))) => {
-                            is_string = false;
-                            let v = Value::from(n.value);
-                            auto = (n.value as i64) + 1;
-                            v
-                        }
-                        _ => {
-                            is_string = false;
-                            let v = Value::from(auto);
-                            auto += 1;
-                            v
-                        }
-                    };
-                    if mname == member {
-                        let ty = if is_string { "string" } else { "number" };
-                        return json!({ "type": ty, "enum": [value] });
+            if let Some((_, Symbol::Enum(e))) = self.project.resolve(file, &parent)
+                && let Some((_, value)) = enum_member_values(&e)
+                    .into_iter()
+                    .find(|(name, _)| *name == member)
+            {
+                return match value {
+                    Some(v) => {
+                        json!({ "type": enum_value_type(&v), "enum": [enum_value_json(&v)] })
                     }
-                }
+                    None => json!({ "x-unresolved": format!("{parent}.{member}") }),
+                };
             }
             // Namespace-qualified type, e.g. `Enums.AccountType` where `Enums`
             // is a TS namespace (`import * as Enums` / `export * as Enums`).
@@ -935,45 +912,34 @@ impl<'a> SchemaCtx<'a> {
             }
             Symbol::TypeAlias(t) => self.ts_type_to_schema(file, &t.type_ann),
             Symbol::Enum(e) => {
-                // Distinguish string-enums from numeric ones based on the first initialiser.
-                let mut values: Vec<Value> = Vec::new();
-                let mut is_string = true;
-                let mut auto = 0i64;
-                for m in &e.members {
-                    let v = match &m.init {
-                        Some(expr) => match expr.as_ref() {
-                            Expr::Lit(Lit::Str(s)) => {
-                                is_string = true;
-                                Value::String(s.value.to_string_lossy().into_owned())
-                            }
-                            Expr::Lit(Lit::Num(n)) => {
-                                is_string = false;
-                                Value::from(n.value)
-                            }
-                            _ => {
-                                // Fallback: use the member name.
-                                Value::String(prop_name(&m.id))
-                            }
-                        },
-                        None => {
-                            is_string = false;
-                            let v = Value::from(auto);
-                            auto += 1;
-                            v
-                        }
-                    };
-                    values.push(v);
-                }
+                let values: Option<Vec<EnumValue>> =
+                    enum_member_values(e).into_iter().map(|(_, v)| v).collect();
                 let mut obj = Map::new();
-                obj.insert(
-                    "type".into(),
-                    Value::String(if is_string {
-                        "string".into()
-                    } else {
-                        "number".into()
-                    }),
-                );
-                obj.insert("enum".into(), Value::Array(values));
+                match values {
+                    Some(values) => {
+                        let mut types: Vec<&str> = Vec::new();
+                        for v in &values {
+                            let t = enum_value_type(v);
+                            if !types.contains(&t) {
+                                types.push(t);
+                            }
+                        }
+                        let ty = match types.as_slice() {
+                            [one] => json!(one),
+                            _ => json!(types),
+                        };
+                        obj.insert("type".into(), ty);
+                        obj.insert(
+                            "enum".into(),
+                            Value::Array(values.iter().map(enum_value_json).collect()),
+                        );
+                    }
+                    // A member whose value nestoa cannot compute: listing the
+                    // others would reject it, so the constraint is left out.
+                    None => {
+                        obj.insert("x-unresolved".into(), json!(e.id.sym.to_string()));
+                    }
+                }
                 if let (Some(src), Some(file_start)) =
                     (self.sources.get(file), self.file_starts.get(file))
                     && let Some(doc) = jsdoc_before(src, *file_start, e.span)
@@ -1073,10 +1039,21 @@ impl<'a> SchemaCtx<'a> {
     }
 }
 
-fn prop_name(p: &swc_ecma_ast::TsEnumMemberId) -> String {
-    match p {
-        swc_ecma_ast::TsEnumMemberId::Ident(i) => i.sym.to_string(),
-        swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
+fn enum_value_type(v: &EnumValue) -> &'static str {
+    match v {
+        EnumValue::Str(_) => "string",
+        EnumValue::Num(_) => "number",
+    }
+}
+
+/// An enum value as JSON, a whole number written as an integer (`1`, not `1.0`).
+fn enum_value_json(v: &EnumValue) -> Value {
+    match v {
+        EnumValue::Str(s) => Value::String(s.clone()),
+        EnumValue::Num(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 => {
+            Value::from(*n as i64)
+        }
+        EnumValue::Num(n) => Value::from(*n),
     }
 }
 
@@ -1580,6 +1557,33 @@ mod tests {
 
     const BASE_AND_CHILD: &str = "export class Base { id: string; secret: string; }\n\
         export class Child extends Base { extra: string; note?: string; }";
+
+    #[test]
+    fn enums_follow_typescript_member_values() {
+        let [level, neg, strings, mixed, computed, member, unknown_member] = lower_all(
+            "export enum Level { A = 1, B, C }\n\
+             export enum Neg { A = -1, B }\n\
+             export enum S { X = 'x', Y = 'y' }\n\
+             export enum Mixed { A = 'a', B = 2 }\n\
+             export enum Computed { A = 1 << 1, B }",
+            "import { Level, Neg, S, Mixed, Computed } from './dto';\n\
+             export type M = Level.C;\n\
+             export type U = Computed.B;",
+            &["Level", "Neg", "S", "Mixed", "Computed", "M", "U"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(level, json!({ "type": "number", "enum": [1, 2, 3] }));
+        assert_eq!(neg, json!({ "type": "number", "enum": [-1, 0] }));
+        assert_eq!(strings, json!({ "type": "string", "enum": ["x", "y"] }));
+        assert_eq!(
+            mixed,
+            json!({ "type": ["string", "number"], "enum": ["a", 2] })
+        );
+        assert_eq!(computed, json!({ "x-unresolved": "Computed" }));
+        assert_eq!(member, json!({ "type": "number", "enum": [3] }));
+        assert_eq!(unknown_member, json!({ "x-unresolved": "Computed.B" }));
+    }
 
     #[test]
     fn utility_types_edit_inherited_properties() {
