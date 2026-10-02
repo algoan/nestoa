@@ -19,6 +19,18 @@ pub enum Symbol {
     Class(Arc<ClassDecl>),
 }
 
+impl Symbol {
+    /// The name the declaration itself was given, whatever it is imported as.
+    pub fn name(&self) -> String {
+        match self {
+            Symbol::Interface(i) => i.id.sym.to_string(),
+            Symbol::TypeAlias(t) => t.id.sym.to_string(),
+            Symbol::Enum(e) => e.id.sym.to_string(),
+            Symbol::Class(c) => c.ident.sym.to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ImportBinding {
     /// The exported name on the other side. None for default imports / namespace imports.
@@ -240,24 +252,13 @@ impl Project {
         let (_, Symbol::Enum(e)) = self.resolve(file, enum_name)? else {
             return None;
         };
-        // `None` once an unsupported initialiser makes the implicit value
-        // unknowable; a later numeric initialiser restores it.
-        let mut next = Some(0.0);
-        for m in &e.members {
-            let value = match m.init.as_deref() {
-                Some(init) => numeric_expr(init),
-                None => next,
-            };
-            let name = match &m.id {
-                swc_ecma_ast::TsEnumMemberId::Ident(i) => i.sym.to_string(),
-                swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
-            };
-            if name == member {
-                return value;
-            }
-            next = value.map(|v| v + 1.0);
+        match enum_member_values(&e)
+            .into_iter()
+            .find(|(name, _)| name == member)?
+        {
+            (_, Some(EnumValue::Num(v))) => Some(v),
+            _ => None,
         }
-        None
     }
 
     fn resolve_const_inner(
@@ -430,6 +431,46 @@ fn collect_decl(decl: &Decl, fs: &mut FileSymbols) {
         }
         _ => {}
     }
+}
+
+/// The value of an enum member, as far as it can be known statically.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EnumValue {
+    Str(String),
+    Num(f64),
+}
+
+/// Each member of an enum with its value, following TypeScript: a string or
+/// (possibly negative) numeric initializer is taken as written, and a member
+/// without one continues from the previous numeric member, starting at 0.
+/// `None` for a computed initializer, and for an implicit member after one
+/// or after a string member, whose value nestoa cannot know. In an ambient
+/// (`declare`) non-const enum TypeScript treats every implicit member as
+/// computed, so those are `None` too.
+pub fn enum_member_values(e: &TsEnumDecl) -> Vec<(String, Option<EnumValue>)> {
+    let implicit_known = !e.declare || e.is_const;
+    let mut next = implicit_known.then_some(0.0);
+    e.members
+        .iter()
+        .map(|m| {
+            let name = match &m.id {
+                swc_ecma_ast::TsEnumMemberId::Ident(i) => i.sym.to_string(),
+                swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
+            };
+            let value = match m.init.as_deref() {
+                Some(swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(s))) => {
+                    Some(EnumValue::Str(s.value.to_string_lossy().into_owned()))
+                }
+                Some(init) => numeric_expr(init).map(EnumValue::Num),
+                None => next.map(EnumValue::Num),
+            };
+            next = match &value {
+                Some(EnumValue::Num(v)) if implicit_known => Some(v + 1.0),
+                _ => None,
+            };
+            (name, value)
+        })
+        .collect()
 }
 
 /// The numeric value of an expression that is a number literal, optionally
