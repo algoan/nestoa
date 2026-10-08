@@ -24,13 +24,21 @@ function platformTag() {
 
 function isMusl() {
   // glibc builds of Node report the runtime glibc version; musl ones don't.
-  const report = process.report && process.report.getReport();
+  const report = nodeReport();
   if (report && report.header) {
     if (report.header.glibcVersionRuntime) return false;
     const libs = report.sharedObjects || [];
     if (libs.some((lib) => /musl/i.test(lib))) return true;
   }
   return /musl/i.test(lddVersion());
+}
+
+function nodeReport() {
+  try {
+    return process.report && process.report.getReport();
+  } catch {
+    return null;
+  }
 }
 
 function lddVersion() {
