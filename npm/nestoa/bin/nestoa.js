@@ -4,13 +4,14 @@
 // At install time, npm installs exactly one of the `@nestoa/<platform>` optional
 // dependencies based on os/arch/libc, and `install.js` copies (or symlinks) the
 // binary into ./bin/nestoa(.exe). This shim execs that binary with the user's
-// argv.
+// argv. NESTOA_BINARY, when set, wins over both.
 
 const { spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
 function resolveBinary() {
+  if (process.env.NESTOA_BINARY) return process.env.NESTOA_BINARY;
   const local = path.join(
     __dirname,
     process.platform === "win32" ? "nestoa.exe" : "nestoa",
@@ -39,8 +40,7 @@ if (!bin) {
   process.exit(1);
 }
 
-const override = process.env.NESTOA_BINARY;
-const result = spawnSync(override || bin, process.argv.slice(2), {
+const result = spawnSync(bin, process.argv.slice(2), {
   stdio: "inherit",
 });
 if (result.error) {
