@@ -23,14 +23,24 @@ function platformTag() {
 }
 
 function isMusl() {
-  // Best-effort detection: glibc ldd prints something like
-  // "ldd (GNU libc) 2.39", musl ldd has no -v but writes "musl libc" to stderr.
+  // glibc builds of Node report the runtime glibc version; musl ones don't.
+  const report = process.report && process.report.getReport();
+  if (report && report.header) {
+    if (report.header.glibcVersionRuntime) return false;
+    const libs = report.sharedObjects || [];
+    if (libs.some((lib) => /musl/i.test(lib))) return true;
+  }
+  return /musl/i.test(lddVersion());
+}
+
+function lddVersion() {
+  // musl's ldd prints its banner but exits non-zero, so read the output from
+  // the error too.
+  const { execSync } = require("child_process");
   try {
-    const { execSync } = require("child_process");
-    const out = execSync("ldd --version 2>&1", { encoding: "utf8" });
-    return /musl/i.test(out);
-  } catch {
-    return false;
+    return execSync("ldd --version 2>&1", { encoding: "utf8" });
+  } catch (err) {
+    return `${err.stdout || ""}${err.stderr || ""}`;
   }
 }
 
