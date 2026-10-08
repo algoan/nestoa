@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,7 +436,7 @@ impl Config {
         };
         for path in candidates {
             if path.is_file() {
-                let value = load_value(&path)?;
+                let value = load_value(&path, &mut Vec::new())?;
                 let cfg: Config = serde_json::from_value(value)
                     .with_context(|| format!("parsing {}", path.display()))?;
                 return Ok(cfg);
@@ -468,7 +468,19 @@ impl Config {
 /// itself extend another). The `extends` key is stripped from the result so it
 /// never reaches `Config`, which denies unknown fields. JSON and YAML configs
 /// are both parsed through `serde_json::Value`, giving one merge medium.
-fn load_value(path: &Path) -> Result<serde_json::Value> {
+/// `chain` holds the files already being loaded, so a cycle is reported
+/// instead of recursing forever.
+fn load_value(path: &Path, chain: &mut Vec<PathBuf>) -> Result<serde_json::Value> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if let Some(start) = chain.iter().position(|p| *p == key) {
+        let cycle: Vec<String> = chain[start..]
+            .iter()
+            .chain(std::iter::once(&key))
+            .map(|p| p.display().to_string())
+            .collect();
+        bail!("\"extends\" cycle: {}", cycle.join(" -> "));
+    }
+    chain.push(key);
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut value: serde_json::Value = if path.extension().and_then(|s| s.to_str()) == Some("json")
@@ -484,7 +496,7 @@ fn load_value(path: &Path) -> Result<serde_json::Value> {
             .as_str()
             .with_context(|| format!("\"extends\" in {} must be a string path", path.display()))?;
         let base_path = path.parent().unwrap_or_else(|| Path::new(".")).join(rel);
-        let mut base = load_value(&base_path)
+        let mut base = load_value(&base_path, chain)
             .with_context(|| format!("resolving \"extends\" from {}", path.display()))?;
         merge_value(&mut base, value);
         return Ok(base);
@@ -617,6 +629,29 @@ mod tests {
         .unwrap();
         let err = Config::load(Some(Path::new("nestoa.config.json")), &dir);
         assert!(err.is_err(), "missing extends target should error");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extends_cycle_errors() {
+        let dir = std::env::temp_dir().join(format!("nestoa-extends-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nestoa.config.json"),
+            r#"{ "extends": "./b.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            r#"{ "extends": "./nestoa.config.json" }"#,
+        )
+        .unwrap();
+        let err = Config::load(Some(Path::new("nestoa.config.json")), &dir)
+            .expect_err("an extends cycle should error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"extends\" cycle"), "{msg}");
+        assert!(msg.contains("b.json -> "), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
