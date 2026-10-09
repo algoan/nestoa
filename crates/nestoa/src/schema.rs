@@ -2157,6 +2157,29 @@ mod tests {
     }
 
     #[test]
+    fn javascript_specifiers_reach_typescript_declarations() {
+        let [item, dto] = lower_with(
+            &[
+                (
+                    "types.d.mts",
+                    "export declare interface Item { id: string; }",
+                ),
+                ("barrel.ts", "export * from './types.mjs';"),
+                ("dto.ts", "export class Dto { name: string; }"),
+            ],
+            "import { Item } from './barrel.js';\n\
+             import { Dto } from './dto.js';\n\
+             export type A = Item;\n\
+             export type B = Dto;",
+            &["A", "B"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(item, json!({ "$ref": "#/components/schemas/Item" }));
+        assert_eq!(dto, json!({ "$ref": "#/components/schemas/Dto" }));
+    }
+
+    #[test]
     fn utility_keys_resolve_aliases_and_never_apply_partially() {
         let [aliased, keyof, mixed] = lower_all(
             BASE_AND_CHILD,

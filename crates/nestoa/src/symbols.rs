@@ -575,27 +575,69 @@ pub fn resolve_module_path(current_file: &Path, specifier: &str) -> Option<PathB
     if !specifier.starts_with('.') {
         return None;
     }
-    let base = current_file.parent()?;
-    let candidate = base.join(specifier);
-    for ext in [
-        ".ts",
-        ".tsx",
-        ".d.ts",
-        "/index.ts",
-        "/index.tsx",
-        "/index.d.ts",
-    ] {
-        let mut p = candidate.clone().into_os_string();
-        p.push(ext);
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p.canonicalize().unwrap_or(p));
-        }
+    module_file(&current_file.parent()?.join(specifier))
+}
+
+/// The file an import of `candidate` loads: its TypeScript counterpart when it
+/// names a JavaScript file, else with the usual extensions or `/index` appended,
+/// else the path itself.
+pub(crate) fn module_file(candidate: &Path) -> Option<PathBuf> {
+    substituted_file(candidate)
+        .or_else(|| {
+            [
+                ".ts",
+                ".tsx",
+                ".d.ts",
+                "/index.ts",
+                "/index.tsx",
+                "/index.d.ts",
+            ]
+            .into_iter()
+            .find_map(|ext| existing(with_suffix(candidate, ext)))
+        })
+        .or_else(|| existing(candidate.to_path_buf()))
+}
+
+/// The TypeScript file a `.js`/`.mjs`/`.cjs`/`.jsx` path stands for, as
+/// TypeScript substitutes extensions (`a.mjs` -> `a.mts`, then `a.d.mts`).
+fn substituted_file(path: &Path) -> Option<PathBuf> {
+    const SUBSTITUTIONS: [(&str, &[&str]); 4] = [
+        (".mjs", &[".mts", ".d.mts"]),
+        (".cjs", &[".cts", ".d.cts"]),
+        (".jsx", &[".tsx", ".d.ts"]),
+        (".js", &[".ts", ".tsx", ".d.ts"]),
+    ];
+    let name = path.to_str()?;
+    let (stem, replacements) = SUBSTITUTIONS
+        .iter()
+        .find_map(|(js, ts)| Some((name.strip_suffix(js)?, *ts)))?;
+    replacements
+        .iter()
+        .find_map(|ext| existing(PathBuf::from(format!("{stem}{ext}"))))
+}
+
+/// `path` itself when it names a TypeScript file, or its substituted
+/// TypeScript file when it names a JavaScript one, whichever exists.
+fn typescript_file(path: &Path) -> Option<PathBuf> {
+    let is_ts = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "ts" | "tsx" | "mts" | "cts"));
+    if is_ts {
+        existing(path.to_path_buf())
+    } else {
+        substituted_file(path)
     }
-    if candidate.is_file() {
-        return Some(candidate.canonicalize().unwrap_or(candidate));
-    }
-    None
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+fn existing(path: PathBuf) -> Option<PathBuf> {
+    path.is_file().then(|| path.canonicalize().unwrap_or(path))
 }
 
 /// Split a bare module specifier into `(package_name, subpath)`.
@@ -638,21 +680,24 @@ pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a package.json `exports` entry value to a `.d.ts` path the way
+/// Resolve a package.json `exports` entry value to a TypeScript file the way
 /// TypeScript walks it: conditions in declared order, the first applicable one
-/// that yields a declaration wins, and one mapped to `null` blocks the entry.
-fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
+/// whose target `resolve` finds wins, and one mapped to `null` blocks the entry.
+fn dts_from_exports_value(
+    v: &serde_json::Value,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     match v {
-        serde_json::Value::String(s) if s.ends_with(".d.ts") => Some(s.clone()),
-        serde_json::Value::Array(alternatives) => {
-            alternatives.iter().find_map(dts_from_exports_value)
-        }
+        serde_json::Value::String(target) => resolve(target),
+        serde_json::Value::Array(alternatives) => alternatives
+            .iter()
+            .find_map(|v| dts_from_exports_value(v, resolve)),
         serde_json::Value::Object(map) => {
             for (_, v) in map.iter().filter(|(k, _)| condition_applies(k)) {
                 if v.is_null() {
                     return None;
                 }
-                if let Some(found) = dts_from_exports_value(v) {
+                if let Some(found) = dts_from_exports_value(v, resolve) {
                     return Some(found);
                 }
             }
@@ -676,27 +721,30 @@ fn condition_applies(condition: &str) -> bool {
 
 /// Resolve a package subpath to its declaration entry via the `exports` map:
 /// the best-matching key (exact, then the longest `*` pattern prefix, as Node
-/// picks it), its `*` substituted into the target.
-fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String> {
+/// picks it), its `*` substituted into the target, which must exist.
+fn types_from_exports(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) -> Option<PathBuf> {
     let exports = json.get("exports")?;
     let key = if subpath.is_empty() {
         ".".to_string()
     } else {
         format!("./{subpath}")
     };
-    // A string, array or conditions object is shorthand for `{ ".": … }`.
-    let serde_json::Value::Object(map) = exports else {
-        return (key == ".")
-            .then(|| dts_from_exports_value(exports))
-            .flatten();
+    let target_in = |target: &str, captured: &str| {
+        typescript_file(&pkg_dir.join(target.replace('*', captured).trim_start_matches("./")))
     };
-    if !map.keys().any(|k| k.starts_with('.')) {
+    // A string, array or conditions object is shorthand for `{ ".": … }`.
+    let shorthand = match exports {
+        serde_json::Value::Object(map) => !map.keys().any(|k| k.starts_with('.')),
+        _ => true,
+    };
+    if shorthand {
         return (key == ".")
-            .then(|| dts_from_exports_value(exports))
+            .then(|| dts_from_exports_value(exports, &|t| target_in(t, "")))
             .flatten();
     }
+    let map = exports.as_object()?;
     let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key, true)?;
-    Some(dts_from_exports_value(value)?.replace('*', &captured))
+    dts_from_exports_value(value, &|t| target_in(t, &captured))
 }
 
 /// The TypeScript version `typesVersions` ranges are evaluated against.
@@ -780,19 +828,15 @@ fn comparator_holds(comparator: &str) -> bool {
     }
 }
 
-/// `path` itself when it is a `.ts` file, or with a `.d.ts` / `/index.d.ts`
-/// suffix, whichever exists.
+/// `path` itself when it is a TypeScript file, its substituted TypeScript file
+/// when it is a JavaScript one, or with a `.d.ts` / `/index.d.ts` suffix,
+/// whichever exists.
 fn declaration_file(path: &Path) -> Option<PathBuf> {
-    let as_is = path.extension().is_some_and(|e| e == "ts").then_some("");
-    as_is
-        .into_iter()
-        .chain([".d.ts", "/index.d.ts"])
-        .find_map(|ext| {
-            let mut p = path.as_os_str().to_os_string();
-            p.push(ext);
-            let p = PathBuf::from(p);
-            p.is_file().then(|| p.canonicalize().unwrap_or(p))
-        })
+    typescript_file(path).or_else(|| {
+        [".d.ts", "/index.d.ts"]
+            .into_iter()
+            .find_map(|ext| existing(with_suffix(path, ext)))
+    })
 }
 
 /// Locate the TypeScript declaration file for a bare package import (including
@@ -803,26 +847,23 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
     let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
-    let in_package = |rel: String| {
-        let candidate = pkg_dir.join(rel.trim_start_matches("./"));
-        candidate
-            .is_file()
-            .then(|| candidate.canonicalize().unwrap_or(candidate))
-    };
+    let in_package = |rel: &str| declaration_file(&pkg_dir.join(rel.trim_start_matches("./")));
     if subpath.is_empty() {
-        if let Some(found) = types_from_exports(&json, "").and_then(in_package) {
+        if let Some(found) = types_from_exports(&json, &pkg_dir, "") {
             return Some(found);
         }
-        let entry = ["typings", "types"]
+        let typings = ["typings", "types"]
             .into_iter()
-            .find_map(|k| json.get(k)?.as_str())
-            .unwrap_or("index.d.ts");
+            .find_map(|k| json.get(k)?.as_str());
+        // Without `types`, TypeScript looks for the declaration next to `main`.
+        let main = || in_package(json.get("main")?.as_str()?);
+        let entry = typings.unwrap_or("index.d.ts");
         // `typesVersions` remaps the entry path too, not just subpaths.
         return types_from_versions(&json, &pkg_dir, entry.trim_start_matches("./"))
-            .or_else(|| in_package(entry.to_string()));
+            .or_else(|| typings.map_or_else(main, in_package))
+            .or_else(|| in_package(entry));
     }
-    types_from_exports(&json, &subpath)
-        .and_then(in_package)
+    types_from_exports(&json, &pkg_dir, &subpath)
         .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
         .or_else(|| declaration_file(&pkg_dir.join(&subpath)))
 }
@@ -990,6 +1031,58 @@ mod tests {
             &["main.d.ts"],
         );
         assert_eq!(resolved(&sugar, "lib").as_deref(), Some("main.d.ts"));
+    }
+
+    #[test]
+    fn javascript_targets_resolve_to_their_declarations() {
+        let substituted = package(
+            "substituted",
+            r#"{ "exports": {
+                ".": { "import": "./dist/index.js", "types": "./legacy/index.d.ts" },
+                "./esm": { "import": "./esm/index.mjs", "require": "./cjs/index.cjs" },
+                "./cjs": { "import": "./esm/missing.mjs", "require": "./cjs/index.cjs" },
+                "./gone": { "types": "./missing.d.ts", "default": "./dist/index.js" },
+                "./*": "./dist/*.js"
+            } }"#,
+            &[
+                "dist/index.d.ts",
+                "legacy/index.d.ts",
+                "esm/index.d.mts",
+                "cjs/index.d.cts",
+                "dist/a.d.ts",
+            ],
+        );
+        for (specifier, expected) in [
+            ("lib", "dist/index.d.ts"),
+            ("lib/esm", "esm/index.d.mts"),
+            ("lib/cjs", "cjs/index.d.cts"),
+            ("lib/gone", "dist/index.d.ts"),
+            ("lib/a", "dist/a.d.ts"),
+        ] {
+            assert_eq!(
+                resolved(&substituted, specifier).as_deref(),
+                Some(expected),
+                "{specifier}"
+            );
+        }
+
+        let main = package(
+            "main",
+            r#"{ "main": "./lib/index.js" }"#,
+            &["lib/index.d.ts", "lib/sub.d.ts"],
+        );
+        assert_eq!(resolved(&main, "lib").as_deref(), Some("lib/index.d.ts"));
+        assert_eq!(
+            resolved(&main, "lib/lib/sub.js").as_deref(),
+            Some("lib/sub.d.ts")
+        );
+
+        let dir = main.parent().unwrap();
+        for (rel, specifier) in [("dto.ts", "./dto.js"), ("esm.d.mts", "./esm.mjs")] {
+            std::fs::write(dir.join(rel), "").unwrap();
+            let found = resolve_module_path(&main, specifier).expect(specifier);
+            assert!(found.ends_with(rel), "{specifier}: {found:?}");
+        }
     }
 
     #[test]
