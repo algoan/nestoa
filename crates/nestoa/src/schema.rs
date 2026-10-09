@@ -6,7 +6,8 @@ use serde_json::{Map, Value, json};
 use swc_common::Spanned;
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
-    TsTypeLit, TsTypeParamInstantiation, TsTypeRef, TsUnionOrIntersectionType,
+    TsTypeLit, TsTypeOperatorOp, TsTypeParamInstantiation, TsTypeQueryExpr, TsTypeRef,
+    TsUnionOrIntersectionType,
 };
 
 use crate::jsdoc::{JsDoc, jsdoc_before};
@@ -221,7 +222,13 @@ impl<'a> SchemaCtx<'a> {
                 }
                 TsLit::Number(n) => json!({ "type": "number", "enum": [n.value] }),
                 TsLit::Bool(b) => json!({ "type": "boolean", "enum": [b.value] }),
-                _ => json!({}),
+                // A template literal type is a string whose pattern is not kept.
+                TsLit::Tpl(_) => {
+                    let mut schema = self.unsupported(file, ty, "template literal");
+                    schema["type"] = json!("string");
+                    schema
+                }
+                TsLit::BigInt(_) => self.unsupported(file, ty, "bigint literal"),
             },
             TsType::TsArrayType(TsArrayType { elem_type, .. }) => json!({
                 "type": "array",
@@ -235,13 +242,83 @@ impl<'a> SchemaCtx<'a> {
                     .collect();
                 json!({ "type": "array", "prefixItems": items, "items": false })
             }
+            // `[a, b?]`: positions are never required, so `b?` is just `b`.
+            TsType::TsOptionalType(o) => self.ts_type_to_schema(file, &o.type_ann),
             TsType::TsUnionOrIntersectionType(uoi) => self.uoi_schema(file, uoi),
             TsType::TsTypeRef(r) => self.type_ref_schema(file, r),
             TsType::TsTypeLit(lit) => self.type_lit_schema(file, lit),
             TsType::TsParenthesizedType(p) => self.ts_type_to_schema(file, &p.type_ann),
-            TsType::TsTypeOperator(_) => json!({}),
-            _ => json!({}),
+            TsType::TsTypeOperator(op) if op.op == TsTypeOperatorOp::ReadOnly => {
+                self.ts_type_to_schema(file, &op.type_ann)
+            }
+            TsType::TsTypeOperator(op) if op.op == TsTypeOperatorOp::KeyOf => self
+                .keyof_schema(file, &op.type_ann)
+                .unwrap_or_else(|| self.unsupported(file, ty, "keyof")),
+            TsType::TsTypeOperator(_) => self.unsupported(file, ty, "unique"),
+            TsType::TsIndexedAccessType(ia) => self
+                .indexed_access_schema(file, &ia.obj_type, &ia.index_type)
+                .unwrap_or_else(|| self.unsupported(file, ty, "indexed access")),
+            TsType::TsMappedType(_) => self.unsupported(file, ty, "mapped type"),
+            TsType::TsConditionalType(_) => self.unsupported(file, ty, "conditional type"),
+            TsType::TsInferType(_) => self.unsupported(file, ty, "infer"),
+            TsType::TsTypeQuery(_) => self.unsupported(file, ty, "typeof"),
+            TsType::TsImportType(_) => self.unsupported(file, ty, "import type"),
+            TsType::TsRestType(_) => self.unsupported(file, ty, "rest element"),
+            TsType::TsThisType(_) => self.unsupported(file, ty, "this"),
+            TsType::TsFnOrConstructorType(_) => self.unsupported(file, ty, "function"),
+            TsType::TsTypePredicate(_) => self.unsupported(file, ty, "type predicate"),
         }
+    }
+
+    /// `keyof typeof SomeEnum`: the enum's member names. Any other `keyof` is
+    /// `None`: an object's `properties` leave out its index signatures, so its
+    /// key set cannot be read off its schema.
+    fn keyof_schema(&self, file: &Path, operand: &TsType) -> Option<Value> {
+        let TsType::TsTypeQuery(q) = operand else {
+            return None;
+        };
+        let TsTypeQueryExpr::TsEntityName(TsEntityName::Ident(id)) = &q.expr_name else {
+            return None;
+        };
+        let (_, Symbol::Enum(e)) = self.project.resolve(file, id.sym.as_ref())? else {
+            return None;
+        };
+        let names: Vec<String> = enum_member_values(&e).into_iter().map(|(n, _)| n).collect();
+        Some(if names.is_empty() {
+            json!({ "not": {} })
+        } else {
+            json!({ "type": "string", "enum": names })
+        })
+    }
+
+    /// `X['k']`: the schema of property `k` of an object-shaped `X`.
+    fn indexed_access_schema(
+        &mut self,
+        file: &Path,
+        obj: &TsType,
+        index: &TsType,
+    ) -> Option<Value> {
+        let [key] = self.string_union_keys(file, index, 0)?.try_into().ok()?;
+        let schema = self.ts_type_to_schema(file, obj);
+        let mut obj = flatten_object(&self.components.schemas, &schema, 0)?;
+        obj.get_mut("properties")?.as_object_mut()?.remove(&key)
+    }
+
+    /// A type form nestoa does not lower, marked with its source text (or
+    /// `kind` when the source is not at hand) so the gap stays visible.
+    fn unsupported(&self, file: &Path, ty: &TsType, kind: &str) -> Value {
+        let span = ty.span();
+        let text = self
+            .sources
+            .get(file)
+            .zip(self.file_starts.get(file))
+            .and_then(|(src, start)| {
+                let lo = span.lo.0.checked_sub(start.0)? as usize;
+                let hi = span.hi.0.checked_sub(start.0)? as usize;
+                src.get(lo..hi)
+            })
+            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
+        json!({ "x-unresolved": text.unwrap_or_else(|| kind.to_string()) })
     }
 
     fn uoi_schema(&mut self, file: &Path, uoi: &TsUnionOrIntersectionType) -> Value {
@@ -1939,6 +2016,78 @@ mod tests {
             unknown["allOf"][0],
             json!({ "x-unresolved": "Missing.Base" })
         );
+    }
+
+    #[test]
+    fn type_operators_and_indexed_access_are_lowered() {
+        let [shapes] = lower_all(
+            "export enum Level { Low = 'low', High = 'high' }\n\
+             export class Base { id: string; count?: number; }",
+            "import { Base, Level } from './dto';\n\
+             export class Shapes {\n\
+               list: readonly string[];\n\
+               level: keyof typeof Level;\n\
+               id: Base['id'];\n\
+               pair: [string, number?];\n\
+             }",
+            &["Shapes"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &shapes["properties"];
+        assert_eq!(
+            p["list"],
+            json!({ "type": "array", "items": { "type": "string" } })
+        );
+        assert_eq!(
+            p["level"],
+            json!({ "type": "string", "enum": ["Low", "High"] })
+        );
+        assert_eq!(p["id"], json!({ "type": "string" }));
+        assert_eq!(p["pair"]["prefixItems"][1], json!({ "type": "number" }));
+    }
+
+    #[test]
+    fn unsupported_type_forms_stay_visible() {
+        let main = "const config = { a: 1 };\n\
+             export class Dict { [k: string]: number; }\n\
+             export class Gaps {\n\
+               mapped: { [K in 'a']: K };\n\
+               cond: string extends number ? 1 : 2;\n\
+               query: typeof config;\n\
+               keys: keyof typeof config;\n\
+               dict: keyof Dict;\n\
+               missing: Dict['nope'];\n\
+               tpl: `v${number}`;\n\
+             }";
+        let (project, dir, sources, file_starts) = project_with_sources(&[("main.ts", main)]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let file = dir.join("main.ts");
+        let (decl_file, sym) = project.resolve(&file, "Gaps").unwrap();
+        let p = ctx.symbol_to_schema(&decl_file, &sym)["properties"].clone();
+        let unresolved = |k: &str| p[k]["x-unresolved"].clone();
+        assert_eq!(unresolved("mapped"), json!("{ [K in 'a']: K }"));
+        assert_eq!(unresolved("cond"), json!("string extends number ? 1 : 2"));
+        assert_eq!(unresolved("query"), json!("typeof config"));
+        assert_eq!(unresolved("keys"), json!("keyof typeof config"));
+        assert_eq!(unresolved("missing"), json!("Dict['nope']"));
+        assert_eq!(
+            p["tpl"],
+            json!({ "type": "string", "x-unresolved": "`v${number}`" })
+        );
+        // An index signature is not a property, so the class's keys are unknown
+        // even though its `properties` is empty.
+        assert_eq!(unresolved("dict"), json!("keyof Dict"));
     }
 
     #[test]
