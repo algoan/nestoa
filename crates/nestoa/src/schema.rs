@@ -6,7 +6,8 @@ use serde_json::{Map, Value, json};
 use swc_common::Spanned;
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
-    TsTypeLit, TsTypeParamInstantiation, TsTypeRef, TsUnionOrIntersectionType,
+    TsTypeLit, TsTypeOperatorOp, TsTypeParamInstantiation, TsTypeQueryExpr, TsTypeRef,
+    TsUnionOrIntersectionType,
 };
 
 use crate::jsdoc::{JsDoc, jsdoc_before};
@@ -214,6 +215,9 @@ pub struct SchemaCtx<'a> {
 impl<'a> SchemaCtx<'a> {
     pub fn ts_type_to_schema(&mut self, file: &Path, ty: &TsType) -> Value {
         match ty {
+            TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsSymbolKeyword => {
+                self.unsupported(file, ty, "symbol")
+            }
             TsType::TsKeywordType(k) => keyword_schema(k.kind),
             TsType::TsLitType(l) => match &l.lit {
                 TsLit::Str(s) => {
@@ -221,7 +225,13 @@ impl<'a> SchemaCtx<'a> {
                 }
                 TsLit::Number(n) => json!({ "type": "number", "enum": [n.value] }),
                 TsLit::Bool(b) => json!({ "type": "boolean", "enum": [b.value] }),
-                _ => json!({}),
+                // A template literal type is a string whose pattern is not kept.
+                TsLit::Tpl(_) => {
+                    let mut schema = self.unsupported(file, ty, "template literal");
+                    schema["type"] = json!("string");
+                    schema
+                }
+                TsLit::BigInt(_) => self.unsupported(file, ty, "bigint literal"),
             },
             TsType::TsArrayType(TsArrayType { elem_type, .. }) => json!({
                 "type": "array",
@@ -235,13 +245,83 @@ impl<'a> SchemaCtx<'a> {
                     .collect();
                 json!({ "type": "array", "prefixItems": items, "items": false })
             }
+            // `[a, b?]`: positions are never required, so `b?` is just `b`.
+            TsType::TsOptionalType(o) => self.ts_type_to_schema(file, &o.type_ann),
             TsType::TsUnionOrIntersectionType(uoi) => self.uoi_schema(file, uoi),
             TsType::TsTypeRef(r) => self.type_ref_schema(file, r),
             TsType::TsTypeLit(lit) => self.type_lit_schema(file, lit),
             TsType::TsParenthesizedType(p) => self.ts_type_to_schema(file, &p.type_ann),
-            TsType::TsTypeOperator(_) => json!({}),
-            _ => json!({}),
+            TsType::TsTypeOperator(op) if op.op == TsTypeOperatorOp::ReadOnly => {
+                self.ts_type_to_schema(file, &op.type_ann)
+            }
+            TsType::TsTypeOperator(op) if op.op == TsTypeOperatorOp::KeyOf => self
+                .keyof_schema(file, &op.type_ann)
+                .unwrap_or_else(|| self.unsupported(file, ty, "keyof")),
+            TsType::TsTypeOperator(_) => self.unsupported(file, ty, "unique"),
+            TsType::TsIndexedAccessType(ia) => self
+                .indexed_access_schema(file, &ia.obj_type, &ia.index_type)
+                .unwrap_or_else(|| self.unsupported(file, ty, "indexed access")),
+            TsType::TsMappedType(_) => self.unsupported(file, ty, "mapped type"),
+            TsType::TsConditionalType(_) => self.unsupported(file, ty, "conditional type"),
+            TsType::TsInferType(_) => self.unsupported(file, ty, "infer"),
+            TsType::TsTypeQuery(_) => self.unsupported(file, ty, "typeof"),
+            TsType::TsImportType(_) => self.unsupported(file, ty, "import type"),
+            TsType::TsRestType(_) => self.unsupported(file, ty, "rest element"),
+            TsType::TsThisType(_) => self.unsupported(file, ty, "this"),
+            TsType::TsFnOrConstructorType(_) => self.unsupported(file, ty, "function"),
+            TsType::TsTypePredicate(_) => self.unsupported(file, ty, "type predicate"),
         }
+    }
+
+    /// `keyof typeof SomeEnum`: the enum's member names. Any other `keyof` is
+    /// `None`: an object's `properties` leave out its index signatures, so its
+    /// key set cannot be read off its schema.
+    fn keyof_schema(&self, file: &Path, operand: &TsType) -> Option<Value> {
+        let TsType::TsTypeQuery(q) = operand else {
+            return None;
+        };
+        let TsTypeQueryExpr::TsEntityName(TsEntityName::Ident(id)) = &q.expr_name else {
+            return None;
+        };
+        let (_, Symbol::Enum(e)) = self.project.resolve(file, id.sym.as_ref())? else {
+            return None;
+        };
+        let names: Vec<String> = enum_member_values(&e).into_iter().map(|(n, _)| n).collect();
+        Some(if names.is_empty() {
+            json!({ "not": {} })
+        } else {
+            json!({ "type": "string", "enum": names })
+        })
+    }
+
+    /// `X['k']`: the schema of property `k` of an object-shaped `X`.
+    fn indexed_access_schema(
+        &mut self,
+        file: &Path,
+        obj: &TsType,
+        index: &TsType,
+    ) -> Option<Value> {
+        let [key] = self.string_union_keys(file, index, 0)?.try_into().ok()?;
+        let schema = self.ts_type_to_schema(file, obj);
+        let mut obj = flatten_object(&self.components.schemas, &schema, 0)?;
+        obj.get_mut("properties")?.as_object_mut()?.remove(&key)
+    }
+
+    /// A type form nestoa does not lower, marked with its source text (or
+    /// `kind` when the source is not at hand) so the gap stays visible.
+    fn unsupported(&self, file: &Path, ty: &TsType, kind: &str) -> Value {
+        let span = ty.span();
+        let text = self
+            .sources
+            .get(file)
+            .zip(self.file_starts.get(file))
+            .and_then(|(src, start)| {
+                let lo = span.lo.0.checked_sub(start.0)? as usize;
+                let hi = span.hi.0.checked_sub(start.0)? as usize;
+                src.get(lo..hi)
+            })
+            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
+        json!({ "x-unresolved": text.unwrap_or_else(|| kind.to_string()) })
     }
 
     fn uoi_schema(&mut self, file: &Path, uoi: &TsUnionOrIntersectionType) -> Value {
@@ -270,7 +350,11 @@ impl<'a> SchemaCtx<'a> {
                     })
                     .collect();
                 let schema = if non_null.is_empty() {
-                    json!({})
+                    return if nullable {
+                        json!({ "type": "null" })
+                    } else {
+                        json!({})
+                    };
                 } else if non_null.len() == 1 {
                     non_null.into_iter().next().unwrap()
                 } else if non_null
@@ -427,6 +511,21 @@ impl<'a> SchemaCtx<'a> {
                         ObjectEdit::Pick(keys)
                     };
                     return self.reshape_object(base, &edit);
+                }
+            }
+            "Exclude" | "Extract" => {
+                if let Some(args) = &r.type_params
+                    && let [from, filter] = args.params.as_slice()
+                {
+                    let from = self.ts_type_to_schema(file, from);
+                    let filter = self.ts_type_to_schema(file, filter);
+                    return filter_union(
+                        &self.components.schemas,
+                        from,
+                        &filter,
+                        name == "Extract",
+                    )
+                    .unwrap_or_else(|| json!({ "x-unresolved": format!("{name}<…>") }));
                 }
             }
             "Record" => {
@@ -848,16 +947,12 @@ impl<'a> SchemaCtx<'a> {
                 let mut required: Vec<String> = Vec::new();
                 let mut all_of: Vec<Value> = Vec::new();
                 for parent in &i.extends {
-                    if let Expr::Ident(id) = &*parent.expr {
-                        let name = id.sym.to_string();
-                        let dummy_ref = TsTypeRef {
-                            span: parent.span,
-                            type_name: TsEntityName::Ident(id.clone()),
-                            type_params: parent.type_args.clone(),
-                        };
-                        all_of.push(self.type_ref_schema(file, &dummy_ref));
-                        let _ = name;
-                    }
+                    all_of.push(
+                        self.heritage_schema(file, &parent.expr, parent.type_args.as_deref())
+                            .unwrap_or_else(
+                                || json!({ "x-unresolved": heritage_label(&parent.expr) }),
+                            ),
+                    );
                 }
                 for el in &i.body.body {
                     if let TsTypeElement::TsPropertySignature(p) = el {
@@ -1107,6 +1202,175 @@ fn keyword_schema(k: TsKeywordTypeKind) -> Value {
         TsVoidKeyword | TsUndefinedKeyword | TsNeverKeyword => Value::Null,
         TsSymbolKeyword | TsIntrinsicKeyword => json!({}),
     }
+}
+
+/// One member of a lowered union, as `Exclude`/`Extract` compare them.
+#[derive(Clone, PartialEq)]
+enum Member {
+    /// A literal value and its JSON type.
+    Lit(&'static str, Value),
+    /// A whole primitive type (`string`).
+    Prim(String),
+    Null,
+    /// An unconstrained schema: `any`, `unknown` or `object`, which the
+    /// schema cannot tell apart.
+    Any,
+    /// Anything else, compared by its schema.
+    Other(Value),
+}
+
+/// Split a lowered schema into its union members, reading enum components
+/// through their `$ref` and nested unions through their branches.
+fn union_members(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    out: &mut Vec<Member>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 16;
+    // `void`/`undefined`/`never` lower to a JSON null and add no member.
+    let Value::Object(map) = schema else {
+        return;
+    };
+    if map.is_empty() {
+        out.push(Member::Any);
+        return;
+    }
+    if let Some(target) = map
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .and_then(|name| schemas.get(name))
+        && depth < MAX_DEPTH
+    {
+        let mut inner = Vec::new();
+        union_members(schemas, target, &mut inner, depth + 1);
+        match inner.as_slice() {
+            [Member::Other(_)] => out.push(Member::Other(schema.clone())),
+            _ => out.extend(inner),
+        }
+        return;
+    }
+    if let Some(Value::Array(branches)) = map.get("oneOf").or_else(|| map.get("anyOf")) {
+        for branch in branches {
+            union_members(schemas, branch, out, depth + 1);
+        }
+        return;
+    }
+    if let Some(Value::Array(values)) = map.get("enum") {
+        out.extend(values.iter().map(|v| match v {
+            Value::Null => Member::Null,
+            Value::String(_) => Member::Lit("string", v.clone()),
+            Value::Bool(_) => Member::Lit("boolean", v.clone()),
+            _ => Member::Lit("number", v.clone()),
+        }));
+        return;
+    }
+    let types: Option<Vec<&str>> = match map.get("type") {
+        Some(Value::String(t)) if map.len() == 1 => Some(vec![t]),
+        Some(Value::Array(ts)) if map.len() == 1 => ts.iter().map(Value::as_str).collect(),
+        _ => None,
+    };
+    match types {
+        Some(types) => out.extend(types.into_iter().map(|t| match t {
+            "null" => Member::Null,
+            t => Member::Prim(t.to_string()),
+        })),
+        None => out.push(Member::Other(schema.clone())),
+    }
+}
+
+/// Whether union member `m` is assignable to the union `to`, as TypeScript
+/// decides it for `Exclude`/`Extract`. `None` when the schemas cannot tell,
+/// such as two different object types, or an unresolved one.
+fn assignable(m: &Member, to: &[Member]) -> Option<bool> {
+    let opaque = |m: &Member| matches!(m, Member::Other(s) if s.get("x-unresolved").is_some());
+    if to.contains(&Member::Any) {
+        return None;
+    }
+    if to.contains(m) {
+        return Some(true);
+    }
+    match m {
+        Member::Lit(t, _) if to.contains(&Member::Prim(t.to_string())) => Some(true),
+        Member::Lit(..) | Member::Prim(_) | Member::Null if to.iter().any(opaque) => None,
+        Member::Lit(..) | Member::Prim(_) | Member::Null => Some(false),
+        // An object type is never assignable to a primitive or a literal.
+        Member::Other(_) if opaque(m) && to.iter().any(|t| *t != Member::Null) => None,
+        Member::Other(_) if to.iter().any(|t| matches!(t, Member::Other(_))) => None,
+        Member::Other(_) => Some(false),
+        Member::Any => None,
+    }
+}
+
+/// `Exclude<T, U>` (or `Extract<T, U>` when `keep_assignable`): the members of
+/// `from` that are not (are) assignable to `filter`. A `from` that loses no
+/// member is returned as written, so `Exclude<string, 'a'>` stays `string`.
+/// `None` when a member's assignability cannot be decided. An unconstrained
+/// `T` is kept by `Exclude`, which can only narrow it.
+fn filter_union(
+    schemas: &IndexMap<String, Value>,
+    from: Value,
+    filter: &Value,
+    keep_assignable: bool,
+) -> Option<Value> {
+    let mut to = Vec::new();
+    union_members(schemas, filter, &mut to, 0);
+    let mut members = Vec::new();
+    union_members(schemas, &from, &mut members, 0);
+    if members.contains(&Member::Any) {
+        return (!keep_assignable).then_some(from);
+    }
+    // `boolean` is `true | false`, so a boolean literal can split it.
+    if to.iter().any(|t| matches!(t, Member::Lit("boolean", _))) {
+        members = members
+            .into_iter()
+            .flat_map(|m| match m {
+                Member::Prim(t) if t == "boolean" => vec![
+                    Member::Lit("boolean", json!(true)),
+                    Member::Lit("boolean", json!(false)),
+                ],
+                m => vec![m],
+            })
+            .collect();
+    }
+    let mut kept = Vec::new();
+    for m in &members {
+        if assignable(m, &to)? == keep_assignable {
+            kept.push(m);
+        }
+    }
+    if kept.len() == members.len() {
+        return Some(from);
+    }
+    let mut branches: Vec<Value> = Vec::new();
+    let mut nullable = false;
+    for m in kept {
+        match m {
+            Member::Lit(t, v) => match branches
+                .iter_mut()
+                .find(|b| b.get("type") == Some(&json!(t)) && b.get("enum").is_some())
+            {
+                Some(b) => b["enum"].as_array_mut()?.push(v.clone()),
+                None => branches.push(json!({ "type": t, "enum": [v] })),
+            },
+            Member::Prim(t) => branches.push(json!({ "type": t })),
+            Member::Null => nullable = true,
+            Member::Other(s) => branches.push(s.clone()),
+            Member::Any => {}
+        }
+    }
+    let schema = match branches.len() {
+        0 if nullable => return Some(json!({ "type": "null" })),
+        0 => json!({ "not": {} }),
+        1 => branches.remove(0),
+        _ => json!({ "oneOf": branches }),
+    };
+    Some(if nullable {
+        make_nullable(schema)
+    } else {
+        schema
+    })
 }
 
 /// A property-set edit, as made by `Partial`/`Required`/`Omit`/`Pick` and
@@ -1922,6 +2186,161 @@ mod tests {
         assert!(own.get("properties").and_then(|p| p.get("b")).is_some());
         // The base class is collected into components for the $ref to point at.
         assert!(ctx.components.schemas.contains_key("Base"));
+    }
+
+    #[test]
+    fn interface_extends_a_namespace_member_or_stays_visible() {
+        let [known, unknown] = lower_with(
+            &[("base.ts", "export interface Base { a: string; }")],
+            "import * as Models from './base';\n\
+             export interface Known extends Models.Base { b: number; }\n\
+             export interface Unknown extends Missing.Base { b: number; }",
+            &["Known", "Unknown"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            known["allOf"][0],
+            json!({ "$ref": "#/components/schemas/Base" })
+        );
+        assert_eq!(
+            unknown["allOf"][0],
+            json!({ "x-unresolved": "Missing.Base" })
+        );
+    }
+
+    #[test]
+    fn type_operators_and_indexed_access_are_lowered() {
+        let [shapes] = lower_all(
+            "export enum Level { Low = 'low', High = 'high' }\n\
+             export class Base { id: string; count?: number; }",
+            "import { Base, Level } from './dto';\n\
+             export class Shapes {\n\
+               list: readonly string[];\n\
+               level: keyof typeof Level;\n\
+               id: Base['id'];\n\
+               pair: [string, number?];\n\
+             }",
+            &["Shapes"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &shapes["properties"];
+        assert_eq!(
+            p["list"],
+            json!({ "type": "array", "items": { "type": "string" } })
+        );
+        assert_eq!(
+            p["level"],
+            json!({ "type": "string", "enum": ["Low", "High"] })
+        );
+        assert_eq!(p["id"], json!({ "type": "string" }));
+        assert_eq!(p["pair"]["prefixItems"][1], json!({ "type": "number" }));
+    }
+
+    #[test]
+    fn unsupported_type_forms_stay_visible() {
+        let main = "const config = { a: 1 };\n\
+             export class Dict { [k: string]: number; }\n\
+             export class Gaps {\n\
+               mapped: { [K in 'a']: K };\n\
+               cond: string extends number ? 1 : 2;\n\
+               query: typeof config;\n\
+               keys: keyof typeof config;\n\
+               dict: keyof Dict;\n\
+               missing: Dict['nope'];\n\
+               tpl: `v${number}`;\n\
+             }";
+        let (project, dir, sources, file_starts) = project_with_sources(&[("main.ts", main)]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let file = dir.join("main.ts");
+        let (decl_file, sym) = project.resolve(&file, "Gaps").unwrap();
+        let p = ctx.symbol_to_schema(&decl_file, &sym)["properties"].clone();
+        let unresolved = |k: &str| p[k]["x-unresolved"].clone();
+        assert_eq!(unresolved("mapped"), json!("{ [K in 'a']: K }"));
+        assert_eq!(unresolved("cond"), json!("string extends number ? 1 : 2"));
+        assert_eq!(unresolved("query"), json!("typeof config"));
+        assert_eq!(unresolved("keys"), json!("keyof typeof config"));
+        assert_eq!(unresolved("missing"), json!("Dict['nope']"));
+        assert_eq!(
+            p["tpl"],
+            json!({ "type": "string", "x-unresolved": "`v${number}`" })
+        );
+        // An index signature is not a property, so the class's keys are unknown
+        // even though its `properties` is empty.
+        assert_eq!(unresolved("dict"), json!("keyof Dict"));
+    }
+
+    #[test]
+    fn exclude_and_extract_filter_union_members() {
+        let schemas = lower_all(
+            "export enum Status { Ok = 'ok', Invalid = 'invalid', Failed = 'failed' }\n\
+             export type Failure = Status.Invalid | Status.Failed;\n\
+             export class Item { id: string; }\n\
+             export class Other { name: string; }",
+            "import { Status, Failure, Item, Other } from './dto';\n\
+             export type Letters = Exclude<'a' | 'b' | 'c', 'b'>;\n\
+             export type Ok = Exclude<Status, Failure>;\n\
+             export type Name = Exclude<string, 'a' | 'b'>;\n\
+             export type Failures = Extract<Status, Failure | 'other'>;\n\
+             export type Strings = Extract<'a' | 1 | true, string>;\n\
+             export type Never = Extract<string, 'a'>;\n\
+             export type Present = Exclude<Item | null | undefined, null | undefined>;\n\
+             export type Flag = Exclude<boolean | null, false>;\n\
+             export type Mixed = Exclude<Item | 'none', string>;\n\
+             export type Unknown = Exclude<Item | Other, Item>;\n\
+             export type NotObject = Exclude<string | Item, object>;\n\
+             export type Symbols = Extract<string | symbol, symbol>;\n\
+             export type FromAny = Exclude<any, string>;",
+            &[
+                "Letters",
+                "Ok",
+                "Name",
+                "Failures",
+                "Strings",
+                "Never",
+                "Present",
+                "Flag",
+                "Mixed",
+                "Unknown",
+                "NotObject",
+                "Symbols",
+                "FromAny",
+            ],
+        );
+        let item = json!({ "$ref": "#/components/schemas/Item" });
+        let expected = [
+            json!({ "type": "string", "enum": ["a", "c"] }),
+            json!({ "type": "string", "enum": ["ok"] }),
+            json!({ "type": "string" }),
+            json!({ "type": "string", "enum": ["invalid", "failed"] }),
+            json!({ "type": "string", "enum": ["a"] }),
+            json!({ "not": {} }),
+            item.clone(),
+            json!({ "type": ["boolean", "null"], "enum": [true, null] }),
+            item,
+            // `Item` and `Other` are both objects: the schemas cannot tell
+            // whether one is assignable to the other.
+            json!({ "x-unresolved": "Exclude<…>" }),
+            // `object`, like `any`, lowers to `{}`: it filters nothing decidably.
+            json!({ "x-unresolved": "Exclude<…>" }),
+            json!({ "x-unresolved": "Extract<…>" }),
+            json!({}),
+        ];
+        assert_eq!(schemas.len(), expected.len());
+        for (got, want) in schemas.iter().zip(expected) {
+            assert_eq!(*got, want);
+        }
     }
 
     #[test]
