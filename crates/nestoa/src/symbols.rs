@@ -8,6 +8,7 @@ use swc_ecma_ast::{
 };
 
 use crate::parse::ParsedFile;
+use crate::tsconfig::best_match;
 
 /// One exported (or top-level) named declaration in a file. Indexed by name
 /// within the file.
@@ -609,6 +610,9 @@ pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
 fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) if s.ends_with(".d.ts") => Some(s.clone()),
+        serde_json::Value::Array(alternatives) => {
+            alternatives.iter().find_map(dts_from_exports_value)
+        }
         serde_json::Value::Object(map) => {
             for key in ["types", "typings"] {
                 if let Some(found) = map.get(key).and_then(dts_from_exports_value) {
@@ -622,47 +626,65 @@ fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Resolve a package subpath to its declaration entry via the `exports` map,
-/// honouring exact keys and a trailing `/*` wildcard.
+/// Resolve a package subpath to its declaration entry via the `exports` map:
+/// the best-matching key (exact, then the longest `*` pattern prefix, as Node
+/// picks it), its `*` substituted into the target.
 fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String> {
     let exports = json.get("exports")?;
     let key = if subpath.is_empty() {
         ".".to_string()
     } else {
-        format!("./{}", subpath)
+        format!("./{subpath}")
     };
-    if let Some(v) = exports.get(&key)
-        && let Some(found) = dts_from_exports_value(v)
-    {
-        return Some(found);
+    // A string, array or conditions object is shorthand for `{ ".": … }`.
+    let serde_json::Value::Object(map) = exports else {
+        return (key == ".")
+            .then(|| dts_from_exports_value(exports))
+            .flatten();
+    };
+    if !map.keys().any(|k| k.starts_with('.')) {
+        return (key == ".")
+            .then(|| dts_from_exports_value(exports))
+            .flatten();
     }
-    // Wildcard match: `./foo/*` with a `*` in the target path.
-    if let serde_json::Value::Object(map) = exports {
-        for (k, v) in map {
-            if let Some(prefix) = k.strip_suffix("/*") {
-                let prefix = prefix.trim_start_matches("./");
-                if let Some(rest) = subpath
-                    .strip_prefix(prefix)
-                    .and_then(|r| r.strip_prefix('/'))
-                    && let Some(tmpl) = dts_from_exports_value(v)
-                {
-                    return Some(tmpl.replace('*', rest));
-                }
-            }
-        }
-    }
-    None
+    let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key)?;
+    Some(dts_from_exports_value(value)?.replace('*', &captured))
 }
 
-/// Resolve a subpath via the legacy `typesVersions` map.
-fn types_from_versions(json: &serde_json::Value, subpath: &str) -> Option<String> {
-    let star = json.get("typesVersions")?.get("*")?;
-    if let Some(arr) = star.get(subpath).and_then(|v| v.as_array())
-        && let Some(first) = arr.first().and_then(|v| v.as_str())
-    {
-        return Some(first.to_string());
-    }
-    None
+/// Resolve a subpath via the legacy `typesVersions` map. TypeScript uses the
+/// first version range it satisfies; nestoa takes the first, the newest by
+/// convention. Each target of the best-matching pattern is tried in order.
+fn types_from_versions(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) -> Option<PathBuf> {
+    let map = json
+        .get("typesVersions")?
+        .as_object()?
+        .values()
+        .next()?
+        .as_object()?;
+    let (targets, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), subpath)?;
+    targets
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.as_str())
+        .find_map(|t| {
+            let target = pkg_dir.join(t.replace('*', &captured).trim_start_matches("./"));
+            declaration_file(&target)
+        })
+}
+
+/// `path` itself when it is a `.ts` file, or with a `.d.ts` / `/index.d.ts`
+/// suffix, whichever exists.
+fn declaration_file(path: &Path) -> Option<PathBuf> {
+    let as_is = path.extension().is_some_and(|e| e == "ts").then_some("");
+    as_is
+        .into_iter()
+        .chain([".d.ts", "/index.d.ts"])
+        .find_map(|ext| {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(ext);
+            let p = PathBuf::from(p);
+            p.is_file().then(|| p.canonicalize().unwrap_or(p))
+        })
 }
 
 /// Locate the TypeScript declaration file for a bare package import (including
@@ -673,8 +695,14 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
     let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
-    let rel = if subpath.is_empty() {
-        types_from_exports(&json, "")
+    let in_package = |rel: String| {
+        let candidate = pkg_dir.join(rel.trim_start_matches("./"));
+        candidate
+            .is_file()
+            .then(|| candidate.canonicalize().unwrap_or(candidate))
+    };
+    if subpath.is_empty() {
+        let rel = types_from_exports(&json, "")
             .or_else(|| {
                 json.get("typings")
                     .and_then(|v| v.as_str())
@@ -685,25 +713,13 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| "index.d.ts".to_string())
-    } else {
-        types_from_exports(&json, &subpath)
-            .or_else(|| types_from_versions(&json, &subpath))
-            .or_else(|| {
-                [
-                    format!("{}.d.ts", subpath),
-                    format!("{}/index.d.ts", subpath),
-                ]
-                .into_iter()
-                .find(|cand| pkg_dir.join(cand).is_file())
-            })?
-    };
-
-    let candidate = pkg_dir.join(rel.trim_start_matches("./"));
-    if candidate.is_file() {
-        return Some(candidate.canonicalize().unwrap_or(candidate));
+            .unwrap_or_else(|| "index.d.ts".to_string());
+        return in_package(rel);
     }
-    None
+    types_from_exports(&json, &subpath)
+        .and_then(in_package)
+        .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
+        .or_else(|| declaration_file(&pkg_dir.join(&subpath)))
 }
 
 #[cfg(test)]
@@ -767,5 +783,85 @@ mod tests {
         assert!(root.ends_with("dist/index.d.ts"), "got {:?}", root);
         let sub = resolve_package_types(&consumer, "@scope/lib/sub").expect("subpath import");
         assert!(sub.ends_with("dist/sub/index.d.ts"), "got {:?}", sub);
+    }
+
+    /// Write a package under a fresh temp dir and return a consumer file
+    /// sitting next to its `node_modules`.
+    fn package(name: &str, manifest: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nestoa-pkg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("node_modules/lib");
+        for rel in files {
+            let path = pkg.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "export interface X { a: string; }").unwrap();
+        }
+        std::fs::write(pkg.join("package.json"), manifest).unwrap();
+        let consumer = dir.join("src/file.ts");
+        std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
+        std::fs::write(&consumer, "").unwrap();
+        consumer
+    }
+
+    fn resolved(consumer: &Path, specifier: &str) -> Option<String> {
+        let path = resolve_package_types(consumer, specifier)?;
+        let pkg = consumer
+            .parent()?
+            .parent()?
+            .join("node_modules/lib")
+            .canonicalize()
+            .ok()?;
+        Some(path.strip_prefix(pkg).ok()?.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn exports_patterns_match_like_node() {
+        let consumer = package(
+            "exports",
+            r#"{ "exports": {
+                "./*": { "types": "./dist/*.d.ts" },
+                "./deep/*": { "types": "./types/deep/*.d.ts" },
+                "./hidden/*": null
+            } }"#,
+            &["dist/a.d.ts", "types/deep/b.d.ts", "hidden/c.d.ts"],
+        );
+        assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));
+        assert_eq!(
+            resolved(&consumer, "lib/deep/b").as_deref(),
+            Some("types/deep/b.d.ts")
+        );
+        // `null` excludes the subpath from `exports`; the plain layout still applies.
+        assert_eq!(
+            resolved(&consumer, "lib/hidden/c").as_deref(),
+            Some("hidden/c.d.ts")
+        );
+
+        let sugar = package(
+            "sugar",
+            r#"{ "exports": { "types": "./main.d.ts" } }"#,
+            &["main.d.ts"],
+        );
+        assert_eq!(resolved(&sugar, "lib").as_deref(), Some("main.d.ts"));
+    }
+
+    #[test]
+    fn types_versions_patterns_and_fallback_targets() {
+        let consumer = package(
+            "versions",
+            r#"{ "typesVersions": { ">=4.2": {
+                "sub/*": ["missing/*", "types/sub/*"],
+                "*": ["dist/*"]
+            } } }"#,
+            &["dist/a.d.ts", "dist/dir/index.d.ts", "types/sub/b.d.ts"],
+        );
+        assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));
+        assert_eq!(
+            resolved(&consumer, "lib/dir").as_deref(),
+            Some("dist/dir/index.d.ts")
+        );
+        assert_eq!(
+            resolved(&consumer, "lib/sub/b").as_deref(),
+            Some("types/sub/b.d.ts")
+        );
     }
 }
