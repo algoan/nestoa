@@ -684,15 +684,19 @@ fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String>
     Some(dts_from_exports_value(value)?.replace('*', &captured))
 }
 
-/// Resolve a subpath via the legacy `typesVersions` map. TypeScript uses the
-/// first version range it satisfies; nestoa takes the first, the newest by
-/// convention. Each target of the best-matching pattern is tried in order.
+/// The TypeScript version `typesVersions` ranges are evaluated against.
+const TS_VERSION: [u64; 3] = [5, 9, 0];
+
+/// Resolve a subpath via the legacy `typesVersions` map: the first version
+/// range `TS_VERSION` satisfies, as TypeScript picks it, then each target of
+/// its best-matching pattern in order.
 fn types_from_versions(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) -> Option<PathBuf> {
     let map = json
         .get("typesVersions")?
         .as_object()?
-        .values()
-        .next()?
+        .iter()
+        .find(|(range, _)| satisfies_ts(range))?
+        .1
         .as_object()?;
     let (targets, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), subpath, false)?;
     targets
@@ -703,6 +707,50 @@ fn types_from_versions(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) 
             let target = pkg_dir.join(t.replace('*', &captured).trim_start_matches("./"));
             declaration_file(&target)
         })
+}
+
+/// Whether `TS_VERSION` satisfies a semver range: `||` alternatives of
+/// space-separated comparators (`>=4.2 <5`, `*`, `~4.1`, `^4.1`, `4.2.x`). An
+/// unparsable comparator never holds.
+fn satisfies_ts(range: &str) -> bool {
+    range.split("||").any(|alt| {
+        let alt = alt.trim();
+        alt.is_empty() || alt.split_whitespace().all(comparator_holds)
+    })
+}
+
+fn comparator_holds(comparator: &str) -> bool {
+    let (op, version) = ["<=", ">=", "<", ">", "=", "~", "^"]
+        .into_iter()
+        .find_map(|op| comparator.strip_prefix(op).map(|v| (op, v)))
+        .unwrap_or(("", comparator));
+    let mut parts: Vec<u64> = Vec::new();
+    for part in version.trim_start_matches('v').split('.') {
+        match part {
+            "x" | "X" | "*" => break,
+            _ => match part.parse() {
+                Ok(n) => parts.push(n),
+                Err(_) => return false,
+            },
+        }
+    }
+    let given = parts.len().min(3);
+    let mut bound = [0u64; 3];
+    bound[..given].copy_from_slice(&parts[..given]);
+    let ts = TS_VERSION;
+    let same_prefix = |n: usize| ts[..n] == bound[..n];
+    match op {
+        "<" => ts < bound,
+        "<=" => ts <= bound,
+        ">" => ts > bound,
+        ">=" => ts >= bound,
+        // `~1.2` allows patch updates, `~1` minor ones.
+        "~" => ts >= bound && same_prefix(given.clamp(1, 2)),
+        // `^1.2` allows anything below the next major (or minor, for `^0.x`).
+        "^" => ts >= bound && same_prefix(if bound[0] == 0 { 2 } else { 1 }),
+        // A bare or `=` version matches every version it is a prefix of.
+        _ => same_prefix(given),
+    }
 }
 
 /// `path` itself when it is a `.ts` file, or with a `.d.ts` / `/index.d.ts`
@@ -889,17 +937,44 @@ mod tests {
     }
 
     #[test]
+    fn types_versions_ranges() {
+        for (range, holds) in [
+            ("*", true),
+            (">=4.2", true),
+            ("<4.0", false),
+            (">=3.1 <4.0 || >=5", true),
+            ("~5.9", true),
+            ("~5.8", false),
+            ("^5.1", true),
+            ("^4.9", false),
+            ("5.x", true),
+            ("5.9", true),
+            ("4", false),
+            ("latest", false),
+        ] {
+            assert_eq!(satisfies_ts(range), holds, "{range}");
+        }
+    }
+
+    #[test]
     fn types_versions_patterns_and_fallback_targets() {
         let consumer = package(
             "versions",
             r#"{ "typesVersions": {
+                "<4.0": { "*": ["legacy/*"] },
                 ">=4.2": {
                     "sub/*": ["missing/*", "types/sub/*"],
                     "*": ["dist/*"]
                 }
             } }"#,
-            &["dist/a.d.ts", "dist/dir/index.d.ts", "types/sub/b.d.ts"],
+            &[
+                "dist/a.d.ts",
+                "dist/dir/index.d.ts",
+                "types/sub/b.d.ts",
+                "legacy/a.d.ts",
+            ],
         );
+        // `<4.0` comes first but is for an older TypeScript.
         assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));
         assert_eq!(
             resolved(&consumer, "lib/dir").as_deref(),
