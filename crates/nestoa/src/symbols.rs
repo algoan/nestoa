@@ -119,16 +119,18 @@ impl Project {
         }
         if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
             let target = self.resolve_module(file, &binding.specifier)?;
-            match &binding.imported {
+            return match &binding.imported {
                 // `import * as Ns from "spec"` — the target module is the namespace.
                 None if binding.is_namespace => Some(target),
                 None => None, // default import — not a namespace
                 // `import { Ns } from "spec"` — find namespace `Ns` in the target.
                 Some(imported) => self.resolve_namespace_module(&target, imported, visited),
-            }
-        } else {
-            None
+            };
         }
+        fs.star_re_exports.iter().find_map(|spec| {
+            let target = self.resolve_module(file, spec)?;
+            self.resolve_namespace_module(&target, ns, visited)
+        })
     }
 
     /// The package a value binding ultimately comes from, and its exported
@@ -172,15 +174,26 @@ impl Project {
         if let Some(spec) = fs.namespace_re_exports.get(ns) {
             return Some((file.to_path_buf(), spec.clone()));
         }
-        let binding = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns))?;
-        if binding.is_namespace {
-            return Some((file.to_path_buf(), binding.specifier.clone()));
+        if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
+            if binding.is_namespace {
+                return Some((file.to_path_buf(), binding.specifier.clone()));
+            }
+            let target = self.in_repo_module(file, &binding.specifier)?;
+            let exported = binding.imported.as_deref().unwrap_or(ns);
+            return self.namespace_specifier(&target, exported, seen);
         }
-        let target = resolve_module_path(file, &binding.specifier)
-            .or_else(|| self.resolve_alias(&binding.specifier))
-            .filter(|t| self.symbols.contains_key(t))?;
-        let exported = binding.imported.as_deref().unwrap_or(ns);
-        self.namespace_specifier(&target, exported, seen)
+        fs.star_re_exports.iter().find_map(|spec| {
+            let target = self.in_repo_module(file, spec)?;
+            self.namespace_specifier(&target, ns, seen)
+        })
+    }
+
+    /// The parsed in-repo module (relative or tsconfig-aliased) a specifier
+    /// names. `None` for a package.
+    fn in_repo_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
+        resolve_module_path(file, specifier)
+            .or_else(|| self.resolve_alias(specifier))
+            .filter(|t| self.symbols.contains_key(t))
     }
 
     fn import_origin_inner(
