@@ -739,9 +739,21 @@ fn comparator_holds(comparator: &str) -> bool {
     bound[..given].copy_from_slice(&parts[..given]);
     let ts = TS_VERSION;
     let same_prefix = |n: usize| ts[..n] == bound[..n];
+    // A partial version stands for every version it prefixes, so `>5` means
+    // above all of 5.x: from 6.0.0 on, and `<=5` below 6.0.0.
+    let past_partial = || {
+        let mut next = bound;
+        if given > 0 {
+            next[given - 1] += 1;
+        }
+        next
+    };
     match op {
+        _ if given == 0 => matches!(op, "" | "=" | ">=" | "<=" | "~" | "^"),
         "<" => ts < bound,
+        "<=" if given < 3 => ts < past_partial(),
         "<=" => ts <= bound,
+        ">" if given < 3 => ts >= past_partial(),
         ">" => ts > bound,
         ">=" => ts >= bound,
         // `~1.2` allows patch updates, `~1` minor ones.
@@ -950,6 +962,13 @@ mod tests {
             ("5.x", true),
             ("5.9", true),
             ("4", false),
+            (">5", false),
+            (">5.8", true),
+            (">5.9", false),
+            ("<=5", true),
+            ("<=5.8", false),
+            (">5.9.0", false),
+            ("<=5.9.0", true),
             ("latest", false),
         ] {
             assert_eq!(satisfies_ts(range), holds, "{range}");
