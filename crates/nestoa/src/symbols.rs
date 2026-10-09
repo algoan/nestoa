@@ -889,7 +889,7 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
         // `typesVersions` remaps the entry path too, not just subpaths.
         return types_from_versions(&json, &pkg_dir, entry.trim_start_matches("./"))
             .or_else(|| typings.map_or_else(main, in_package))
-            .or_else(|| in_package(entry));
+            .or_else(|| in_package("index.d.ts"));
     }
     types_from_exports(&json, &pkg_dir, &subpath, mode)
         .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
@@ -1112,6 +1112,14 @@ mod tests {
             resolved(&main, "lib/lib/sub.js").as_deref(),
             Some("lib/sub.d.ts")
         );
+
+        // A declared but missing entry falls back to `index.d.ts`, never to `main`.
+        let missing = package(
+            "missing",
+            r#"{ "types": "./gone.d.ts", "main": "./lib/index.js" }"#,
+            &["index.d.ts", "lib/index.d.ts"],
+        );
+        assert_eq!(resolved(&missing, "lib").as_deref(), Some("index.d.ts"));
 
         let dir = main.parent().unwrap();
         for (rel, specifier) in [("dto.ts", "./dto.js"), ("esm.d.mts", "./esm.mjs")] {
