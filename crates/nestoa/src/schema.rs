@@ -347,7 +347,11 @@ impl<'a> SchemaCtx<'a> {
                     })
                     .collect();
                 let schema = if non_null.is_empty() {
-                    json!({})
+                    return if nullable {
+                        json!({ "type": "null" })
+                    } else {
+                        json!({})
+                    };
                 } else if non_null.len() == 1 {
                     non_null.into_iter().next().unwrap()
                 } else if non_null
@@ -504,6 +508,21 @@ impl<'a> SchemaCtx<'a> {
                         ObjectEdit::Pick(keys)
                     };
                     return self.reshape_object(base, &edit);
+                }
+            }
+            "Exclude" | "Extract" => {
+                if let Some(args) = &r.type_params
+                    && let [from, filter] = args.params.as_slice()
+                {
+                    let from = self.ts_type_to_schema(file, from);
+                    let filter = self.ts_type_to_schema(file, filter);
+                    return filter_union(
+                        &self.components.schemas,
+                        from,
+                        &filter,
+                        name == "Extract",
+                    )
+                    .unwrap_or_else(|| json!({ "x-unresolved": format!("{name}<…>") }));
                 }
             }
             "Record" => {
@@ -1180,6 +1199,170 @@ fn keyword_schema(k: TsKeywordTypeKind) -> Value {
         TsVoidKeyword | TsUndefinedKeyword | TsNeverKeyword => Value::Null,
         TsSymbolKeyword | TsIntrinsicKeyword => json!({}),
     }
+}
+
+/// One member of a lowered union, as `Exclude`/`Extract` compare them.
+#[derive(Clone, PartialEq)]
+enum Member {
+    /// A literal value and its JSON type.
+    Lit(&'static str, Value),
+    /// A whole primitive type (`string`).
+    Prim(String),
+    Null,
+    /// `any`/`unknown`.
+    Any,
+    /// Anything else, compared by its schema.
+    Other(Value),
+}
+
+/// Split a lowered schema into its union members, reading enum components
+/// through their `$ref` and nested unions through their branches.
+fn union_members(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    out: &mut Vec<Member>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 16;
+    // `void`/`undefined`/`never` lower to a JSON null and add no member.
+    let Value::Object(map) = schema else {
+        return;
+    };
+    if map.is_empty() {
+        out.push(Member::Any);
+        return;
+    }
+    if let Some(target) = map
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .and_then(|name| schemas.get(name))
+        && depth < MAX_DEPTH
+    {
+        let mut inner = Vec::new();
+        union_members(schemas, target, &mut inner, depth + 1);
+        match inner.as_slice() {
+            [Member::Other(_)] => out.push(Member::Other(schema.clone())),
+            _ => out.extend(inner),
+        }
+        return;
+    }
+    if let Some(Value::Array(branches)) = map.get("oneOf").or_else(|| map.get("anyOf")) {
+        for branch in branches {
+            union_members(schemas, branch, out, depth + 1);
+        }
+        return;
+    }
+    if let Some(Value::Array(values)) = map.get("enum") {
+        out.extend(values.iter().map(|v| match v {
+            Value::Null => Member::Null,
+            Value::String(_) => Member::Lit("string", v.clone()),
+            Value::Bool(_) => Member::Lit("boolean", v.clone()),
+            _ => Member::Lit("number", v.clone()),
+        }));
+        return;
+    }
+    let types: Option<Vec<&str>> = match map.get("type") {
+        Some(Value::String(t)) if map.len() == 1 => Some(vec![t]),
+        Some(Value::Array(ts)) if map.len() == 1 => ts.iter().map(Value::as_str).collect(),
+        _ => None,
+    };
+    match types {
+        Some(types) => out.extend(types.into_iter().map(|t| match t {
+            "null" => Member::Null,
+            t => Member::Prim(t.to_string()),
+        })),
+        None => out.push(Member::Other(schema.clone())),
+    }
+}
+
+/// Whether union member `m` is assignable to the union `to`, as TypeScript
+/// decides it for `Exclude`/`Extract`. `None` when the schemas cannot tell,
+/// such as two different object types, or an unresolved one.
+fn assignable(m: &Member, to: &[Member]) -> Option<bool> {
+    let opaque = |m: &Member| matches!(m, Member::Other(s) if s.get("x-unresolved").is_some());
+    if to.contains(&Member::Any) || to.contains(m) {
+        return Some(true);
+    }
+    match m {
+        Member::Lit(t, _) if to.contains(&Member::Prim(t.to_string())) => Some(true),
+        Member::Lit(..) | Member::Prim(_) | Member::Null if to.iter().any(opaque) => None,
+        Member::Lit(..) | Member::Prim(_) | Member::Null => Some(false),
+        // An object type is never assignable to a primitive or a literal.
+        Member::Other(_) if opaque(m) && to.iter().any(|t| *t != Member::Null) => None,
+        Member::Other(_) if to.iter().any(|t| matches!(t, Member::Other(_))) => None,
+        Member::Other(_) => Some(false),
+        Member::Any => None,
+    }
+}
+
+/// `Exclude<T, U>` (or `Extract<T, U>` when `keep_assignable`): the members of
+/// `from` that are not (are) assignable to `filter`. A `from` that loses no
+/// member is returned as written, so `Exclude<string, 'a'>` stays `string`.
+/// `None` when a member's assignability cannot be decided.
+fn filter_union(
+    schemas: &IndexMap<String, Value>,
+    from: Value,
+    filter: &Value,
+    keep_assignable: bool,
+) -> Option<Value> {
+    let mut to = Vec::new();
+    union_members(schemas, filter, &mut to, 0);
+    let mut members = Vec::new();
+    union_members(schemas, &from, &mut members, 0);
+    if members.contains(&Member::Any) {
+        return Some(from);
+    }
+    // `boolean` is `true | false`, so a boolean literal can split it.
+    if to.iter().any(|t| matches!(t, Member::Lit("boolean", _))) {
+        members = members
+            .into_iter()
+            .flat_map(|m| match m {
+                Member::Prim(t) if t == "boolean" => vec![
+                    Member::Lit("boolean", json!(true)),
+                    Member::Lit("boolean", json!(false)),
+                ],
+                m => vec![m],
+            })
+            .collect();
+    }
+    let mut kept = Vec::new();
+    for m in &members {
+        if assignable(m, &to)? == keep_assignable {
+            kept.push(m);
+        }
+    }
+    if kept.len() == members.len() {
+        return Some(from);
+    }
+    let mut branches: Vec<Value> = Vec::new();
+    let mut nullable = false;
+    for m in kept {
+        match m {
+            Member::Lit(t, v) => match branches
+                .iter_mut()
+                .find(|b| b.get("type") == Some(&json!(t)) && b.get("enum").is_some())
+            {
+                Some(b) => b["enum"].as_array_mut()?.push(v.clone()),
+                None => branches.push(json!({ "type": t, "enum": [v] })),
+            },
+            Member::Prim(t) => branches.push(json!({ "type": t })),
+            Member::Null => nullable = true,
+            Member::Other(s) => branches.push(s.clone()),
+            Member::Any => {}
+        }
+    }
+    let schema = match branches.len() {
+        0 if nullable => return Some(json!({ "type": "null" })),
+        0 => json!({ "not": {} }),
+        1 => branches.remove(0),
+        _ => json!({ "oneOf": branches }),
+    };
+    Some(if nullable {
+        make_nullable(schema)
+    } else {
+        schema
+    })
 }
 
 /// A property-set edit, as made by `Partial`/`Required`/`Omit`/`Pick` and
@@ -2088,6 +2271,49 @@ mod tests {
         // An index signature is not a property, so the class's keys are unknown
         // even though its `properties` is empty.
         assert_eq!(unresolved("dict"), json!("keyof Dict"));
+    }
+
+    #[test]
+    fn exclude_and_extract_filter_union_members() {
+        let schemas = lower_all(
+            "export enum Status { Ok = 'ok', Invalid = 'invalid', Failed = 'failed' }\n\
+             export type Failure = Status.Invalid | Status.Failed;\n\
+             export class Item { id: string; }\n\
+             export class Other { name: string; }",
+            "import { Status, Failure, Item, Other } from './dto';\n\
+             export type Letters = Exclude<'a' | 'b' | 'c', 'b'>;\n\
+             export type Ok = Exclude<Status, Failure>;\n\
+             export type Name = Exclude<string, 'a' | 'b'>;\n\
+             export type Failures = Extract<Status, Failure | 'other'>;\n\
+             export type Strings = Extract<'a' | 1 | true, string>;\n\
+             export type Never = Extract<string, 'a'>;\n\
+             export type Present = Exclude<Item | null | undefined, null | undefined>;\n\
+             export type Flag = Exclude<boolean | null, false>;\n\
+             export type Mixed = Exclude<Item | 'none', string>;\n\
+             export type Unknown = Exclude<Item | Other, Item>;",
+            &[
+                "Letters", "Ok", "Name", "Failures", "Strings", "Never", "Present", "Flag",
+                "Mixed", "Unknown",
+            ],
+        );
+        let item = json!({ "$ref": "#/components/schemas/Item" });
+        let expected = [
+            json!({ "type": "string", "enum": ["a", "c"] }),
+            json!({ "type": "string", "enum": ["ok"] }),
+            json!({ "type": "string" }),
+            json!({ "type": "string", "enum": ["invalid", "failed"] }),
+            json!({ "type": "string", "enum": ["a"] }),
+            json!({ "not": {} }),
+            item.clone(),
+            json!({ "type": ["boolean", "null"], "enum": [true, null] }),
+            item,
+            // `Item` and `Other` are both objects: the schemas cannot tell
+            // whether one is assignable to the other.
+            json!({ "x-unresolved": "Exclude<…>" }),
+        ];
+        for (got, want) in schemas.iter().zip(expected) {
+            assert_eq!(*got, want);
+        }
     }
 
     #[test]
