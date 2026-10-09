@@ -880,16 +880,17 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
         if let Some(found) = types_from_exports(&json, &pkg_dir, "", mode) {
             return Some(found);
         }
-        let typings = ["typings", "types"]
+        // Without `typings`/`types`, TypeScript looks for the declaration next
+        // to `main`; `typesVersions` remaps whichever entry it picks, and the
+        // package-root index after it.
+        let entry = ["typings", "types", "main"]
             .into_iter()
             .find_map(|k| json.get(k)?.as_str());
-        // Without `types`, TypeScript looks for the declaration next to `main`.
-        let main = || in_package(json.get("main")?.as_str()?);
-        let entry = typings.unwrap_or("index.d.ts");
-        // `typesVersions` remaps the entry path too, not just subpaths.
-        return types_from_versions(&json, &pkg_dir, entry.trim_start_matches("./"))
-            .or_else(|| typings.map_or_else(main, in_package))
-            .or_else(|| in_package("index.d.ts"));
+        let remapped = |rel: &str| {
+            types_from_versions(&json, &pkg_dir, rel.trim_start_matches("./"))
+                .or_else(|| in_package(rel))
+        };
+        return entry.and_then(remapped).or_else(|| remapped("index.d.ts"));
     }
     types_from_exports(&json, &pkg_dir, &subpath, mode)
         .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
@@ -1111,6 +1112,16 @@ mod tests {
         assert_eq!(
             resolved(&main, "lib/lib/sub.js").as_deref(),
             Some("lib/sub.d.ts")
+        );
+
+        let versioned_main = package(
+            "versioned-main",
+            r#"{ "main": "./lib/index.js", "typesVersions": { "*": { "*": ["ts/*"] } } }"#,
+            &["ts/index.d.ts", "ts/lib/index.d.ts"],
+        );
+        assert_eq!(
+            resolved(&versioned_main, "lib").as_deref(),
+            Some("ts/lib/index.d.ts")
         );
 
         // A declared but missing entry falls back to `index.d.ts`, never to `main`.
