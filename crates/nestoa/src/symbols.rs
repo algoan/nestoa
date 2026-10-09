@@ -802,19 +802,16 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
             .then(|| candidate.canonicalize().unwrap_or(candidate))
     };
     if subpath.is_empty() {
-        let rel = types_from_exports(&json, "")
-            .or_else(|| {
-                json.get("typings")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                json.get("types")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "index.d.ts".to_string());
-        return in_package(rel);
+        if let Some(found) = types_from_exports(&json, "").and_then(in_package) {
+            return Some(found);
+        }
+        let entry = ["typings", "types"]
+            .into_iter()
+            .find_map(|k| json.get(k)?.as_str())
+            .unwrap_or("index.d.ts");
+        // `typesVersions` remaps the entry path too, not just subpaths.
+        return types_from_versions(&json, &pkg_dir, entry.trim_start_matches("./"))
+            .or_else(|| in_package(entry.to_string()));
     }
     types_from_exports(&json, &subpath)
         .and_then(in_package)
@@ -964,6 +961,19 @@ mod tests {
             &["main.d.ts"],
         );
         assert_eq!(resolved(&sugar, "lib").as_deref(), Some("main.d.ts"));
+    }
+
+    #[test]
+    fn types_versions_remap_the_root_entry() {
+        let consumer = package(
+            "root",
+            r#"{ "types": "./index.d.ts", "typesVersions": { ">=4.0": { "*": ["ts4/*"] } } }"#,
+            &["index.d.ts", "ts4/index.d.ts"],
+        );
+        assert_eq!(
+            resolved(&consumer, "lib").as_deref(),
+            Some("ts4/index.d.ts")
+        );
     }
 
     #[test]
