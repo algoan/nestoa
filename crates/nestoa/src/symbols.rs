@@ -55,6 +55,9 @@ pub struct FileSymbols {
     pub star_re_exports: Vec<String>,
     /// `export * as Ns from "./other"` — namespace name -> module specifier.
     pub namespace_re_exports: HashMap<String, String>,
+    /// `export { Local as Exported }` without `from`: exported name -> the
+    /// local declaration or import it names.
+    pub local_exports: HashMap<String, String>,
 }
 
 /// All files indexed by path.
@@ -117,6 +120,9 @@ impl Project {
         if let Some(spec) = fs.namespace_re_exports.get(ns) {
             return self.resolve_module(file, spec);
         }
+        if let Some(local) = fs.local_exports.get(ns) {
+            return self.resolve_namespace_module(file, local, visited);
+        }
         if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
             let target = self.resolve_module(file, &binding.specifier)?;
             return match &binding.imported {
@@ -174,6 +180,9 @@ impl Project {
         if let Some(spec) = fs.namespace_re_exports.get(ns) {
             return Some((file.to_path_buf(), spec.clone()));
         }
+        if let Some(local) = fs.local_exports.get(ns) {
+            return self.namespace_specifier(file, local, seen);
+        }
         if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
             if binding.is_namespace {
                 return Some((file.to_path_buf(), binding.specifier.clone()));
@@ -206,6 +215,9 @@ impl Project {
             return None;
         }
         let fs = self.symbols.get(file)?;
+        if let Some(local) = fs.local_exports.get(name) {
+            return self.import_origin_inner(file, local, visited);
+        }
         if let Some(b) = fs.imports.get(name).or_else(|| fs.re_exports.get(name))
             && !b.is_namespace
         {
@@ -288,6 +300,9 @@ impl Project {
         if let Some(v) = fs.const_numbers.get(name) {
             return Some(*v);
         }
+        if let Some(local) = fs.local_exports.get(name) {
+            return self.resolve_const_inner(file, local, visited);
+        }
         if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
@@ -318,6 +333,9 @@ impl Project {
         let fs = self.symbols.get(file)?;
         if let Some(sym) = fs.declared.get(name) {
             return Some((file.to_path_buf(), sym.clone()));
+        }
+        if let Some(local) = fs.local_exports.get(name) {
+            return self.resolve_inner(file, local, visited);
         }
         if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
@@ -387,8 +405,10 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
                                             is_namespace: false,
                                         },
                                     );
+                                } else if exported_local != orig_name {
+                                    fs.local_exports.insert(exported_local, orig_name);
                                 }
-                                // Bare `export { X }` (no src) — X is already in declared/imports.
+                                // Bare `export { X }` — X is already in declared/imports.
                             }
                             ExportSpecifier::Namespace(ns) => {
                                 // `export * as Ns from "./other"`.

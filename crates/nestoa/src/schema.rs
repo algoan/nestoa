@@ -2083,9 +2083,16 @@ mod tests {
                     "export function PickType(base: any, keys: any) { return base; }",
                 ),
                 ("star.ts", "export * from './barrel';"),
+                (
+                    "alias.ts",
+                    "import { PartialType } from '@nestjs/swagger';\n\
+                     import * as sw from '@nestjs/swagger';\n\
+                     export { PartialType as MakePartial, sw as nest };",
+                ),
             ],
             "import { PartialType, swagger } from './barrel';\n\
              import { swagger as starred } from './star';\n\
+             import { MakePartial, nest } from './alias';\n\
              import { PickType } from './own';\n\
              import { Child } from './dto';\n\
              function OmitType(base: any, keys: any) { return base; }\n\
@@ -2093,17 +2100,24 @@ mod tests {
              export class Imported extends PickType(Child, ['id']) {}\n\
              export class Local extends OmitType(Child, ['id']) {}\n\
              export class NamespaceBarrel extends swagger.PickType(Child, ['id']) {}\n\
-             export class StarBarrel extends starred.PickType(Child, ['id']) {}",
+             export class StarBarrel extends starred.PickType(Child, ['id']) {}\n\
+             export class LocalAlias extends MakePartial(Child) {}\n\
+             export class LocalNamespace extends nest.PickType(Child, ['id']) {}",
             &[
                 "ViaBarrel",
                 "Imported",
                 "Local",
                 "NamespaceBarrel",
                 "StarBarrel",
+                "LocalAlias",
+                "LocalNamespace",
             ],
         );
         assert_eq!(prop_names(&schemas[3]["allOf"][0]), ["id"]);
         assert_eq!(prop_names(&schemas[4]["allOf"][0]), ["id"]);
+        assert_eq!(required_names(&schemas[5]["allOf"][0]), Vec::<&str>::new());
+        assert_eq!(prop_names(&schemas[5]["allOf"][0]).len(), 4);
+        assert_eq!(prop_names(&schemas[6]["allOf"][0]), ["id"]);
         assert_eq!(
             prop_names(&schemas[0]["allOf"][0]),
             ["id", "secret", "extra", "note"]
@@ -2119,19 +2133,26 @@ mod tests {
     }
 
     #[test]
-    fn namespaces_resolve_through_star_barrels() {
-        let [namespaced] = lower_with(
+    fn local_export_aliases_and_namespaces_through_star_barrels_resolve() {
+        let [aliased, namespaced] = lower_with(
             &[
+                (
+                    "dto.ts",
+                    "class Base { id: string; }\nexport { Base as Renamed };",
+                ),
                 ("enums.ts", "export enum Kind { A = 'a' }"),
                 ("ns.ts", "export * as Enums from './enums';"),
                 ("barrel.ts", "export * from './ns';"),
             ],
-            "import { Enums } from './barrel';\n\
+            "import { Renamed } from './dto';\n\
+             import { Enums } from './barrel';\n\
+             export type A = Renamed;\n\
              export type B = Enums.Kind;",
-            &["B"],
+            &["A", "B"],
         )
         .try_into()
         .unwrap();
+        assert_eq!(aliased, json!({ "$ref": "#/components/schemas/Renamed" }));
         assert_eq!(namespaced, json!({ "$ref": "#/components/schemas/Kind" }));
     }
 
