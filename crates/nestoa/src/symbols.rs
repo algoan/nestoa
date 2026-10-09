@@ -8,6 +8,7 @@ use swc_ecma_ast::{
 };
 
 use crate::parse::ParsedFile;
+use crate::tsconfig::best_match;
 
 /// One exported (or top-level) named declaration in a file. Indexed by name
 /// within the file.
@@ -54,6 +55,9 @@ pub struct FileSymbols {
     pub star_re_exports: Vec<String>,
     /// `export * as Ns from "./other"` — namespace name -> module specifier.
     pub namespace_re_exports: HashMap<String, String>,
+    /// `export { Local as Exported }` without `from`: exported name -> the
+    /// local declaration or import it names.
+    pub local_exports: HashMap<String, String>,
 }
 
 /// All files indexed by path.
@@ -116,18 +120,23 @@ impl Project {
         if let Some(spec) = fs.namespace_re_exports.get(ns) {
             return self.resolve_module(file, spec);
         }
+        if let Some(local) = fs.local_exports.get(ns) {
+            return self.resolve_namespace_module(file, local, visited);
+        }
         if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
             let target = self.resolve_module(file, &binding.specifier)?;
-            match &binding.imported {
+            return match &binding.imported {
                 // `import * as Ns from "spec"` — the target module is the namespace.
                 None if binding.is_namespace => Some(target),
                 None => None, // default import — not a namespace
                 // `import { Ns } from "spec"` — find namespace `Ns` in the target.
                 Some(imported) => self.resolve_namespace_module(&target, imported, visited),
-            }
-        } else {
-            None
+            };
         }
+        fs.star_re_exports.iter().find_map(|spec| {
+            let target = self.resolve_module(file, spec)?;
+            self.resolve_namespace_module(&target, ns, visited)
+        })
     }
 
     /// The package a value binding ultimately comes from, and its exported
@@ -171,15 +180,29 @@ impl Project {
         if let Some(spec) = fs.namespace_re_exports.get(ns) {
             return Some((file.to_path_buf(), spec.clone()));
         }
-        let binding = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns))?;
-        if binding.is_namespace {
-            return Some((file.to_path_buf(), binding.specifier.clone()));
+        if let Some(local) = fs.local_exports.get(ns) {
+            return self.namespace_specifier(file, local, seen);
         }
-        let target = resolve_module_path(file, &binding.specifier)
-            .or_else(|| self.resolve_alias(&binding.specifier))
-            .filter(|t| self.symbols.contains_key(t))?;
-        let exported = binding.imported.as_deref().unwrap_or(ns);
-        self.namespace_specifier(&target, exported, seen)
+        if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
+            if binding.is_namespace {
+                return Some((file.to_path_buf(), binding.specifier.clone()));
+            }
+            let target = self.in_repo_module(file, &binding.specifier)?;
+            let exported = binding.imported.as_deref().unwrap_or(ns);
+            return self.namespace_specifier(&target, exported, seen);
+        }
+        fs.star_re_exports.iter().find_map(|spec| {
+            let target = self.in_repo_module(file, spec)?;
+            self.namespace_specifier(&target, ns, seen)
+        })
+    }
+
+    /// The parsed in-repo module (relative or tsconfig-aliased) a specifier
+    /// names. `None` for a package.
+    fn in_repo_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
+        resolve_module_path(file, specifier)
+            .or_else(|| self.resolve_alias(specifier))
+            .filter(|t| self.symbols.contains_key(t))
     }
 
     fn import_origin_inner(
@@ -192,6 +215,9 @@ impl Project {
             return None;
         }
         let fs = self.symbols.get(file)?;
+        if let Some(local) = fs.local_exports.get(name) {
+            return self.import_origin_inner(file, local, visited);
+        }
         if let Some(b) = fs.imports.get(name).or_else(|| fs.re_exports.get(name))
             && !b.is_namespace
         {
@@ -274,6 +300,9 @@ impl Project {
         if let Some(v) = fs.const_numbers.get(name) {
             return Some(*v);
         }
+        if let Some(local) = fs.local_exports.get(name) {
+            return self.resolve_const_inner(file, local, visited);
+        }
         if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
@@ -304,6 +333,9 @@ impl Project {
         let fs = self.symbols.get(file)?;
         if let Some(sym) = fs.declared.get(name) {
             return Some((file.to_path_buf(), sym.clone()));
+        }
+        if let Some(local) = fs.local_exports.get(name) {
+            return self.resolve_inner(file, local, visited);
         }
         if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
@@ -373,8 +405,10 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
                                             is_namespace: false,
                                         },
                                     );
+                                } else if exported_local != orig_name {
+                                    fs.local_exports.insert(exported_local, orig_name);
                                 }
-                                // Bare `export { X }` (no src) — X is already in declared/imports.
+                                // Bare `export { X }` — X is already in declared/imports.
                             }
                             ExportSpecifier::Namespace(ns) => {
                                 // `export * as Ns from "./other"`.
@@ -591,9 +625,9 @@ pub fn package_name(specifier: &str) -> String {
     split_package_specifier(specifier).0
 }
 
-/// Walk up from `current_file` looking for `node_modules/<pkg>`.
-fn find_package_dir(current_file: &Path, pkg: &str) -> Option<PathBuf> {
-    let mut dir = current_file.parent();
+/// Walk up from `start_dir` looking for `node_modules/<pkg>`.
+pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
+    let mut dir = Some(start_dir);
     while let Some(d) = dir {
         let candidate = d.join("node_modules").join(pkg);
         if candidate.is_dir() {
@@ -604,106 +638,193 @@ fn find_package_dir(current_file: &Path, pkg: &str) -> Option<PathBuf> {
     None
 }
 
-/// Recursively search a package.json `exports` entry value for a `.d.ts` path,
-/// preferring an explicit `types`/`typings` condition.
+/// Resolve a package.json `exports` entry value to a `.d.ts` path the way
+/// TypeScript walks it: conditions in declared order, the first applicable one
+/// that yields a declaration wins, and one mapped to `null` blocks the entry.
 fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) if s.ends_with(".d.ts") => Some(s.clone()),
+        serde_json::Value::Array(alternatives) => {
+            alternatives.iter().find_map(dts_from_exports_value)
+        }
         serde_json::Value::Object(map) => {
-            for key in ["types", "typings"] {
-                if let Some(found) = map.get(key).and_then(dts_from_exports_value) {
+            for (_, v) in map.iter().filter(|(k, _)| condition_applies(k)) {
+                if v.is_null() {
+                    return None;
+                }
+                if let Some(found) = dts_from_exports_value(v) {
                     return Some(found);
                 }
             }
-            // Fall back to any nested condition that yields a .d.ts.
-            map.values().find_map(dts_from_exports_value)
+            None
         }
         _ => None,
     }
 }
 
-/// Resolve a package subpath to its declaration entry via the `exports` map,
-/// honouring exact keys and a trailing `/*` wildcard.
+/// The `exports` conditions TypeScript enables when resolving declarations.
+/// The importer's module format is unknown, so `import` and `require` both apply.
+fn condition_applies(condition: &str) -> bool {
+    match condition.strip_prefix("types@") {
+        Some(range) => satisfies_ts(range),
+        None => matches!(
+            condition,
+            "types" | "import" | "require" | "node" | "default"
+        ),
+    }
+}
+
+/// Resolve a package subpath to its declaration entry via the `exports` map:
+/// the best-matching key (exact, then the longest `*` pattern prefix, as Node
+/// picks it), its `*` substituted into the target.
 fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String> {
     let exports = json.get("exports")?;
     let key = if subpath.is_empty() {
         ".".to_string()
     } else {
-        format!("./{}", subpath)
+        format!("./{subpath}")
     };
-    if let Some(v) = exports.get(&key)
-        && let Some(found) = dts_from_exports_value(v)
-    {
-        return Some(found);
+    // A string, array or conditions object is shorthand for `{ ".": … }`.
+    let serde_json::Value::Object(map) = exports else {
+        return (key == ".")
+            .then(|| dts_from_exports_value(exports))
+            .flatten();
+    };
+    if !map.keys().any(|k| k.starts_with('.')) {
+        return (key == ".")
+            .then(|| dts_from_exports_value(exports))
+            .flatten();
     }
-    // Wildcard match: `./foo/*` with a `*` in the target path.
-    if let serde_json::Value::Object(map) = exports {
-        for (k, v) in map {
-            if let Some(prefix) = k.strip_suffix("/*") {
-                let prefix = prefix.trim_start_matches("./");
-                if let Some(rest) = subpath
-                    .strip_prefix(prefix)
-                    .and_then(|r| r.strip_prefix('/'))
-                    && let Some(tmpl) = dts_from_exports_value(v)
-                {
-                    return Some(tmpl.replace('*', rest));
-                }
-            }
-        }
-    }
-    None
+    let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key, true)?;
+    Some(dts_from_exports_value(value)?.replace('*', &captured))
 }
 
-/// Resolve a subpath via the legacy `typesVersions` map.
-fn types_from_versions(json: &serde_json::Value, subpath: &str) -> Option<String> {
-    let star = json.get("typesVersions")?.get("*")?;
-    if let Some(arr) = star.get(subpath).and_then(|v| v.as_array())
-        && let Some(first) = arr.first().and_then(|v| v.as_str())
-    {
-        return Some(first.to_string());
+/// The TypeScript version `typesVersions` ranges are evaluated against.
+const TS_VERSION: [u64; 3] = [5, 9, 0];
+
+/// Resolve a subpath via the legacy `typesVersions` map: the first version
+/// range `TS_VERSION` satisfies, as TypeScript picks it, then each target of
+/// its best-matching pattern in order.
+fn types_from_versions(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) -> Option<PathBuf> {
+    let map = json
+        .get("typesVersions")?
+        .as_object()?
+        .iter()
+        .find(|(range, _)| satisfies_ts(range))?
+        .1
+        .as_object()?;
+    let (targets, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), subpath, false)?;
+    targets
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.as_str())
+        .find_map(|t| {
+            let target = pkg_dir.join(t.replace('*', &captured).trim_start_matches("./"));
+            declaration_file(&target)
+        })
+}
+
+/// Whether `TS_VERSION` satisfies a semver range: `||` alternatives of
+/// space-separated comparators (`>=4.2 <5`, `*`, `~4.1`, `^4.1`, `4.2.x`). An
+/// unparsable comparator never holds.
+fn satisfies_ts(range: &str) -> bool {
+    range.split("||").any(|alt| {
+        let alt = alt.trim();
+        alt.is_empty() || alt.split_whitespace().all(comparator_holds)
+    })
+}
+
+fn comparator_holds(comparator: &str) -> bool {
+    let (op, version) = ["<=", ">=", "<", ">", "=", "~", "^"]
+        .into_iter()
+        .find_map(|op| comparator.strip_prefix(op).map(|v| (op, v)))
+        .unwrap_or(("", comparator));
+    let mut parts: Vec<u64> = Vec::new();
+    for part in version.trim_start_matches('v').split('.') {
+        match part {
+            "x" | "X" | "*" => break,
+            _ => match part.parse() {
+                Ok(n) => parts.push(n),
+                Err(_) => return false,
+            },
+        }
     }
-    None
+    let given = parts.len().min(3);
+    let mut bound = [0u64; 3];
+    bound[..given].copy_from_slice(&parts[..given]);
+    let ts = TS_VERSION;
+    let same_prefix = |n: usize| ts[..n] == bound[..n];
+    // A partial version stands for every version it prefixes, so `>5` means
+    // above all of 5.x: from 6.0.0 on, and `<=5` below 6.0.0.
+    let past_partial = || {
+        let mut next = bound;
+        if given > 0 {
+            next[given - 1] += 1;
+        }
+        next
+    };
+    match op {
+        _ if given == 0 => matches!(op, "" | "=" | ">=" | "<=" | "~" | "^"),
+        "<" => ts < bound,
+        "<=" if given < 3 => ts < past_partial(),
+        "<=" => ts <= bound,
+        ">" if given < 3 => ts >= past_partial(),
+        ">" => ts > bound,
+        ">=" => ts >= bound,
+        // `~1.2` allows patch updates, `~1` minor ones.
+        "~" => ts >= bound && same_prefix(given.clamp(1, 2)),
+        // `^1.2` allows anything below the next major (or minor, for `^0.x`).
+        "^" => ts >= bound && same_prefix(if bound[0] == 0 { 2 } else { 1 }),
+        // A bare or `=` version matches every version it is a prefix of.
+        _ => same_prefix(given),
+    }
+}
+
+/// `path` itself when it is a `.ts` file, or with a `.d.ts` / `/index.d.ts`
+/// suffix, whichever exists.
+fn declaration_file(path: &Path) -> Option<PathBuf> {
+    let as_is = path.extension().is_some_and(|e| e == "ts").then_some("");
+    as_is
+        .into_iter()
+        .chain([".d.ts", "/index.d.ts"])
+        .find_map(|ext| {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(ext);
+            let p = PathBuf::from(p);
+            p.is_file().then(|| p.canonicalize().unwrap_or(p))
+        })
 }
 
 /// Locate the TypeScript declaration file for a bare package import (including
 /// subpaths), so its exported types can be parsed. Returns the `.d.ts` path.
 pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<PathBuf> {
     let (pkg, subpath) = split_package_specifier(specifier);
-    let pkg_dir = find_package_dir(current_file, &pkg)?;
+    let pkg_dir = find_package_dir(current_file.parent()?, &pkg)?;
     let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
-    let rel = if subpath.is_empty() {
-        types_from_exports(&json, "")
-            .or_else(|| {
-                json.get("typings")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                json.get("types")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "index.d.ts".to_string())
-    } else {
-        types_from_exports(&json, &subpath)
-            .or_else(|| types_from_versions(&json, &subpath))
-            .or_else(|| {
-                [
-                    format!("{}.d.ts", subpath),
-                    format!("{}/index.d.ts", subpath),
-                ]
-                .into_iter()
-                .find(|cand| pkg_dir.join(cand).is_file())
-            })?
+    let in_package = |rel: String| {
+        let candidate = pkg_dir.join(rel.trim_start_matches("./"));
+        candidate
+            .is_file()
+            .then(|| candidate.canonicalize().unwrap_or(candidate))
     };
-
-    let candidate = pkg_dir.join(rel.trim_start_matches("./"));
-    if candidate.is_file() {
-        return Some(candidate.canonicalize().unwrap_or(candidate));
+    if subpath.is_empty() {
+        if let Some(found) = types_from_exports(&json, "").and_then(in_package) {
+            return Some(found);
+        }
+        let entry = ["typings", "types"]
+            .into_iter()
+            .find_map(|k| json.get(k)?.as_str())
+            .unwrap_or("index.d.ts");
+        // `typesVersions` remaps the entry path too, not just subpaths.
+        return types_from_versions(&json, &pkg_dir, entry.trim_start_matches("./"))
+            .or_else(|| in_package(entry.to_string()));
     }
-    None
+    types_from_exports(&json, &subpath)
+        .and_then(in_package)
+        .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
+        .or_else(|| declaration_file(&pkg_dir.join(&subpath)))
 }
 
 #[cfg(test)]
@@ -767,5 +888,177 @@ mod tests {
         assert!(root.ends_with("dist/index.d.ts"), "got {:?}", root);
         let sub = resolve_package_types(&consumer, "@scope/lib/sub").expect("subpath import");
         assert!(sub.ends_with("dist/sub/index.d.ts"), "got {:?}", sub);
+    }
+
+    /// Write a package under a fresh temp dir and return a consumer file
+    /// sitting next to its `node_modules`.
+    fn package(name: &str, manifest: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nestoa-pkg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("node_modules/lib");
+        for rel in files {
+            let path = pkg.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "export interface X { a: string; }").unwrap();
+        }
+        std::fs::write(pkg.join("package.json"), manifest).unwrap();
+        let consumer = dir.join("src/file.ts");
+        std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
+        std::fs::write(&consumer, "").unwrap();
+        consumer
+    }
+
+    fn resolved(consumer: &Path, specifier: &str) -> Option<String> {
+        let path = resolve_package_types(consumer, specifier)?;
+        let pkg = consumer
+            .parent()?
+            .parent()?
+            .join("node_modules/lib")
+            .canonicalize()
+            .ok()?;
+        Some(path.strip_prefix(pkg).ok()?.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn exports_patterns_match_like_node() {
+        let consumer = package(
+            "exports",
+            r#"{ "exports": {
+                "./*": { "types": "./dist/*.d.ts" },
+                "./*.js": { "types": "./js/*.d.ts" },
+                "./deep/*": { "types": "./types/deep/*.d.ts" },
+                "./hidden/*": null
+            } }"#,
+            &[
+                "dist/a.d.ts",
+                "types/deep/b.d.ts",
+                "hidden/c.d.ts",
+                "js/d.d.ts",
+            ],
+        );
+        // Same prefix: the longer pattern wins, whatever the key order.
+        assert_eq!(
+            resolved(&consumer, "lib/d.js").as_deref(),
+            Some("js/d.d.ts")
+        );
+        assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));
+        assert_eq!(
+            resolved(&consumer, "lib/deep/b").as_deref(),
+            Some("types/deep/b.d.ts")
+        );
+        // `null` excludes the subpath from `exports`; the plain layout still applies.
+        assert_eq!(
+            resolved(&consumer, "lib/hidden/c").as_deref(),
+            Some("hidden/c.d.ts")
+        );
+
+        let versioned = package(
+            "versioned",
+            r#"{ "exports": { ".": {
+                "types@<4.0": "./old.d.ts",
+                "types@>=5.9": "./new.d.ts",
+                "types": "./main.d.ts"
+            } } }"#,
+            &["old.d.ts", "new.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&versioned, "lib").as_deref(), Some("new.d.ts"));
+
+        let blocked = package(
+            "blocked",
+            r#"{ "typings": "./legacy.d.ts", "exports": { ".": {
+                "types@>=5.9": null,
+                "types": "./main.d.ts"
+            } } }"#,
+            &["legacy.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&blocked, "lib").as_deref(), Some("legacy.d.ts"));
+
+        let ordered = package(
+            "ordered",
+            r#"{ "exports": { ".": {
+                "browser": "./browser.d.ts",
+                "import": { "types": "./esm.d.ts" },
+                "types": "./main.d.ts"
+            } } }"#,
+            &["browser.d.ts", "esm.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&ordered, "lib").as_deref(), Some("esm.d.ts"));
+
+        let sugar = package(
+            "sugar",
+            r#"{ "exports": { "types": "./main.d.ts" } }"#,
+            &["main.d.ts"],
+        );
+        assert_eq!(resolved(&sugar, "lib").as_deref(), Some("main.d.ts"));
+    }
+
+    #[test]
+    fn types_versions_remap_the_root_entry() {
+        let consumer = package(
+            "root",
+            r#"{ "types": "./index.d.ts", "typesVersions": { ">=4.0": { "*": ["ts4/*"] } } }"#,
+            &["index.d.ts", "ts4/index.d.ts"],
+        );
+        assert_eq!(
+            resolved(&consumer, "lib").as_deref(),
+            Some("ts4/index.d.ts")
+        );
+    }
+
+    #[test]
+    fn types_versions_ranges() {
+        for (range, holds) in [
+            ("*", true),
+            (">=4.2", true),
+            ("<4.0", false),
+            (">=3.1 <4.0 || >=5", true),
+            ("~5.9", true),
+            ("~5.8", false),
+            ("^5.1", true),
+            ("^4.9", false),
+            ("5.x", true),
+            ("5.9", true),
+            ("4", false),
+            (">5", false),
+            (">5.8", true),
+            (">5.9", false),
+            ("<=5", true),
+            ("<=5.8", false),
+            (">5.9.0", false),
+            ("<=5.9.0", true),
+            ("latest", false),
+        ] {
+            assert_eq!(satisfies_ts(range), holds, "{range}");
+        }
+    }
+
+    #[test]
+    fn types_versions_patterns_and_fallback_targets() {
+        let consumer = package(
+            "versions",
+            r#"{ "typesVersions": {
+                "<4.0": { "*": ["legacy/*"] },
+                ">=4.2": {
+                    "sub/*": ["missing/*", "types/sub/*"],
+                    "*": ["dist/*"]
+                }
+            } }"#,
+            &[
+                "dist/a.d.ts",
+                "dist/dir/index.d.ts",
+                "types/sub/b.d.ts",
+                "legacy/a.d.ts",
+            ],
+        );
+        // `<4.0` comes first but is for an older TypeScript.
+        assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));
+        assert_eq!(
+            resolved(&consumer, "lib/dir").as_deref(),
+            Some("dist/dir/index.d.ts")
+        );
+        assert_eq!(
+            resolved(&consumer, "lib/sub/b").as_deref(),
+            Some("types/sub/b.d.ts")
+        );
     }
 }

@@ -32,20 +32,48 @@ impl TsPaths {
     }
 
     /// Resolve a bare import specifier through the alias table to a file path.
+    /// Only the best-matching pattern's targets are tried, as TypeScript does.
     pub fn resolve(&self, specifier: &str) -> Option<PathBuf> {
-        for (pattern, targets) in &self.entries {
-            if let Some(captured) = match_pattern(pattern, specifier) {
-                for target in targets {
-                    let rel = target.replace('*', &captured);
-                    let candidate = self.base_url.join(rel.trim_start_matches("./"));
-                    if let Some(found) = resolve_file_with_exts(&candidate) {
-                        return Some(found);
-                    }
-                }
-            }
-        }
-        None
+        let patterns = self.entries.iter().map(|(p, t)| (p.as_str(), t));
+        let (targets, captured) = best_match(patterns, specifier, false)?;
+        targets.iter().find_map(|target| {
+            let rel = target.replace('*', &captured);
+            resolve_file_with_exts(&self.base_url.join(rel.trim_start_matches("./")))
+        })
     }
+}
+
+/// The pattern that matches `specifier` best, with its value and the text its
+/// `*` captured: an exact pattern first, then the wildcard with the longest
+/// prefix. TypeScript (`paths`, `typesVersions`) keeps the first of two equal
+/// prefixes; Node (`exports`) prefers the longer pattern, so `./*.js` beats
+/// `./*` — `longer_pattern_wins_ties` selects that.
+pub(crate) fn best_match<'a, T>(
+    patterns: impl Iterator<Item = (&'a str, T)>,
+    specifier: &str,
+    longer_pattern_wins_ties: bool,
+) -> Option<(T, String)> {
+    let mut best: Option<((usize, usize), T, String)> = None;
+    for (pattern, value) in patterns {
+        let Some(captured) = match_pattern(pattern, specifier) else {
+            continue;
+        };
+        let rank = match pattern.find('*') {
+            Some(star) => (
+                star,
+                if longer_pattern_wins_ties {
+                    pattern.len()
+                } else {
+                    0
+                },
+            ),
+            None => return Some((value, captured)),
+        };
+        if best.as_ref().is_none_or(|(r, ..)| rank > *r) {
+            best = Some((rank, value, captured));
+        }
+    }
+    best.map(|(_, value, captured)| (value, captured))
 }
 
 /// Match a tsconfig `paths` pattern against a specifier. A pattern has at most
@@ -109,35 +137,49 @@ pub fn load_tsconfig_paths(project_root: &Path, explicit: Option<&Path>) -> Opti
         }
         None => project_root.join("tsconfig.json"),
     };
-    let mut visited = std::collections::HashSet::new();
-    let (base_url, entries) = collect(&start, &mut visited)?;
-    Some(TsPaths { base_url, entries })
+    let mut found = Inherited::default();
+    collect(&start, &mut std::collections::HashSet::new(), &mut found);
+    let (paths_dir, entries) = found.paths?;
+    Some(TsPaths {
+        base_url: found.base_url.unwrap_or(paths_dir),
+        entries,
+    })
 }
 
-/// Walk the `extends` chain returning the `(base_url, paths)` from the most
-/// derived config that declares `paths`.
-fn collect(
-    path: &Path,
-    visited: &mut std::collections::HashSet<PathBuf>,
-) -> Option<(PathBuf, PathEntries)> {
+/// The options read from the most derived config in an `extends` chain that
+/// declares them. `paths` resolve against `baseUrl` when one is set anywhere in
+/// the chain, and otherwise against the directory of the config declaring them.
+#[derive(Default)]
+struct Inherited {
+    paths: Option<(PathBuf, PathEntries)>,
+    base_url: Option<PathBuf>,
+}
+
+/// Fill `found` from `path`, then from what it extends, most derived first: in
+/// an `extends` array a later config overrides an earlier one.
+fn collect(path: &Path, visited: &mut std::collections::HashSet<PathBuf>, found: &mut Inherited) {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(path.clone()) {
-        return None;
+        return;
     }
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
+    let Some(json) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)).ok())
+    else {
+        return;
+    };
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let co = json.get("compilerOptions");
-
-    if let Some(paths) = co.and_then(|c| c.get("paths")).and_then(|p| p.as_object())
+    if found.base_url.is_none()
+        && let Some(base) = co.and_then(|c| c.get("baseUrl")).and_then(|b| b.as_str())
+    {
+        let base_url = dir.join(base);
+        found.base_url = Some(base_url.canonicalize().unwrap_or(base_url));
+    }
+    if found.paths.is_none()
+        && let Some(paths) = co.and_then(|c| c.get("paths")).and_then(|p| p.as_object())
         && !paths.is_empty()
     {
-        let base_rel = co
-            .and_then(|c| c.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or(".");
-        let base_url = dir.join(base_rel);
-        let base_url = base_url.canonicalize().unwrap_or(base_url);
         let entries = paths
             .iter()
             .map(|(k, v)| {
@@ -152,18 +194,49 @@ fn collect(
                 (k.clone(), targets)
             })
             .collect();
-        return Some((base_url, entries));
+        found.paths = Some((dir.to_path_buf(), entries));
     }
-
-    // No `paths` here — follow `extends`.
-    if let Some(ext) = json.get("extends").and_then(|e| e.as_str()) {
-        let mut ext_path = dir.join(ext);
-        if !ext_path.is_file() {
-            ext_path = dir.join(format!("{}.json", ext));
+    if found.paths.is_some() && found.base_url.is_some() {
+        return;
+    }
+    let parents: Vec<&str> = match json.get("extends") {
+        Some(serde_json::Value::String(e)) => vec![e.as_str()],
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|e| e.as_str()).rev().collect(),
+        _ => Vec::new(),
+    };
+    for parent in parents {
+        if let Some(parent) = extends_path(dir, parent) {
+            collect(&parent, visited, found);
         }
-        return collect(&ext_path, visited);
     }
-    None
+}
+
+/// The file an `extends` entry names: a path relative to the config, or a
+/// package (`@tsconfig/node20`, `@tsconfig/node20/tsconfig.json`) found in a
+/// `node_modules` above it.
+fn extends_path(dir: &Path, entry: &str) -> Option<PathBuf> {
+    let with_json = |p: PathBuf| {
+        if p.is_file() {
+            p
+        } else {
+            let mut j = p.into_os_string();
+            j.push(".json");
+            PathBuf::from(j)
+        }
+    };
+    if entry.starts_with('.') || Path::new(entry).is_absolute() {
+        return Some(with_json(dir.join(entry)));
+    }
+    let (pkg, subpath) = crate::symbols::split_package_specifier(entry);
+    let pkg_dir = crate::symbols::find_package_dir(dir, &pkg)?;
+    if !subpath.is_empty() {
+        return Some(with_json(pkg_dir.join(subpath)));
+    }
+    let declared = std::fs::read_to_string(pkg_dir.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|json| json.get("tsconfig")?.as_str().map(str::to_string));
+    Some(pkg_dir.join(declared.as_deref().unwrap_or("tsconfig.json")))
 }
 
 /// Strip `//` and `/* */` comments and trailing commas so a JSONC tsconfig can
@@ -284,6 +357,107 @@ mod tests {
         }"#;
         let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(src)).unwrap();
         assert_eq!(parsed["compilerOptions"]["baseUrl"], ".");
+    }
+
+    /// Write `files` under a fresh temp dir and return it.
+    fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nestoa-tsc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, body) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_longest_matching_prefix_wins() {
+        let dir = tree(
+            "prefix",
+            &[
+                ("libs/any/x.ts", ""),
+                ("libs/core/x.ts", ""),
+                ("libs/exact.ts", ""),
+                (
+                    "tsconfig.json",
+                    r#"{ "compilerOptions": { "paths": {
+                        "@algoan/*": ["libs/any/*"],
+                        "@algoan/core/*": ["libs/core/*"],
+                        "@algoan/core/exact": ["libs/exact.ts"]
+                    } } }"#,
+                ),
+            ],
+        );
+        let paths = load_tsconfig_paths(&dir, None).unwrap();
+        assert_eq!(
+            paths.resolve("@algoan/core/x"),
+            Some(dir.join("libs/core/x.ts"))
+        );
+        assert_eq!(paths.resolve("@algoan/x"), Some(dir.join("libs/any/x.ts")));
+        assert_eq!(
+            paths.resolve("@algoan/core/exact"),
+            Some(dir.join("libs/exact.ts"))
+        );
+        // The best pattern's targets are the only ones tried.
+        assert_eq!(paths.resolve("@algoan/core/missing"), None);
+    }
+
+    #[test]
+    fn extends_arrays_packages_and_an_inherited_base_url() {
+        let dir = tree(
+            "extends",
+            &[
+                ("src/lib/index.ts", ""),
+                ("other/lib/index.ts", ""),
+                (
+                    "node_modules/@tsconfig/base/package.json",
+                    r#"{ "name": "@tsconfig/base", "tsconfig": "base.json" }"#,
+                ),
+                (
+                    "node_modules/@tsconfig/base/base.json",
+                    r#"{ "compilerOptions": { "strict": true } }"#,
+                ),
+                (
+                    "first.json",
+                    r#"{ "compilerOptions": { "baseUrl": "other" } }"#,
+                ),
+                (
+                    "second.json",
+                    r#"{ "compilerOptions": { "baseUrl": "src" } }"#,
+                ),
+                (
+                    "svc/tsconfig.json",
+                    r#"{
+                        "extends": ["@tsconfig/base", "../first.json", "../second"],
+                        "compilerOptions": { "paths": { "@lib": ["lib"] } }
+                    }"#,
+                ),
+            ],
+        );
+        let paths = load_tsconfig_paths(&dir.join("svc"), None).unwrap();
+        // `paths` resolve against the `baseUrl` of the last config extended.
+        assert_eq!(paths.resolve("@lib"), Some(dir.join("src/lib/index.ts")));
+    }
+
+    #[test]
+    fn paths_without_a_base_url_resolve_from_their_config() {
+        let dir = tree(
+            "nobase",
+            &[
+                ("base/lib.ts", ""),
+                (
+                    "base/tsconfig.json",
+                    r#"{ "compilerOptions": { "paths": { "@lib": ["./lib"] } } }"#,
+                ),
+                (
+                    "svc/tsconfig.json",
+                    r#"{ "extends": "../base/tsconfig.json" }"#,
+                ),
+            ],
+        );
+        let paths = load_tsconfig_paths(&dir.join("svc"), None).unwrap();
+        assert_eq!(paths.resolve("@lib"), Some(dir.join("base/lib.ts")));
     }
 
     #[test]
