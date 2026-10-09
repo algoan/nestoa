@@ -591,9 +591,9 @@ pub fn package_name(specifier: &str) -> String {
     split_package_specifier(specifier).0
 }
 
-/// Walk up from `current_file` looking for `node_modules/<pkg>`.
-fn find_package_dir(current_file: &Path, pkg: &str) -> Option<PathBuf> {
-    let mut dir = current_file.parent();
+/// Walk up from `start_dir` looking for `node_modules/<pkg>`.
+pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
+    let mut dir = Some(start_dir);
     while let Some(d) = dir {
         let candidate = d.join("node_modules").join(pkg);
         if candidate.is_dir() {
@@ -669,7 +669,7 @@ fn types_from_versions(json: &serde_json::Value, subpath: &str) -> Option<String
 /// subpaths), so its exported types can be parsed. Returns the `.d.ts` path.
 pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<PathBuf> {
     let (pkg, subpath) = split_package_specifier(specifier);
-    let pkg_dir = find_package_dir(current_file, &pkg)?;
+    let pkg_dir = find_package_dir(current_file.parent()?, &pkg)?;
     let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
