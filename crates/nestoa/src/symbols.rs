@@ -638,8 +638,9 @@ pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
     None
 }
 
-/// Recursively search a package.json `exports` entry value for a `.d.ts` path,
-/// preferring an explicit `types`/`typings` condition.
+/// Resolve a package.json `exports` entry value to a `.d.ts` path the way
+/// TypeScript walks it: conditions in declared order, the first applicable one
+/// that yields a declaration wins, and one mapped to `null` blocks the entry.
 fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) if s.ends_with(".d.ts") => Some(s.clone()),
@@ -647,13 +648,7 @@ fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
             alternatives.iter().find_map(dts_from_exports_value)
         }
         serde_json::Value::Object(map) => {
-            // `types@<range>` only applies to the TypeScript versions it names.
-            let applies = |k: &str| k.strip_prefix("types@").is_none_or(satisfies_ts);
-            let types_like = map.iter().filter(|(k, _)| {
-                matches!(k.as_str(), "types" | "typings") || k.starts_with("types@") && applies(k)
-            });
-            for (_, v) in types_like {
-                // A matching condition mapped to `null` blocks the entry, as in TypeScript.
+            for (_, v) in map.iter().filter(|(k, _)| condition_applies(k)) {
                 if v.is_null() {
                     return None;
                 }
@@ -661,12 +656,21 @@ fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
                     return Some(found);
                 }
             }
-            // Fall back to any nested condition that yields a .d.ts.
-            map.iter()
-                .filter(|(k, _)| applies(k))
-                .find_map(|(_, v)| dts_from_exports_value(v))
+            None
         }
         _ => None,
+    }
+}
+
+/// The `exports` conditions TypeScript enables when resolving declarations.
+/// The importer's module format is unknown, so `import` and `require` both apply.
+fn condition_applies(condition: &str) -> bool {
+    match condition.strip_prefix("types@") {
+        Some(range) => satisfies_ts(range),
+        None => matches!(
+            condition,
+            "types" | "import" | "require" | "node" | "default"
+        ),
     }
 }
 
@@ -968,6 +972,17 @@ mod tests {
             &["legacy.d.ts", "main.d.ts"],
         );
         assert_eq!(resolved(&blocked, "lib").as_deref(), Some("legacy.d.ts"));
+
+        let ordered = package(
+            "ordered",
+            r#"{ "exports": { ".": {
+                "browser": "./browser.d.ts",
+                "import": { "types": "./esm.d.ts" },
+                "types": "./main.d.ts"
+            } } }"#,
+            &["browser.d.ts", "esm.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&ordered, "lib").as_deref(), Some("esm.d.ts"));
 
         let sugar = package(
             "sugar",
