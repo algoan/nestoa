@@ -215,6 +215,9 @@ pub struct SchemaCtx<'a> {
 impl<'a> SchemaCtx<'a> {
     pub fn ts_type_to_schema(&mut self, file: &Path, ty: &TsType) -> Value {
         match ty {
+            TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsSymbolKeyword => {
+                self.unsupported(file, ty, "symbol")
+            }
             TsType::TsKeywordType(k) => keyword_schema(k.kind),
             TsType::TsLitType(l) => match &l.lit {
                 TsLit::Str(s) => {
@@ -1209,7 +1212,8 @@ enum Member {
     /// A whole primitive type (`string`).
     Prim(String),
     Null,
-    /// `any`/`unknown`.
+    /// An unconstrained schema: `any`, `unknown` or `object`, which the
+    /// schema cannot tell apart.
     Any,
     /// Anything else, compared by its schema.
     Other(Value),
@@ -1281,7 +1285,10 @@ fn union_members(
 /// such as two different object types, or an unresolved one.
 fn assignable(m: &Member, to: &[Member]) -> Option<bool> {
     let opaque = |m: &Member| matches!(m, Member::Other(s) if s.get("x-unresolved").is_some());
-    if to.contains(&Member::Any) || to.contains(m) {
+    if to.contains(&Member::Any) {
+        return None;
+    }
+    if to.contains(m) {
         return Some(true);
     }
     match m {
@@ -1299,7 +1306,8 @@ fn assignable(m: &Member, to: &[Member]) -> Option<bool> {
 /// `Exclude<T, U>` (or `Extract<T, U>` when `keep_assignable`): the members of
 /// `from` that are not (are) assignable to `filter`. A `from` that loses no
 /// member is returned as written, so `Exclude<string, 'a'>` stays `string`.
-/// `None` when a member's assignability cannot be decided.
+/// `None` when a member's assignability cannot be decided. An unconstrained
+/// `T` is kept by `Exclude`, which can only narrow it.
 fn filter_union(
     schemas: &IndexMap<String, Value>,
     from: Value,
@@ -1311,7 +1319,7 @@ fn filter_union(
     let mut members = Vec::new();
     union_members(schemas, &from, &mut members, 0);
     if members.contains(&Member::Any) {
-        return Some(from);
+        return (!keep_assignable).then_some(from);
     }
     // `boolean` is `true | false`, so a boolean literal can split it.
     if to.iter().any(|t| matches!(t, Member::Lit("boolean", _))) {
@@ -2290,10 +2298,24 @@ mod tests {
              export type Present = Exclude<Item | null | undefined, null | undefined>;\n\
              export type Flag = Exclude<boolean | null, false>;\n\
              export type Mixed = Exclude<Item | 'none', string>;\n\
-             export type Unknown = Exclude<Item | Other, Item>;",
+             export type Unknown = Exclude<Item | Other, Item>;\n\
+             export type NotObject = Exclude<string | Item, object>;\n\
+             export type Symbols = Extract<string | symbol, symbol>;\n\
+             export type FromAny = Exclude<any, string>;",
             &[
-                "Letters", "Ok", "Name", "Failures", "Strings", "Never", "Present", "Flag",
-                "Mixed", "Unknown",
+                "Letters",
+                "Ok",
+                "Name",
+                "Failures",
+                "Strings",
+                "Never",
+                "Present",
+                "Flag",
+                "Mixed",
+                "Unknown",
+                "NotObject",
+                "Symbols",
+                "FromAny",
             ],
         );
         let item = json!({ "$ref": "#/components/schemas/Item" });
@@ -2310,7 +2332,12 @@ mod tests {
             // `Item` and `Other` are both objects: the schemas cannot tell
             // whether one is assignable to the other.
             json!({ "x-unresolved": "Exclude<…>" }),
+            // `object`, like `any`, lowers to `{}`: it filters nothing decidably.
+            json!({ "x-unresolved": "Exclude<…>" }),
+            json!({ "x-unresolved": "Extract<…>" }),
+            json!({}),
         ];
+        assert_eq!(schemas.len(), expected.len());
         for (got, want) in schemas.iter().zip(expected) {
             assert_eq!(*got, want);
         }
