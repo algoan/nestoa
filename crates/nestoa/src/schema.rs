@@ -848,16 +848,12 @@ impl<'a> SchemaCtx<'a> {
                 let mut required: Vec<String> = Vec::new();
                 let mut all_of: Vec<Value> = Vec::new();
                 for parent in &i.extends {
-                    if let Expr::Ident(id) = &*parent.expr {
-                        let name = id.sym.to_string();
-                        let dummy_ref = TsTypeRef {
-                            span: parent.span,
-                            type_name: TsEntityName::Ident(id.clone()),
-                            type_params: parent.type_args.clone(),
-                        };
-                        all_of.push(self.type_ref_schema(file, &dummy_ref));
-                        let _ = name;
-                    }
+                    all_of.push(
+                        self.heritage_schema(file, &parent.expr, parent.type_args.as_deref())
+                            .unwrap_or_else(
+                                || json!({ "x-unresolved": heritage_label(&parent.expr) }),
+                            ),
+                    );
                 }
                 for el in &i.body.body {
                     if let TsTypeElement::TsPropertySignature(p) = el {
@@ -1922,6 +1918,27 @@ mod tests {
         assert!(own.get("properties").and_then(|p| p.get("b")).is_some());
         // The base class is collected into components for the $ref to point at.
         assert!(ctx.components.schemas.contains_key("Base"));
+    }
+
+    #[test]
+    fn interface_extends_a_namespace_member_or_stays_visible() {
+        let [known, unknown] = lower_with(
+            &[("base.ts", "export interface Base { a: string; }")],
+            "import * as Models from './base';\n\
+             export interface Known extends Models.Base { b: number; }\n\
+             export interface Unknown extends Missing.Base { b: number; }",
+            &["Known", "Unknown"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            known["allOf"][0],
+            json!({ "$ref": "#/components/schemas/Base" })
+        );
+        assert_eq!(
+            unknown["allOf"][0],
+            json!({ "x-unresolved": "Missing.Base" })
+        );
     }
 
     #[test]
