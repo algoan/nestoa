@@ -685,19 +685,20 @@ pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
 /// whose target `resolve` finds wins, and one mapped to `null` blocks the entry.
 fn dts_from_exports_value(
     v: &serde_json::Value,
+    mode: ImportMode,
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     match v {
         serde_json::Value::String(target) => resolve(target),
         serde_json::Value::Array(alternatives) => alternatives
             .iter()
-            .find_map(|v| dts_from_exports_value(v, resolve)),
+            .find_map(|v| dts_from_exports_value(v, mode, resolve)),
         serde_json::Value::Object(map) => {
-            for (_, v) in map.iter().filter(|(k, _)| condition_applies(k)) {
+            for (_, v) in map.iter().filter(|(k, _)| condition_applies(k, mode)) {
                 if v.is_null() {
                     return None;
                 }
-                if let Some(found) = dts_from_exports_value(v, resolve) {
+                if let Some(found) = dts_from_exports_value(v, mode, resolve) {
                     return Some(found);
                 }
             }
@@ -707,22 +708,48 @@ fn dts_from_exports_value(
     }
 }
 
-/// The `exports` conditions TypeScript enables when resolving declarations.
-/// The importer's module format is unknown, so `import` and `require` both apply.
-fn condition_applies(condition: &str) -> bool {
+/// The module format of an importing file, as far as its extension tells.
+#[derive(Clone, Copy, PartialEq)]
+enum ImportMode {
+    Esm,
+    CommonJs,
+    /// A `.ts` file's format depends on tsconfig and the nearest `package.json`.
+    Unknown,
+}
+
+impl ImportMode {
+    fn of(importer: &Path) -> Self {
+        match importer.extension().and_then(|e| e.to_str()) {
+            Some("mts" | "mjs") => Self::Esm,
+            Some("cts" | "cjs") => Self::CommonJs,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The `exports` conditions TypeScript enables when resolving declarations:
+/// `import` or `require` by the importer's format, both when it is unknown.
+fn condition_applies(condition: &str, mode: ImportMode) -> bool {
     match condition.strip_prefix("types@") {
         Some(range) => satisfies_ts(range),
-        None => matches!(
-            condition,
-            "types" | "import" | "require" | "node" | "default"
-        ),
+        None => match condition {
+            "types" | "node" | "default" => true,
+            "import" => mode != ImportMode::CommonJs,
+            "require" => mode != ImportMode::Esm,
+            _ => false,
+        },
     }
 }
 
 /// Resolve a package subpath to its declaration entry via the `exports` map:
 /// the best-matching key (exact, then the longest `*` pattern prefix, as Node
 /// picks it), its `*` substituted into the target, which must exist.
-fn types_from_exports(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) -> Option<PathBuf> {
+fn types_from_exports(
+    json: &serde_json::Value,
+    pkg_dir: &Path,
+    subpath: &str,
+    mode: ImportMode,
+) -> Option<PathBuf> {
     let exports = json.get("exports")?;
     let key = if subpath.is_empty() {
         ".".to_string()
@@ -739,12 +766,12 @@ fn types_from_exports(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) -
     };
     if shorthand {
         return (key == ".")
-            .then(|| dts_from_exports_value(exports, &|t| target_in(t, "")))
+            .then(|| dts_from_exports_value(exports, mode, &|t| target_in(t, "")))
             .flatten();
     }
     let map = exports.as_object()?;
     let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key, true)?;
-    dts_from_exports_value(value, &|t| target_in(t, &captured))
+    dts_from_exports_value(value, mode, &|t| target_in(t, &captured))
 }
 
 /// The TypeScript version `typesVersions` ranges are evaluated against.
@@ -843,13 +870,14 @@ fn declaration_file(path: &Path) -> Option<PathBuf> {
 /// subpaths), so its exported types can be parsed. Returns the `.d.ts` path.
 pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<PathBuf> {
     let (pkg, subpath) = split_package_specifier(specifier);
+    let mode = ImportMode::of(current_file);
     let pkg_dir = find_package_dir(current_file.parent()?, &pkg)?;
     let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
     let in_package = |rel: &str| declaration_file(&pkg_dir.join(rel.trim_start_matches("./")));
     if subpath.is_empty() {
-        if let Some(found) = types_from_exports(&json, &pkg_dir, "") {
+        if let Some(found) = types_from_exports(&json, &pkg_dir, "", mode) {
             return Some(found);
         }
         let typings = ["typings", "types"]
@@ -863,7 +891,7 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
             .or_else(|| typings.map_or_else(main, in_package))
             .or_else(|| in_package(entry));
     }
-    types_from_exports(&json, &pkg_dir, &subpath)
+    types_from_exports(&json, &pkg_dir, &subpath, mode)
         .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
         .or_else(|| declaration_file(&pkg_dir.join(&subpath)))
 }
@@ -1065,6 +1093,14 @@ mod tests {
                 "{specifier}"
             );
         }
+
+        // `.d.cts` names its own format, so the `require` branch is the one that applies.
+        let importer = substituted.with_file_name("file.cts");
+        std::fs::write(&importer, "").unwrap();
+        assert_eq!(
+            resolved(&importer, "lib/esm").as_deref(),
+            Some("cjs/index.d.cts")
+        );
 
         let main = package(
             "main",
