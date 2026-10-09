@@ -647,13 +647,20 @@ fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
             alternatives.iter().find_map(dts_from_exports_value)
         }
         serde_json::Value::Object(map) => {
-            for key in ["types", "typings"] {
-                if let Some(found) = map.get(key).and_then(dts_from_exports_value) {
+            // `types@<range>` only applies to the TypeScript versions it names.
+            let applies = |k: &str| k.strip_prefix("types@").is_none_or(satisfies_ts);
+            let types_like = map.iter().filter(|(k, _)| {
+                matches!(k.as_str(), "types" | "typings") || k.starts_with("types@") && applies(k)
+            });
+            for (_, v) in types_like {
+                if let Some(found) = dts_from_exports_value(v) {
                     return Some(found);
                 }
             }
             // Fall back to any nested condition that yields a .d.ts.
-            map.values().find_map(dts_from_exports_value)
+            map.iter()
+                .filter(|(k, _)| applies(k))
+                .find_map(|(_, v)| dts_from_exports_value(v))
         }
         _ => None,
     }
@@ -939,6 +946,17 @@ mod tests {
             resolved(&consumer, "lib/hidden/c").as_deref(),
             Some("hidden/c.d.ts")
         );
+
+        let versioned = package(
+            "versioned",
+            r#"{ "exports": { ".": {
+                "types@<4.0": "./old.d.ts",
+                "types@>=5.9": "./new.d.ts",
+                "types": "./main.d.ts"
+            } } }"#,
+            &["old.d.ts", "new.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&versioned, "lib").as_deref(), Some("new.d.ts"));
 
         let sugar = package(
             "sugar",
