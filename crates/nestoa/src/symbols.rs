@@ -653,6 +653,10 @@ fn dts_from_exports_value(v: &serde_json::Value) -> Option<String> {
                 matches!(k.as_str(), "types" | "typings") || k.starts_with("types@") && applies(k)
             });
             for (_, v) in types_like {
+                // A matching condition mapped to `null` blocks the entry, as in TypeScript.
+                if v.is_null() {
+                    return None;
+                }
                 if let Some(found) = dts_from_exports_value(v) {
                     return Some(found);
                 }
@@ -954,6 +958,16 @@ mod tests {
             &["old.d.ts", "new.d.ts", "main.d.ts"],
         );
         assert_eq!(resolved(&versioned, "lib").as_deref(), Some("new.d.ts"));
+
+        let blocked = package(
+            "blocked",
+            r#"{ "typings": "./legacy.d.ts", "exports": { ".": {
+                "types@>=5.9": null,
+                "types": "./main.d.ts"
+            } } }"#,
+            &["legacy.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&blocked, "lib").as_deref(), Some("legacy.d.ts"));
 
         let sugar = package(
             "sugar",
