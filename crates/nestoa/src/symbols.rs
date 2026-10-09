@@ -680,7 +680,7 @@ fn types_from_exports(json: &serde_json::Value, subpath: &str) -> Option<String>
             .then(|| dts_from_exports_value(exports))
             .flatten();
     }
-    let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key)?;
+    let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key, true)?;
     Some(dts_from_exports_value(value)?.replace('*', &captured))
 }
 
@@ -694,7 +694,7 @@ fn types_from_versions(json: &serde_json::Value, pkg_dir: &Path, subpath: &str) 
         .values()
         .next()?
         .as_object()?;
-    let (targets, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), subpath)?;
+    let (targets, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), subpath, false)?;
     targets
         .as_array()?
         .iter()
@@ -853,10 +853,21 @@ mod tests {
             "exports",
             r#"{ "exports": {
                 "./*": { "types": "./dist/*.d.ts" },
+                "./*.js": { "types": "./js/*.d.ts" },
                 "./deep/*": { "types": "./types/deep/*.d.ts" },
                 "./hidden/*": null
             } }"#,
-            &["dist/a.d.ts", "types/deep/b.d.ts", "hidden/c.d.ts"],
+            &[
+                "dist/a.d.ts",
+                "types/deep/b.d.ts",
+                "hidden/c.d.ts",
+                "js/d.d.ts",
+            ],
+        );
+        // Same prefix: the longer pattern wins, whatever the key order.
+        assert_eq!(
+            resolved(&consumer, "lib/d.js").as_deref(),
+            Some("js/d.d.ts")
         );
         assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));
         assert_eq!(
@@ -881,10 +892,12 @@ mod tests {
     fn types_versions_patterns_and_fallback_targets() {
         let consumer = package(
             "versions",
-            r#"{ "typesVersions": { ">=4.2": {
-                "sub/*": ["missing/*", "types/sub/*"],
-                "*": ["dist/*"]
-            } } }"#,
+            r#"{ "typesVersions": {
+                ">=4.2": {
+                    "sub/*": ["missing/*", "types/sub/*"],
+                    "*": ["dist/*"]
+                }
+            } }"#,
             &["dist/a.d.ts", "dist/dir/index.d.ts", "types/sub/b.d.ts"],
         );
         assert_eq!(resolved(&consumer, "lib/a").as_deref(), Some("dist/a.d.ts"));

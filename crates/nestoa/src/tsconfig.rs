@@ -35,7 +35,7 @@ impl TsPaths {
     /// Only the best-matching pattern's targets are tried, as TypeScript does.
     pub fn resolve(&self, specifier: &str) -> Option<PathBuf> {
         let patterns = self.entries.iter().map(|(p, t)| (p.as_str(), t));
-        let (targets, captured) = best_match(patterns, specifier)?;
+        let (targets, captured) = best_match(patterns, specifier, false)?;
         targets.iter().find_map(|target| {
             let rel = target.replace('*', &captured);
             resolve_file_with_exts(&self.base_url.join(rel.trim_start_matches("./")))
@@ -45,18 +45,28 @@ impl TsPaths {
 
 /// The pattern that matches `specifier` best, with its value and the text its
 /// `*` captured: an exact pattern first, then the wildcard with the longest
-/// prefix. This is how both tsconfig `paths` and package.json `exports` pick.
+/// prefix. TypeScript (`paths`, `typesVersions`) keeps the first of two equal
+/// prefixes; Node (`exports`) prefers the longer pattern, so `./*.js` beats
+/// `./*` — `longer_pattern_wins_ties` selects that.
 pub(crate) fn best_match<'a, T>(
     patterns: impl Iterator<Item = (&'a str, T)>,
     specifier: &str,
+    longer_pattern_wins_ties: bool,
 ) -> Option<(T, String)> {
-    let mut best: Option<(usize, T, String)> = None;
+    let mut best: Option<((usize, usize), T, String)> = None;
     for (pattern, value) in patterns {
         let Some(captured) = match_pattern(pattern, specifier) else {
             continue;
         };
         let rank = match pattern.find('*') {
-            Some(star) => star,
+            Some(star) => (
+                star,
+                if longer_pattern_wins_ties {
+                    pattern.len()
+                } else {
+                    0
+                },
+            ),
             None => return Some((value, captured)),
         };
         if best.as_ref().is_none_or(|(r, ..)| rank > *r) {
