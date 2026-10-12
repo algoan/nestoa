@@ -17,7 +17,7 @@
 //! |------------------------------------------|------------------------------------|
 //! | `type: [T, "null"]`                      | `type: T` + `nullable: true`       |
 //! | `enum: [a, b, null]`                     | `enum: [a, b]` + `nullable: true`  |
-//! | `oneOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
+//! | `anyOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
 //! | `type: "null"` on its own                | unconstrained — the type is lost   |
 //! | `type: [A, B]` (multi-type)              | `anyOf: [{type: A}, {type: B}]`    |
 //! | `const: v`                               | `enum: [v]`                        |
@@ -87,7 +87,7 @@ pub fn downgrade_to_30(doc: &mut Value) {
 /// 3.0.3 allows only a single string `type`, so any array has to go. The
 /// analyser itself only ever produces `[T, "null"]` (`make_nullable` widens one
 /// concrete type), but a schema handed over verbatim in the config can carry a
-/// genuine multi-type array; that becomes a `oneOf` of one-type branches, and
+/// genuine multi-type array; that becomes an `anyOf` of one-type branches, and
 /// takes the same nullability loss as any other union.
 fn downgrade_null_type(map: &mut Map<String, Value>) {
     let Some(Value::Array(types)) = map.get("type") else {
