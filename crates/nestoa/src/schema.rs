@@ -3,14 +3,14 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
-use swc_common::Spanned;
+use swc_common::{Span, Spanned};
 use swc_ecma_ast::{
     Expr, Lit, TsArrayType, TsEntityName, TsKeywordTypeKind, TsLit, TsType, TsTypeElement,
     TsTypeLit, TsTypeOperatorOp, TsTypeParamInstantiation, TsTypeQueryExpr, TsTypeRef,
     TsUnionOrIntersectionType,
 };
 
-use crate::jsdoc::{JsDoc, jsdoc_before};
+use crate::jsdoc::JsDoc;
 use crate::symbols::{EnumValue, Project, Symbol, enum_member_values};
 
 /// Mutable container for the components/schemas section of the OpenAPI doc.
@@ -305,6 +305,10 @@ impl<'a> SchemaCtx<'a> {
         let schema = self.ts_type_to_schema(file, obj);
         let mut obj = flatten_object(&self.components.schemas, &schema, 0)?;
         obj.get_mut("properties")?.as_object_mut()?.remove(&key)
+    }
+
+    fn jsdoc(&self, file: &Path, span: Span) -> Option<JsDoc> {
+        self.project.files.get(file)?.docs.jsdoc(span.lo)
     }
 
     /// A type form nestoa does not lower, marked with its source text (or
@@ -774,13 +778,7 @@ impl<'a> SchemaCtx<'a> {
                     _ => continue,
                 };
                 // `@internal`/`@private` members never reach the wire.
-                if self
-                    .sources
-                    .get(file)
-                    .zip(self.file_starts.get(file))
-                    .and_then(|(src, file_start)| jsdoc_before(src, *file_start, p.span))
-                    .is_some_and(|d| d.internal)
-                {
+                if self.jsdoc(file, p.span).is_some_and(|d| d.internal) {
                     continue;
                 }
                 let schema = p
@@ -961,11 +959,7 @@ impl<'a> SchemaCtx<'a> {
                             Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
                             _ => continue,
                         };
-                        let doc = self
-                            .sources
-                            .get(file)
-                            .zip(self.file_starts.get(file))
-                            .and_then(|(src, file_start)| jsdoc_before(src, *file_start, p.span));
+                        let doc = self.jsdoc(file, p.span);
                         // `@internal`/`@private` members never reach the wire.
                         if doc.as_ref().is_some_and(|d| d.internal) {
                             continue;
@@ -996,10 +990,7 @@ impl<'a> SchemaCtx<'a> {
                         Value::Array(required.into_iter().map(Value::String).collect()),
                     );
                 }
-                if let (Some(src), Some(file_start)) =
-                    (self.sources.get(file), self.file_starts.get(file))
-                    && let Some(doc) = jsdoc_before(src, *file_start, i.span)
-                {
+                if let Some(doc) = self.jsdoc(file, i.span) {
                     attach_doc_to_map(&mut object, &doc);
                 }
                 let object_schema = Value::Object(object);
@@ -1050,10 +1041,7 @@ impl<'a> SchemaCtx<'a> {
                         obj.insert("x-unresolved".into(), json!(e.id.sym.to_string()));
                     }
                 }
-                if let (Some(src), Some(file_start)) =
-                    (self.sources.get(file), self.file_starts.get(file))
-                    && let Some(doc) = jsdoc_before(src, *file_start, e.span)
-                {
+                if let Some(doc) = self.jsdoc(file, e.span) {
                     attach_doc_to_map(&mut obj, &doc);
                 }
                 Value::Object(obj)
@@ -1091,11 +1079,7 @@ impl<'a> SchemaCtx<'a> {
                             }
                             _ => continue,
                         };
-                        let doc = self
-                            .sources
-                            .get(file)
-                            .zip(self.file_starts.get(file))
-                            .and_then(|(src, file_start)| jsdoc_before(src, *file_start, p.span));
+                        let doc = self.jsdoc(file, p.span);
                         // `@internal`/`@private` members never reach the wire.
                         if doc.as_ref().is_some_and(|d| d.internal) {
                             continue;
@@ -1131,10 +1115,7 @@ impl<'a> SchemaCtx<'a> {
                         Value::Array(required.into_iter().map(Value::String).collect()),
                     );
                 }
-                if let (Some(src), Some(file_start)) =
-                    (self.sources.get(file), self.file_starts.get(file))
-                    && let Some(doc) = jsdoc_before(src, *file_start, c.class.span)
-                {
+                if let Some(doc) = self.jsdoc(file, c.class.span) {
                     attach_doc_to_map(&mut obj, &doc);
                 }
                 let object_schema = Value::Object(obj);

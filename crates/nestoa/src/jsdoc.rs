@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use swc_common::{BytePos, Span};
+use swc_common::BytePos;
+use swc_common::comments::{Comment, CommentKind, SingleThreadedComments};
 
 /// Parsed JSDoc block.
 #[derive(Debug, Default, Clone)]
@@ -161,141 +162,83 @@ fn parse_throws(body: &str) -> Option<(u16, Option<String>)> {
     Some((status, desc))
 }
 
-/// Look up the JSDoc block immediately preceding `span` in `source`.
-/// `file_start` is the global BytePos of byte 0 of the file in the source map.
-pub fn jsdoc_before(source: &str, file_start: BytePos, span: Span) -> Option<JsDoc> {
-    let span_start = (span.lo.0.saturating_sub(file_start.0)) as usize;
-    if span_start == 0 || span_start > source.len() {
-        return None;
-    }
-    let head = &source[..span_start];
-    // Scan back, skipping only whitespace and decorators, until we find a /** ... */ block.
-    let bytes = head.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 {
-        // Trim trailing whitespace
-        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
-            i -= 1;
-        }
-        // A decorator: skip back over the @Name(...) form. Cheap heuristic: if line ends with ')', skip
-        // back to matching '(', then keep going until we find @.
-        if i == 0 {
-            return None;
-        }
-        // A block comment ends here. Only a `/**` one is JSDoc; a plain `/* */`
-        // between the JSDoc and the member is skipped, as TypeScript does.
-        if i >= 2 && &bytes[i - 2..i] == b"*/" {
-            let end = i - 2;
-            let after_prev_close = head[..end].rfind("*/").map_or(0, |p| p + 2);
-            let open = after_prev_close
-                + head[after_prev_close..end]
-                    .match_indices("/*")
-                    .map(|(p, _)| p)
-                    .find(|&p| opens_comment(head, after_prev_close + p))?;
-            let block = &head[open..end];
-            if block.starts_with("/**") && !block.starts_with("/**/") {
-                return Some(JsDoc::parse(&block[3..]));
-            }
-            i = open;
-            continue;
-        }
-        // Walk back over a decorator: must start with `@` and may include (...) args
-        // We rewind until we see either a /** end, a `;`/`}`, the start of file, or fail.
-        // Decorators may span multiple lines; we use bracket matching for `(...)` if present.
-        if bytes[i - 1] == b')' {
-            // bracket-match back
-            let mut depth: i32 = 0;
-            let mut k = i;
-            while k > 0 {
-                k -= 1;
-                match bytes[k] {
-                    b')' => depth += 1,
-                    b'(' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // After `(` continues identifier and `@`
-            // Walk back through identifier chars and dots
-            while k > 0 {
-                let c = bytes[k - 1];
-                if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' {
-                    k -= 1;
-                } else {
-                    break;
-                }
-            }
-            if k > 0 && bytes[k - 1] == b'@' {
-                i = k - 1;
-                continue;
-            }
-            return None;
-        }
-        // Or a bare `@Foo` decorator
-        // Walk back through identifier
-        let mut k = i;
-        while k > 0 {
-            let c = bytes[k - 1];
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' {
-                k -= 1;
-            } else {
-                break;
-            }
-        }
-        if k < i && k > 0 && bytes[k - 1] == b'@' {
-            i = k - 1;
-            continue;
-        }
-        return None;
-    }
-    None
+/// One file's comments, indexed for JSDoc lookup.
+#[derive(Debug, Default)]
+pub struct DocComments {
+    /// Each comment, keyed by the first non-whitespace position after it.
+    before: HashMap<BytePos, Comment>,
 }
 
-/// Whether the `/*` at `pos` opens a comment rather than sitting in a string
-/// or a `//` comment earlier on its line. A line-local heuristic (quotes are
-/// balanced per line), not a lexer: enough to find a member's leading comment.
-fn opens_comment(source: &str, pos: usize) -> bool {
-    let line = &source[source[..pos].rfind('\n').map_or(0, |p| p + 1)..pos];
-    let mut open_quote: Option<char> = None;
-    let mut escaped = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (open_quote, c) {
-            (Some(_), _) if escaped => escaped = false,
-            (Some(_), '\\') => escaped = true,
-            (Some(q), c) if c == q => open_quote = None,
-            (None, '"' | '\'' | '`') => open_quote = Some(c),
-            (None, '/') if chars.peek() == Some(&'/') => return false,
-            _ => {}
-        }
+impl DocComments {
+    pub fn new(src: &str, file_start: BytePos, comments: SingleThreadedComments) -> Self {
+        let (leading, trailing) = comments.take_all();
+        let before = [leading, trailing]
+            .into_iter()
+            .flat_map(|m| m.take().into_values().flatten())
+            .map(|c| {
+                let hi = (c.span.hi.0 - file_start.0) as usize;
+                let gap = src[hi..].len() - src[hi..].trim_start().len();
+                (BytePos(c.span.hi.0 + gap as u32), c)
+            })
+            .collect();
+        Self { before }
     }
-    open_quote.is_none()
+
+    /// The JSDoc of the node starting at `lo`: the nearest `/** */` block among
+    /// the comments directly before it, as TypeScript picks it.
+    pub fn jsdoc(&self, lo: BytePos) -> Option<JsDoc> {
+        let mut pos = lo;
+        while let Some(c) = self.before.get(&pos) {
+            if c.kind == CommentKind::Block
+                && let Some(body) = c.text.strip_prefix('*')
+            {
+                return Some(JsDoc::parse(body));
+            }
+            pos = c.span.lo;
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The JSDoc `jsdoc_before` finds for the member starting at `marker`.
+    use swc_common::{FileName, SourceMap, sync::Lrc};
+    use swc_ecma_ast::EsVersion;
+    use swc_ecma_parser::{StringInput, Syntax, TsSyntax, lexer::Lexer};
+
+    /// The JSDoc of the token starting at `marker`. Only lexes, so a fragment
+    /// that isn't a valid module still works.
     fn doc_before(source: &str, marker: &str) -> Option<JsDoc> {
-        let lo = source.find(marker).expect("marker") as u32;
-        jsdoc_before(source, BytePos(0), Span::new(BytePos(lo), BytePos(lo)))
+        let cm: Lrc<SourceMap> = Default::default();
+        let fm = cm.new_source_file(FileName::Anon.into(), source.to_string());
+        let comments = SingleThreadedComments::default();
+        let syntax = Syntax::Typescript(TsSyntax {
+            decorators: true,
+            ..Default::default()
+        });
+        Lexer::new(
+            syntax,
+            EsVersion::EsNext,
+            StringInput::from(&*fm),
+            Some(&comments),
+        )
+        .for_each(drop);
+        let lo = fm.start_pos.0 + source.find(marker).expect("marker") as u32;
+        DocComments::new(source, fm.start_pos, comments).jsdoc(BytePos(lo))
     }
 
     #[test]
     fn plain_block_comment_never_borrows_an_earlier_jsdoc() {
         let source = "/** List */\nlist() {}\n/* plain */\n@Delete(':id')\nremove() {}";
-        assert!(doc_before(source, "remove").is_none());
+        assert!(doc_before(source, "@Delete").is_none());
     }
 
     #[test]
     fn plain_block_comment_after_a_jsdoc_is_skipped() {
         let source = "/** Read */\n/* note */\n@Get()\nread() {}";
-        let doc = doc_before(source, "read").expect("doc");
+        let doc = doc_before(source, "@Get").expect("doc");
         assert_eq!(doc.summary.as_deref(), Some("Read"));
     }
 
@@ -307,6 +250,13 @@ mod tests {
         let url = "const u = \"http://x\"; /** Write */\nwrite() {}";
         let doc = doc_before(url, "write").expect("doc");
         assert_eq!(doc.summary.as_deref(), Some("Write"));
+    }
+
+    #[test]
+    fn comment_opener_in_a_multi_line_template_is_ignored() {
+        let source = "const m = `\n/*`;\n/** Read */\nread() {}";
+        let doc = doc_before(source, "read").expect("doc");
+        assert_eq!(doc.summary.as_deref(), Some("Read"));
     }
 
     #[test]

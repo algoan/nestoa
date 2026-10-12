@@ -2,14 +2,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use swc_common::{FileName, SourceMap, sync::Lrc};
+use swc_common::{SourceMap, comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast::{EsVersion, Module};
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+
+use crate::jsdoc::DocComments;
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
     pub path: PathBuf,
     pub module: Arc<Module>,
+    pub docs: Arc<DocComments>,
 }
 
 pub struct ParsingContext {
@@ -30,11 +33,11 @@ impl ParsingContext {
             .source_map
             .load_file(path)
             .with_context(|| format!("loading {}", path.display()))?;
-        let _ = FileName::Real(path.to_path_buf());
         let name = path.to_string_lossy();
         let is_dts = [".d.ts", ".d.mts", ".d.cts"]
             .iter()
             .any(|ext| name.ends_with(ext));
+        let comments = SingleThreadedComments::default();
         let lexer = Lexer::new(
             Syntax::Typescript(TsSyntax {
                 tsx: path.extension().and_then(|s| s.to_str()) == Some("tsx"),
@@ -45,7 +48,7 @@ impl ParsingContext {
             }),
             EsVersion::EsNext,
             StringInput::from(&*fm),
-            None,
+            Some(&comments),
         );
         let mut parser = Parser::new_from(lexer);
         let module = parser
@@ -54,6 +57,7 @@ impl ParsingContext {
         Ok(ParsedFile {
             path: path.to_path_buf(),
             module: Arc::new(module),
+            docs: Arc::new(DocComments::new(&fm.src, fm.start_pos, comments)),
         })
     }
 }
