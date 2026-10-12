@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use swc_ecma_ast::{
-    ClassDecl, Decl, DefaultDecl, ExportDecl, ExportDefaultDecl, ExportSpecifier, ImportDecl,
-    ImportSpecifier, ModuleDecl, ModuleItem, Stmt, TsEnumDecl, TsInterfaceDecl, TsTypeAliasDecl,
+    Class, Decl, DefaultDecl, ExportDecl, ExportDefaultDecl, ExportSpecifier, Ident, ImportDecl,
+    ImportSpecifier, Module, ModuleDecl, ModuleItem, Stmt, TsEnumDecl, TsInterfaceDecl,
+    TsTypeAliasDecl,
 };
 
 use crate::parse::ParsedFile;
@@ -16,10 +17,10 @@ use crate::tsconfig::best_match;
 /// within the file.
 #[derive(Clone)]
 pub enum Symbol {
-    Interface(Arc<TsInterfaceDecl>),
-    TypeAlias(Arc<TsTypeAliasDecl>),
-    Enum(Arc<TsEnumDecl>),
-    Class(Arc<ClassDecl>),
+    Interface(Shared<TsInterfaceDecl>),
+    TypeAlias(Shared<TsTypeAliasDecl>),
+    Enum(Shared<TsEnumDecl>),
+    Class(Shared<Class>),
 }
 
 impl Symbol {
@@ -29,8 +30,56 @@ impl Symbol {
             Symbol::Interface(i) => i.id.sym.to_string(),
             Symbol::TypeAlias(t) => t.id.sym.to_string(),
             Symbol::Enum(e) => e.id.sym.to_string(),
-            Symbol::Class(c) => c.ident.sym.to_string(),
+            Symbol::Class(c) => {
+                class_of(c.item()).map_or_else(String::new, |(id, _)| id.sym.to_string())
+            }
         }
+    }
+}
+
+/// A top-level declaration of a parsed module, shared with the module rather
+/// than copied out of it. Dereferences to the declaration.
+#[derive(Clone)]
+pub struct Shared<T: 'static> {
+    module: Arc<Module>,
+    index: usize,
+    get: fn(&ModuleItem) -> Option<&T>,
+}
+
+impl<T> Shared<T> {
+    fn item(&self) -> &ModuleItem {
+        &self.module.body[self.index]
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        (self.get)(self.item()).expect("a symbol's module item holds its declaration")
+    }
+}
+
+fn declaration(item: &ModuleItem) -> Option<&Decl> {
+    match item {
+        ModuleItem::Stmt(Stmt::Decl(decl))
+        | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl { decl, .. })) => Some(decl),
+        _ => None,
+    }
+}
+
+/// A named class declaration, `export default class X` included.
+fn class_of(item: &ModuleItem) -> Option<(&Ident, &Class)> {
+    match (declaration(item), item) {
+        (Some(Decl::Class(c)), _) => Some((&c.ident, &c.class)),
+        (
+            None,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(ExportDefaultDecl {
+                decl: DefaultDecl::Class(c),
+                ..
+            })),
+        ) => Some((c.ident.as_ref()?, &c.class)),
+        _ => None,
     }
 }
 
@@ -368,26 +417,15 @@ impl Project {
 
 pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
     let mut fs = FileSymbols::default();
-    for item in &parsed.module.body {
+    for (index, item) in parsed.module.body.iter().enumerate() {
+        if let Some((name, symbol)) = declared_symbol(&parsed.module, index) {
+            fs.declared.insert(name, symbol);
+        }
         match item {
-            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_decl(decl, &mut fs),
+            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, &mut fs),
             ModuleItem::ModuleDecl(md) => match md {
                 ModuleDecl::Import(i) => collect_import(i, &mut fs),
-                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_decl(decl, &mut fs),
-                ModuleDecl::ExportDefaultDecl(ExportDefaultDecl { decl, .. }) => {
-                    if let DefaultDecl::Class(cd) = decl
-                        && let Some(ident) = &cd.ident
-                    {
-                        fs.declared.insert(
-                            ident.sym.to_string(),
-                            Symbol::Class(Arc::new(ClassDecl {
-                                ident: ident.clone(),
-                                declare: false,
-                                class: cd.class.clone(),
-                            })),
-                        );
-                    }
-                }
+                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_consts(decl, &mut fs),
                 ModuleDecl::ExportAll(ea) => {
                     fs.star_re_exports
                         .push(ea.src.value.to_string_lossy().into_owned());
@@ -438,41 +476,74 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
     fs
 }
 
-fn collect_decl(decl: &Decl, fs: &mut FileSymbols) {
-    match decl {
-        Decl::Class(c) => {
-            fs.declared
-                .insert(c.ident.sym.to_string(), Symbol::Class(Arc::new(c.clone())));
+/// The named class, interface, type alias or enum `module.body[index]`
+/// declares, if any.
+fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol)> {
+    fn share<T>(
+        module: &Arc<Module>,
+        index: usize,
+        get: fn(&ModuleItem) -> Option<&T>,
+    ) -> Shared<T> {
+        Shared {
+            module: module.clone(),
+            index,
+            get,
         }
-        Decl::TsInterface(i) => {
-            fs.declared.insert(
-                i.id.sym.to_string(),
-                Symbol::Interface(Arc::new(*i.clone())),
-            );
+    }
+    fn class(item: &ModuleItem) -> Option<&Class> {
+        class_of(item).map(|(_, c)| c)
+    }
+    fn interface(item: &ModuleItem) -> Option<&TsInterfaceDecl> {
+        match declaration(item)? {
+            Decl::TsInterface(i) => Some(i),
+            _ => None,
         }
-        Decl::TsTypeAlias(t) => {
-            fs.declared.insert(
-                t.id.sym.to_string(),
-                Symbol::TypeAlias(Arc::new(*t.clone())),
-            );
+    }
+    fn alias(item: &ModuleItem) -> Option<&TsTypeAliasDecl> {
+        match declaration(item)? {
+            Decl::TsTypeAlias(t) => Some(t),
+            _ => None,
         }
-        Decl::TsEnum(e) => {
-            fs.declared
-                .insert(e.id.sym.to_string(), Symbol::Enum(Arc::new(*e.clone())));
+    }
+    fn enumeration(item: &ModuleItem) -> Option<&TsEnumDecl> {
+        match declaration(item)? {
+            Decl::TsEnum(e) => Some(e),
+            _ => None,
         }
-        Decl::Var(v) => {
-            // Record numeric `const NAME = <literal>` so decorator arguments that
-            // reference the constant (e.g. `@HttpCode(MULTI_STATUS)`) can be
-            // resolved to their value, including across module boundaries.
-            for d in &v.decls {
-                if let (swc_ecma_ast::Pat::Ident(id), Some(init)) = (&d.name, &d.init)
-                    && let Some(n) = numeric_expr(init)
-                {
-                    fs.const_numbers.insert(id.id.sym.to_string(), n);
-                }
-            }
+    }
+    let item = &module.body[index];
+    if let Some((ident, _)) = class_of(item) {
+        let symbol = Symbol::Class(share(module, index, class));
+        return Some((ident.sym.to_string(), symbol));
+    }
+    Some(match declaration(item)? {
+        Decl::TsInterface(i) => (
+            i.id.sym.to_string(),
+            Symbol::Interface(share(module, index, interface)),
+        ),
+        Decl::TsTypeAlias(t) => (
+            t.id.sym.to_string(),
+            Symbol::TypeAlias(share(module, index, alias)),
+        ),
+        Decl::TsEnum(e) => (
+            e.id.sym.to_string(),
+            Symbol::Enum(share(module, index, enumeration)),
+        ),
+        _ => return None,
+    })
+}
+
+/// Record numeric `const NAME = <literal>` so decorator arguments that
+/// reference the constant (e.g. `@HttpCode(MULTI_STATUS)`) can be resolved to
+/// their value, including across module boundaries.
+fn collect_consts(decl: &Decl, fs: &mut FileSymbols) {
+    let Decl::Var(v) = decl else { return };
+    for d in &v.decls {
+        if let (swc_ecma_ast::Pat::Ident(id), Some(init)) = (&d.name, &d.init)
+            && let Some(n) = numeric_expr(init)
+        {
+            fs.const_numbers.insert(id.id.sym.to_string(), n);
         }
-        _ => {}
     }
 }
 
@@ -1060,6 +1131,42 @@ mod tests {
         std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
         std::fs::write(&consumer, "").unwrap();
         consumer
+    }
+
+    #[test]
+    fn symbols_share_the_parsed_declarations() {
+        let dir = std::env::temp_dir().join(format!("nestoa-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dto.ts");
+        std::fs::write(
+            &file,
+            "import { X } from './x';\n\
+             export default class Account<T> { id: string; }\n\
+             export interface Owner { name: string; }\n\
+             type Id = string;\n\
+             export enum Kind { A = 'a' }\n",
+        )
+        .unwrap();
+        let mut project = Project::default();
+        project.add(
+            crate::parse::ParsingContext::default()
+                .parse_file(&file)
+                .unwrap(),
+        );
+
+        let Some((_, Symbol::Class(class))) = project.resolve(&file, "Account") else {
+            panic!("default-exported class");
+        };
+        assert!(class.type_params.is_some());
+        let names: Vec<_> = ["Account", "Owner", "Id", "Kind"]
+            .iter()
+            .map(|n| project.resolve(&file, n).map(|(_, s)| s.name()))
+            .collect();
+        assert_eq!(
+            names,
+            ["Account", "Owner", "Id", "Kind"].map(|n| Some(n.to_string()))
+        );
     }
 
     #[test]

@@ -137,7 +137,7 @@ pub fn rewrite_response(
         else {
             continue;
         };
-        let class = &class_decl.class;
+        let class = &*class_decl;
         let Some((in_ty, out_ty)) = nest_interceptor_args(class) else {
             continue;
         };

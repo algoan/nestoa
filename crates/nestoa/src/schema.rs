@@ -1052,13 +1052,13 @@ impl<'a> SchemaCtx<'a> {
                 // A `class X extends Y` carries Y's members too. Mirror the
                 // interface-`extends` handling: emit Y as an allOf branch.
                 let mut all_of: Vec<Value> = Vec::new();
-                if let Some(super_expr) = &c.class.super_class {
+                if let Some(super_expr) = &c.super_class {
                     let parent = self
-                        .heritage_schema(file, super_expr, c.class.super_type_params.as_deref())
+                        .heritage_schema(file, super_expr, c.super_type_params.as_deref())
                         .unwrap_or_else(|| json!({ "x-unresolved": heritage_label(super_expr) }));
                     all_of.push(parent);
                 }
-                for member in &c.class.body {
+                for member in &c.body {
                     if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
                         // A `static` member lives on the constructor, never on
                         // an instance, so it is never part of the serialized
@@ -1122,7 +1122,7 @@ impl<'a> SchemaCtx<'a> {
                     all_of.push(object_schema);
                     json!({ "allOf": all_of })
                 };
-                if let Some(doc) = self.jsdoc(file, c.class.span) {
+                if let Some(doc) = self.jsdoc(file, c.span) {
                     attach_doc(&mut schema, &doc);
                 }
                 schema
@@ -1164,7 +1164,7 @@ fn generic_param_names(sym: &Symbol) -> Vec<String> {
     let type_params = match sym {
         Symbol::Interface(i) => i.type_params.as_ref(),
         Symbol::TypeAlias(a) => a.type_params.as_ref(),
-        Symbol::Class(c) => c.class.type_params.as_ref(),
+        Symbol::Class(c) => c.type_params.as_ref(),
         Symbol::Enum(_) => None,
     };
     type_params
