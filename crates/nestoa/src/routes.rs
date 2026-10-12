@@ -16,7 +16,7 @@ use crate::errors::{self, ERROR_SCHEMA_NAME};
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
-use crate::jsdoc::{JsDoc, jsdoc_before};
+use crate::jsdoc::JsDoc;
 use crate::schema::{ComponentSchemas, SchemaCtx, decorator_name, describe};
 use crate::symbols::Project;
 
@@ -269,8 +269,11 @@ impl<'a> Extractor<'a> {
 
             // JSDoc on the method
             let mut method_doc = JsDoc::default();
-            if let (Some(src), Some(start)) = (self.sources.get(file), self.file_starts.get(file))
-                && let Some(doc) = jsdoc_before(src, *start, m.span)
+            if let Some(doc) = self
+                .project
+                .files
+                .get(file)
+                .and_then(|f| f.docs.jsdoc(m.span.lo))
             {
                 method_doc = doc;
             }
