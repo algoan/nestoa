@@ -990,16 +990,17 @@ impl<'a> SchemaCtx<'a> {
                         Value::Array(required.into_iter().map(Value::String).collect()),
                     );
                 }
-                if let Some(doc) = self.jsdoc(file, i.span) {
-                    attach_doc_to_map(&mut object, &doc);
-                }
                 let object_schema = Value::Object(object);
-                if all_of.is_empty() {
+                let mut schema = if all_of.is_empty() {
                     object_schema
                 } else {
                     all_of.push(object_schema);
                     json!({ "allOf": all_of })
+                };
+                if let Some(doc) = self.jsdoc(file, i.span) {
+                    attach_doc(&mut schema, &doc);
                 }
+                schema
             }
             Symbol::TypeAlias(t) => self.ts_type_to_schema(file, &t.type_ann),
             Symbol::Enum(e) => {
@@ -1115,16 +1116,17 @@ impl<'a> SchemaCtx<'a> {
                         Value::Array(required.into_iter().map(Value::String).collect()),
                     );
                 }
-                if let Some(doc) = self.jsdoc(file, c.class.span) {
-                    attach_doc_to_map(&mut obj, &doc);
-                }
                 let object_schema = Value::Object(obj);
-                if all_of.is_empty() {
+                let mut schema = if all_of.is_empty() {
                     object_schema
                 } else {
                     all_of.push(object_schema);
                     json!({ "allOf": all_of })
+                };
+                if let Some(doc) = self.jsdoc(file, c.class.span) {
+                    attach_doc(&mut schema, &doc);
                 }
+                schema
             }
         }
     }
@@ -2896,7 +2898,9 @@ mod tests {
              /** A gadget */\n@Schema()\nexport class Gadget { id: string; }\n\
              /** A colour */\nexport enum Colour { Red = 'red' }\n\
              /** A part */\n@Schema()\nclass Part { id: string; }\n\
-             export { Part };",
+             export { Part };\n\
+             /** A child */\nexport interface Child extends Widget { name: string; }\n\
+             /** A sub-part */\n@Schema()\nexport class SubPart extends Part { name: string; }",
         )]);
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
@@ -2914,6 +2918,8 @@ mod tests {
             ("Gadget", "A gadget"),
             ("Colour", "A colour"),
             ("Part", "A part"),
+            ("Child", "A child"),
+            ("SubPart", "A sub-part"),
         ] {
             let (decl_file, sym) = project.resolve(&dir.join("dto.ts"), name).expect(name);
             let schema = ctx.symbol_to_schema(&decl_file, &sym);
