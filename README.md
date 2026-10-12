@@ -129,7 +129,7 @@ keyed by the class name as written in `@UseInterceptors(...)`, covers the rest:
 - `ignore` — a pure side-effect interceptor (logging / tracing / scrubbing)
   that never touches the wire shape; skip it.
 - `requestBody: "single-or-array"` — the client may send one object or an
-  array (emitted as `oneOf: [S, { type: array, items: S }]`); this reshaping is
+  array (emitted as `anyOf: [S, { type: array, items: S }]`); this reshaping is
   imperative, not in the type signature.
 - `response: { whenPathEndsWith?, schema }` — an OpenAPI schema used verbatim,
   for interceptors whose wire shape is runtime control flow rather than a type.
