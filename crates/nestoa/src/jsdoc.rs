@@ -167,6 +167,9 @@ fn parse_throws(body: &str) -> Option<(u16, Option<String>)> {
 pub struct DocComments {
     /// Each comment, keyed by the first non-whitespace position after it.
     before: HashMap<BytePos, Comment>,
+    /// A declaration's start, mapped to where its JSDoc sits: before its
+    /// `export` keyword or first decorator, which its span leaves out.
+    decl_starts: HashMap<BytePos, BytePos>,
 }
 
 impl DocComments {
@@ -181,13 +184,22 @@ impl DocComments {
                 (BytePos(c.span.hi.0 + gap as u32), c)
             })
             .collect();
-        Self { before }
+        Self {
+            before,
+            decl_starts: HashMap::new(),
+        }
+    }
+
+    pub fn add_decl_start(&mut self, decl: BytePos, start: BytePos) {
+        if start < decl {
+            self.decl_starts.insert(decl, start);
+        }
     }
 
     /// The JSDoc of the node starting at `lo`: the nearest `/** */` block among
     /// the comments directly before it, as TypeScript picks it.
     pub fn jsdoc(&self, lo: BytePos) -> Option<JsDoc> {
-        let mut pos = lo;
+        let mut pos = self.decl_starts.get(&lo).copied().unwrap_or(lo);
         while let Some(c) = self.before.get(&pos) {
             if c.kind == CommentKind::Block
                 && let Some(body) = c.text.strip_prefix('*')

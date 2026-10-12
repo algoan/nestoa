@@ -2889,6 +2889,43 @@ mod tests {
     }
 
     #[test]
+    fn jsdoc_before_export_and_decorators_documents_the_declaration() {
+        let (project, dir, sources, file_starts) = project_with_sources(&[(
+            "dto.ts",
+            "/** A widget */\nexport interface Widget { id: string; }\n\
+             /** A gadget */\n@Schema()\nexport class Gadget { id: string; }\n\
+             /** A colour */\nexport enum Colour { Red = 'red' }\n\
+             /** A part */\n@Schema()\nclass Part { id: string; }\n\
+             export { Part };",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        for (name, doc) in [
+            ("Widget", "A widget"),
+            ("Gadget", "A gadget"),
+            ("Colour", "A colour"),
+            ("Part", "A part"),
+        ] {
+            let (decl_file, sym) = project.resolve(&dir.join("dto.ts"), name).expect(name);
+            let schema = ctx.symbol_to_schema(&decl_file, &sym);
+            assert_eq!(
+                schema.get("description"),
+                Some(&json!(doc)),
+                "{name}: {schema}"
+            );
+        }
+    }
+
+    #[test]
     fn unions_use_any_of_so_overlapping_members_validate() {
         // A `Child` is also a valid `Base`: under `oneOf` it would match both
         // branches and be rejected.

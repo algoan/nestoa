@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use swc_common::{SourceMap, comments::SingleThreadedComments, sync::Lrc};
-use swc_ecma_ast::{EsVersion, Module};
+use swc_common::{BytePos, SourceMap, comments::SingleThreadedComments, sync::Lrc};
+use swc_ecma_ast::{Decl, DefaultDecl, EsVersion, Module, ModuleDecl, ModuleItem, Stmt};
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
 use crate::jsdoc::DocComments;
@@ -54,10 +54,42 @@ impl ParsingContext {
         let module = parser
             .parse_module()
             .map_err(|e| anyhow::anyhow!("parse error in {}: {:?}", path.display(), e.kind()))?;
+        let mut docs = DocComments::new(&fm.src, fm.start_pos, comments);
+        for item in &module.body {
+            if let Some((decl, start)) = decl_doc_start(item) {
+                docs.add_decl_start(decl, start);
+            }
+        }
         Ok(ParsedFile {
             path: path.to_path_buf(),
             module: Arc::new(module),
-            docs: Arc::new(DocComments::new(&fm.src, fm.start_pos, comments)),
+            docs: Arc::new(docs),
         })
     }
+}
+
+/// A top-level declaration's span start, and the start of the `export`
+/// keyword or decorators in front of it, where its JSDoc sits.
+fn decl_doc_start(item: &ModuleItem) -> Option<(BytePos, BytePos)> {
+    let (decl, class, start) = match item {
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => match &e.decl {
+            Decl::Class(c) => (c.class.span.lo, Some(&c.class), e.span.lo),
+            Decl::TsInterface(i) => (i.span.lo, None, e.span.lo),
+            Decl::TsEnum(en) => (en.span.lo, None, e.span.lo),
+            Decl::TsTypeAlias(t) => (t.span.lo, None, e.span.lo),
+            _ => return None,
+        },
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
+            DefaultDecl::Class(c) => (c.class.span.lo, Some(&c.class), e.span.lo),
+            DefaultDecl::TsInterfaceDecl(i) => (i.span.lo, None, e.span.lo),
+            DefaultDecl::Fn(_) => return None,
+        },
+        ModuleItem::Stmt(Stmt::Decl(Decl::Class(c))) => {
+            (c.class.span.lo, Some(&c.class), c.class.span.lo)
+        }
+        _ => return None,
+    };
+    let decorators = class.into_iter().flat_map(|c| &c.decorators);
+    let start = decorators.map(|d| d.span.lo).fold(start, BytePos::min);
+    Some((decl, start))
 }
