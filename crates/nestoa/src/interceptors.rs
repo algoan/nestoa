@@ -13,10 +13,9 @@
 //! driven by the `interceptors` config map instead.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
-use swc_common::BytePos;
 use swc_ecma_ast::{
     Class, Decorator, Expr, TsArrayType, TsEntityName, TsKeywordTypeKind, TsType,
     TsUnionOrIntersectionType,
@@ -117,8 +116,6 @@ pub fn rewrite_response(
     declared_return: &TsType,
     interceptor_names: &[String],
     components: &mut ComponentSchemas,
-    sources: &HashMap<PathBuf, String>,
-    file_starts: &HashMap<PathBuf, BytePos>,
 ) -> Option<Value> {
     let mut current_ty = unwrap_async(declared_return).clone();
     let mut current_file = controller_file.to_path_buf();
@@ -165,8 +162,6 @@ pub fn rewrite_response(
 
     let mut ctx = SchemaCtx {
         project,
-        sources,
-        file_starts,
         components,
         type_env: Some(env),
         current_owner: None,
@@ -355,6 +350,7 @@ mod tests {
     use crate::parse::ParsingContext;
     use crate::routes::{Extractor, Route};
     use crate::schema::ComponentSchemas;
+    use std::path::PathBuf;
     use swc_ecma_ast::{Decl, ModuleItem, Stmt};
 
     /// Write `files` into a fresh temp dir and build a `Project` from them.
@@ -383,16 +379,12 @@ mod tests {
         project: &Project,
         entry: &[PathBuf],
     ) -> (Vec<Route>, ComponentSchemas) {
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let routes = {
             let mut ex = Extractor {
                 config,
                 project,
                 entry_files: entry,
-                sources: &sources,
-                file_starts: &file_starts,
                 components: &mut components,
             };
             ex.extract_all()

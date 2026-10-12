@@ -186,8 +186,6 @@ fn instantiation_suffix(params: &[String], env: &TypeEnv) -> String {
 
 pub struct SchemaCtx<'a> {
     pub project: &'a Project,
-    pub sources: &'a HashMap<std::path::PathBuf, String>,
-    pub file_starts: &'a HashMap<std::path::PathBuf, swc_common::BytePos>,
     pub components: &'a mut ComponentSchemas,
     /// Active generic substitutions. `None` outside interceptor lowering.
     /// Owned so it can be temporarily replaced when instantiating a nested
@@ -316,13 +314,14 @@ impl<'a> SchemaCtx<'a> {
     fn unsupported(&self, file: &Path, ty: &TsType, kind: &str) -> Value {
         let span = ty.span();
         let text = self
-            .sources
+            .project
+            .files
             .get(file)
-            .zip(self.file_starts.get(file))
-            .and_then(|(src, start)| {
-                let lo = span.lo.0.checked_sub(start.0)? as usize;
-                let hi = span.hi.0.checked_sub(start.0)? as usize;
-                src.get(lo..hi)
+            .and_then(|f| {
+                let start = f.source.start_pos.0;
+                let lo = span.lo.0.checked_sub(start)? as usize;
+                let hi = span.hi.0.checked_sub(start)? as usize;
+                f.source.src.get(lo..hi)
             })
             .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
         json!({ "x-unresolved": text.unwrap_or_else(|| kind.to_string()) })
@@ -1747,7 +1746,6 @@ fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
 mod tests {
     use super::*;
     use crate::parse::ParsingContext;
-    use std::collections::HashMap;
 
     fn project_from(files: &[(&str, &str)]) -> (Project, std::path::PathBuf) {
         // Unique per call so tests running in parallel never share a dir.
@@ -1780,13 +1778,9 @@ mod tests {
         let mut all = files.to_vec();
         all.push(("main.ts", main));
         let (project, dir) = project_from(&all);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -1983,13 +1977,9 @@ mod tests {
             "node.ts",
             "export class Node { id: string; name: string; child?: Partial<Node>; }",
         )]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2218,13 +2208,9 @@ mod tests {
                 "import { Base } from './base';\nexport class Derived extends Base { b?: number; }",
             ),
         ]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2313,12 +2299,10 @@ mod tests {
                missing: Dict['nope'];\n\
                tpl: `v${number}`;\n\
              }";
-        let (project, dir, sources, file_starts) = project_with_sources(&[("main.ts", main)]);
+        let (project, dir) = project_from(&[("main.ts", main)]);
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2420,14 +2404,10 @@ mod tests {
                 "import { Target } from './target';\nexport interface Holder { field?: PopulatedDoc<Target>; }",
             ),
         ]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let passthrough = vec!["PopulatedDoc".to_string()];
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2462,13 +2442,9 @@ mod tests {
                 "import { Target } from './target';\nexport interface Holder { field?: PopulatedDoc<Target>; }",
             ),
         ]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2528,13 +2504,9 @@ mod tests {
                 "import { PersonalDetails } from './personal_details';\nimport { Party } from './party';\nexport interface Root { personalDetails: PersonalDetails; party: Party; }",
             ),
         ]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2590,13 +2562,9 @@ mod tests {
                 "import { A } from './a';\nimport { B } from './b';\nexport interface Root { a: A; b: B; }",
             ),
         ]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2630,13 +2598,9 @@ mod tests {
                 "import { Account } from './account';\nexport interface Root { primary: Account; secondary: Account; }",
             ),
         ]);
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2658,43 +2622,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    /// Build a project plus the `sources`/`file_starts` maps JSDoc lookups need,
-    /// mirroring the wiring in `main.rs`.
-    fn project_with_sources(
-        files: &[(&str, &str)],
-    ) -> (
-        Project,
-        std::path::PathBuf,
-        HashMap<std::path::PathBuf, String>,
-        HashMap<std::path::PathBuf, swc_common::BytePos>,
-    ) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("nestoa-jsdoc-{}-{}", std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
-        let parser = ParsingContext::default();
-        let mut project = Project::default();
-        let mut sources = HashMap::new();
-        let mut file_starts = HashMap::new();
-        for (rel, body) in files {
-            let path = dir.join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, body).unwrap();
-            project.add(parser.parse_file(&path).unwrap());
-            sources.insert(path.clone(), body.to_string());
-            if let Some(fm) = parser
-                .source_map
-                .get_source_file(&swc_common::FileName::Real(path.clone()))
-            {
-                file_starts.insert(path.clone(), fm.start_pos);
-            }
-        }
-        (project, dir, sources, file_starts)
     }
 
     /// `static` members live on the constructor and are never part of an
@@ -2719,12 +2646,8 @@ mod tests {
             "#,
         )]);
         let mut components = ComponentSchemas::default();
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2752,15 +2675,13 @@ mod tests {
     fn internal_jsdoc_omits_property_from_schema() {
         // `@internal` and `@private` mark implementation-only members that are
         // stripped at runtime (toJSON / formatLean) and must not appear on the wire.
-        let (project, dir, sources, file_starts) = project_with_sources(&[(
+        let (project, dir) = project_from(&[(
             "dto.ts",
             "export class Dto {\n  /** Public field */\n  name?: string;\n  /**\n   * Raw data from the aggregator\n   * @internal\n   */\n  rawData?: string;\n  /** @private */\n  secret?: string;\n}",
         )]);
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2783,15 +2704,13 @@ mod tests {
     fn internal_property_is_not_marked_required() {
         // A required-by-syntax member that is `@internal` should neither appear
         // in `properties` nor leak into `required`.
-        let (project, dir, sources, file_starts) = project_with_sources(&[(
+        let (project, dir) = project_from(&[(
             "iface.ts",
             "export interface Iface {\n  keep: string;\n  /** @internal */\n  drop: string;\n}",
         )]);
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2822,7 +2741,7 @@ mod tests {
         // A `$ref` with a `description` sibling: 3.0 tooling drops the sibling
         // (Swagger Editor's "All other properties in a $ref object are ignored"),
         // so the reference has to move into an `allOf` branch.
-        let (project, dir, sources, file_starts) = project_with_sources(&[
+        let (project, dir) = project_from(&[
             ("kind.ts", "export interface Kind { label: string; }"),
             (
                 "dto.ts",
@@ -2832,8 +2751,6 @@ mod tests {
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2861,7 +2778,7 @@ mod tests {
             Some("Account's type")
         );
         // An undocumented reference stays a bare $ref — nothing to carry.
-        let (project2, dir2, sources2, file_starts2) = project_with_sources(&[
+        let (project2, dir2) = project_from(&[
             ("kind.ts", "export interface Kind { label: string; }"),
             (
                 "dto.ts",
@@ -2871,8 +2788,6 @@ mod tests {
         let mut components2 = ComponentSchemas::default();
         let mut ctx2 = SchemaCtx {
             project: &project2,
-            sources: &sources2,
-            file_starts: &file_starts2,
             components: &mut components2,
             type_env: None,
             current_owner: None,
@@ -2892,7 +2807,7 @@ mod tests {
 
     #[test]
     fn jsdoc_before_export_and_decorators_documents_the_declaration() {
-        let (project, dir, sources, file_starts) = project_with_sources(&[(
+        let (project, dir) = project_from(&[(
             "dto.ts",
             "/** A widget */\nexport interface Widget { id: string; }\n\
              /** A gadget */\n@Schema()\nexport class Gadget { id: string; }\n\
@@ -2905,8 +2820,6 @@ mod tests {
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2935,15 +2848,13 @@ mod tests {
     fn unions_use_any_of_so_overlapping_members_validate() {
         // A `Child` is also a valid `Base`: under `oneOf` it would match both
         // branches and be rejected.
-        let (project, dir, sources, file_starts) = project_with_sources(&[(
+        let (project, dir) = project_from(&[(
             "dto.ts",
             "export interface Base { id: string; }\nexport interface Child extends Base { name: string; }\nexport interface Dto { item: Base | Child; }",
         )]);
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,
@@ -2967,7 +2878,7 @@ mod tests {
     fn nullable_unions_use_json_schema_null_not_nullable_keyword() {
         // `nullable: true` is a 3.0 keyword with no meaning in the 3.1 document
         // nestoa emits, and beside a `$ref`/`anyOf` it is a no-op even in 3.0.
-        let (project, dir, sources, file_starts) = project_with_sources(&[
+        let (project, dir) = project_from(&[
             ("kind.ts", "export interface Kind { label: string; }"),
             (
                 "dto.ts",
@@ -2977,8 +2888,6 @@ mod tests {
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {
             project: &project,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
             type_env: None,
             current_owner: None,

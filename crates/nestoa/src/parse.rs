@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use swc_common::{BytePos, SourceMap, comments::SingleThreadedComments, sync::Lrc};
+use swc_common::{BytePos, SourceFile, SourceMap, comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast::{Decl, DefaultDecl, EsVersion, Module, ModuleDecl, ModuleItem, Stmt};
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
@@ -13,6 +13,8 @@ pub struct ParsedFile {
     pub path: PathBuf,
     pub module: Arc<Module>,
     pub docs: Arc<DocComments>,
+    /// The file's text, kept from parsing for `x-unresolved` source excerpts.
+    pub source: Lrc<SourceFile>,
 }
 
 pub struct ParsingContext {
@@ -64,6 +66,7 @@ impl ParsingContext {
             path: path.to_path_buf(),
             module: Arc::new(module),
             docs: Arc::new(docs),
+            source: fm,
         })
     }
 }
