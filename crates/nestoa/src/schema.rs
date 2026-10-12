@@ -2380,7 +2380,8 @@ mod tests {
              export type Unknown = Exclude<Item | Other, Item>;\n\
              export type NotObject = Exclude<string | Item, object>;\n\
              export type Symbols = Extract<string | symbol, symbol>;\n\
-             export type FromAny = Exclude<any, string>;",
+             export type FromAny = Exclude<any, string>;\n\
+             export type Scalars = Exclude<string | number | boolean, boolean>;",
             &[
                 "Letters",
                 "Ok",
@@ -2395,6 +2396,7 @@ mod tests {
                 "NotObject",
                 "Symbols",
                 "FromAny",
+                "Scalars",
             ],
         );
         let item = json!({ "$ref": "#/components/schemas/Item" });
@@ -2415,6 +2417,7 @@ mod tests {
             json!({ "x-unresolved": "Exclude<…>" }),
             json!({ "x-unresolved": "Extract<…>" }),
             json!({}),
+            json!({ "anyOf": [{ "type": "string" }, { "type": "number" }] }),
         ];
         assert_eq!(schemas.len(), expected.len());
         for (got, want) in schemas.iter().zip(expected) {
