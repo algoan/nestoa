@@ -23,7 +23,7 @@ use crate::config::{Config, OpenApiVersion, OutputFormat};
 use crate::parse::ParsingContext;
 use crate::routes::{Extractor, to_openapi};
 use crate::schema::ComponentSchemas;
-use crate::symbols::{Project, package_name, resolve_module_path, resolve_package_types};
+use crate::symbols::{Project, package_name};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,13 +89,13 @@ fn expand_packages(
                 // Follow relative re-exports so a pulled-in package/lib entry
                 // file drags in the modules it re-exports. Re-discovering an
                 // already-parsed project file is a no-op (guarded below).
-                resolve_module_path(&file, &spec)
+                project.resolver.relative(&file, &spec)
             } else {
                 // Workspace alias (tsconfig paths) wins over a node_modules copy;
                 // fall back to an allowlisted package's declarations.
                 project.resolve_alias(&spec).or_else(|| {
                     if allow.is_match(package_name(&spec)) {
-                        resolve_package_types(&file, &spec)
+                        project.resolver.package_types(&file, &spec)
                     } else {
                         None
                     }
