@@ -205,7 +205,9 @@ off.
 7. **Carry JSDoc** through to the output: the leading summary becomes
    `summary`, additional paragraphs become `description`, `@param` lines
    become parameter descriptions, `@deprecated` flips the operation flag,
-   `@internal` / `@private` omit a property, `@route-mapping` gives each
+   `@internal` / `@private` omit a property, a JSDoc on a DTO, interface, enum
+   or property (above its `export` and decorators) becomes its schema's
+   `description`, `@route-mapping` gives each
    path of a multi-path handler its own response schema, and `@throws` declares
    error responses thrown in service code (see above).
 8. **Reconstruct error responses** from guards, pipes, validation, and declared
