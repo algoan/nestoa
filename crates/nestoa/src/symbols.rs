@@ -680,32 +680,44 @@ pub(crate) fn find_package_dir(start_dir: &Path, pkg: &str) -> Option<PathBuf> {
     None
 }
 
+/// What an `exports` entry value resolves to.
+enum ExportsTarget {
+    Found(PathBuf),
+    /// No applicable condition or alternative yields an existing file.
+    Unmatched,
+    /// A `null` was reached first: the entry is excluded.
+    Blocked,
+}
+
 /// Resolve a package.json `exports` entry value to a TypeScript file the way
-/// TypeScript walks it: conditions in declared order, the first applicable one
-/// whose target `resolve` finds wins, and one mapped to `null` blocks the entry.
+/// TypeScript walks it: conditions and array alternatives in declared order,
+/// the first that yields a file wins, and a `null` reached first blocks the
+/// whole entry, however deeply nested.
 fn dts_from_exports_value(
     v: &serde_json::Value,
     mode: ImportMode,
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    match v {
-        serde_json::Value::String(target) => resolve(target),
-        serde_json::Value::Array(alternatives) => alternatives
-            .iter()
-            .find_map(|v| dts_from_exports_value(v, mode, resolve)),
-        serde_json::Value::Object(map) => {
-            for (_, v) in map.iter().filter(|(k, _)| condition_applies(k, mode)) {
-                if v.is_null() {
-                    return None;
-                }
-                if let Some(found) = dts_from_exports_value(v, mode, resolve) {
-                    return Some(found);
-                }
-            }
-            None
+) -> ExportsTarget {
+    let candidates: Box<dyn Iterator<Item = &serde_json::Value>> = match v {
+        serde_json::Value::Null => return ExportsTarget::Blocked,
+        serde_json::Value::String(target) => {
+            return resolve(target).map_or(ExportsTarget::Unmatched, ExportsTarget::Found);
         }
-        _ => None,
+        serde_json::Value::Array(alternatives) => Box::new(alternatives.iter()),
+        serde_json::Value::Object(map) => Box::new(
+            map.iter()
+                .filter(|(k, _)| condition_applies(k, mode))
+                .map(|(_, v)| v),
+        ),
+        _ => return ExportsTarget::Unmatched,
+    };
+    for v in candidates {
+        match dts_from_exports_value(v, mode, resolve) {
+            ExportsTarget::Unmatched => {}
+            settled => return settled,
+        }
     }
+    ExportsTarget::Unmatched
 }
 
 /// The module format of an importing file, as far as its extension tells.
@@ -743,7 +755,10 @@ fn condition_applies(condition: &str, mode: ImportMode) -> bool {
 
 /// Resolve a package subpath to its declaration entry via the `exports` map:
 /// the best-matching key (exact, then the longest `*` pattern prefix, as Node
-/// picks it), its `*` substituted into the target, which must exist.
+/// picks it), its `*` substituted into the target, which must exist. A blocked
+/// entry gives `None` like an unmatched one, so the package layout still
+/// applies: node10 resolution ignores `exports`, and nestoa doesn't read
+/// `moduleResolution`.
 fn types_from_exports(
     json: &serde_json::Value,
     pkg_dir: &Path,
@@ -764,14 +779,16 @@ fn types_from_exports(
         serde_json::Value::Object(map) => !map.keys().any(|k| k.starts_with('.')),
         _ => true,
     };
-    if shorthand {
-        return (key == ".")
-            .then(|| dts_from_exports_value(exports, mode, &|t| target_in(t, "")))
-            .flatten();
+    let (value, captured) = if shorthand {
+        (key == ".").then(|| (exports, String::new()))?
+    } else {
+        let map = exports.as_object()?;
+        best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key, true)?
+    };
+    match dts_from_exports_value(value, mode, &|t| target_in(t, &captured)) {
+        ExportsTarget::Found(path) => Some(path),
+        ExportsTarget::Unmatched | ExportsTarget::Blocked => None,
     }
-    let map = exports.as_object()?;
-    let (value, captured) = best_match(map.iter().map(|(k, v)| (k.as_str(), v)), &key, true)?;
-    dts_from_exports_value(value, mode, &|t| target_in(t, &captured))
 }
 
 /// The TypeScript version `typesVersions` ranges are evaluated against.
@@ -1042,6 +1059,18 @@ mod tests {
             &["legacy.d.ts", "main.d.ts"],
         );
         assert_eq!(resolved(&blocked, "lib").as_deref(), Some("legacy.d.ts"));
+
+        // A `null` blocks the entry from inside an array or a nested condition too.
+        let nested = package(
+            "nested",
+            r#"{ "typings": "./legacy.d.ts", "exports": {
+                ".": { "import": { "types@>=5.9": null }, "types": "./main.d.ts" },
+                "./arr": [null, "./main.d.ts"]
+            } }"#,
+            &["legacy.d.ts", "main.d.ts"],
+        );
+        assert_eq!(resolved(&nested, "lib").as_deref(), Some("legacy.d.ts"));
+        assert_eq!(resolved(&nested, "lib/arr"), None);
 
         let ordered = package(
             "ordered",
