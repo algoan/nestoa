@@ -1894,7 +1894,7 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "label": {"type": ["string", "null"]},
-                        "owner": {"oneOf": [{"$ref": "#/components/schemas/Owner"}, {"type": "null"}]},
+                        "owner": {"anyOf": [{"$ref": "#/components/schemas/Owner"}, {"type": "null"}]},
                         "range": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false}
                     }
                 }),
@@ -1915,7 +1915,7 @@ mod tests {
         assert_eq!(v31["openapi"], "3.1.0");
         let props = &v31["components"]["schemas"]["Account"]["properties"];
         assert_eq!(props["label"]["type"], json!(["string", "null"]));
-        assert!(props["owner"]["oneOf"].is_array());
+        assert!(props["owner"]["anyOf"].is_array());
         assert!(props["range"]["prefixItems"].is_array());
 
         let v30 = build(OpenApiVersion::V30);

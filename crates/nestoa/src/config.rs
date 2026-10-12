@@ -271,7 +271,7 @@ pub struct ResponseOverride {
 #[serde(rename_all = "kebab-case")]
 pub enum RequestBodyTransform {
     /// The client may send a single object or an array of them (the handler
-    /// sees an array). Emitted as `oneOf: [S, { type: array, items: S }]`.
+    /// sees an array). Emitted as `anyOf: [S, { type: array, items: S }]`.
     SingleOrArray,
 }
 

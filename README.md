@@ -129,7 +129,7 @@ keyed by the class name as written in `@UseInterceptors(...)`, covers the rest:
 - `ignore` — a pure side-effect interceptor (logging / tracing / scrubbing)
   that never touches the wire shape; skip it.
 - `requestBody: "single-or-array"` — the client may send one object or an
-  array (emitted as `oneOf: [S, { type: array, items: S }]`); this reshaping is
+  array (emitted as `anyOf: [S, { type: array, items: S }]`); this reshaping is
   imperative, not in the type signature.
 - `response: { whenPathEndsWith?, schema }` — an OpenAPI schema used verbatim,
   for interceptors whose wire shape is runtime control flow rather than a type.
@@ -193,7 +193,7 @@ off.
    `@Body`, `@Headers` (plus user-defined aliases). The parameter's TypeScript
    type becomes its schema.
 5. **Lower** TypeScript types to JSON Schema, including primitives, arrays,
-   tuples, unions (lifted to `oneOf` / merged enums, with `| null` widening the
+   tuples, unions (lifted to `anyOf` / merged enums, with `| null` widening the
    `type` keyword — see [Output conventions](#output-conventions)),
    intersections (`allOf`),
    utility types (`Promise<T>`, `Observable<T>`, `Partial`, `Required`,
@@ -236,6 +236,10 @@ way under 3.0:
 
 - **`undefined` / `void` members drop out of unions.** `T | undefined` lowers to
   plain `T`; optionality is carried by the object's `required` list.
+- **Unions are `anyOf`, not `oneOf`.** TypeScript unions may overlap
+  (`Base | Child`, where every `Child` is also a `Base`), and `oneOf` rejects a
+  value that matches more than one branch. Client generators may map `anyOf`
+  differently from `oneOf`.
 
 Two constructs, however, simply have no spelling that is valid in both
 versions, so a 3.1 document is never also a 3.0 one. Use
@@ -275,7 +279,7 @@ verbatim through `interceptors[].response.schema`:
 | --- | --- |
 | `type: [T, "null"]` | `type: T` + `nullable: true` |
 | `enum: [a, b, null]` | `enum: [a, b]` + `nullable: true` |
-| `oneOf: [<schema>, {type: "null"}]` | `<schema>` — **nullability is lost** |
+| `anyOf: [<schema>, {type: "null"}]` | `<schema>` — **nullability is lost** |
 | `type: "null"` on its own | an unconstrained schema — **the type is lost** |
 | `type: [A, B]` (multi-type) | `anyOf: [{type: A}, {type: B}]` |
 | `const: v` | `enum: [v]` |

@@ -68,7 +68,7 @@ pub fn request_body_transform(
         {
             let single = body.schema.clone();
             let array = json!({ "type": "array", "items": single.clone() });
-            body.schema = json!({ "oneOf": [single, array] });
+            body.schema = json!({ "anyOf": [single, array] });
         }
     }
 }
@@ -1262,5 +1262,30 @@ mod tests {
         let resp = route.response.as_ref().expect("response schema");
         let refstr = resp.get("$ref").and_then(|v| v.as_str()).unwrap_or("");
         assert_eq!(refstr, "#/components/schemas/Project");
+    }
+
+    #[test]
+    fn single_or_array_body_is_an_any_of() {
+        // An unresolved or unconstrained element also matches the array branch,
+        // which `oneOf` would reject.
+        let mut config = Config::default();
+        config.interceptors.insert(
+            "BulkInterceptor".into(),
+            crate::config::InterceptorConfig {
+                request_body: Some(RequestBodyTransform::SingleOrArray),
+                ..Default::default()
+            },
+        );
+        let item = json!({ "x-unresolved": "Item" });
+        let mut body = RequestBody {
+            schema: item.clone(),
+            required: true,
+            description: None,
+        };
+        request_body_transform(&config, &["BulkInterceptor".into()], &mut body);
+        assert_eq!(
+            body.schema,
+            json!({ "anyOf": [item.clone(), { "type": "array", "items": item }] })
+        );
     }
 }

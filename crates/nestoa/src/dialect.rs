@@ -17,7 +17,7 @@
 //! |------------------------------------------|------------------------------------|
 //! | `type: [T, "null"]`                      | `type: T` + `nullable: true`       |
 //! | `enum: [a, b, null]`                     | `enum: [a, b]` + `nullable: true`  |
-//! | `oneOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
+//! | `anyOf: [<schema>, {type: "null"}]`      | `<schema>` — nullability is lost   |
 //! | `type: "null"` on its own                | unconstrained — the type is lost   |
 //! | `type: [A, B]` (multi-type)              | `anyOf: [{type: A}, {type: B}]`    |
 //! | `const: v`                               | `enum: [v]`                        |
@@ -87,7 +87,7 @@ pub fn downgrade_to_30(doc: &mut Value) {
 /// 3.0.3 allows only a single string `type`, so any array has to go. The
 /// analyser itself only ever produces `[T, "null"]` (`make_nullable` widens one
 /// concrete type), but a schema handed over verbatim in the config can carry a
-/// genuine multi-type array; that becomes a `oneOf` of one-type branches, and
+/// genuine multi-type array; that becomes an `anyOf` of one-type branches, and
 /// takes the same nullability loss as any other union.
 fn downgrade_null_type(map: &mut Map<String, Value>) {
     let Some(Value::Array(types)) = map.get("type") else {
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn unwraps_a_union_that_only_wrapped_a_null_branch() {
         assert_eq!(
-            down(json!({"oneOf": [{"$ref": "#/components/schemas/A"}, {"type": "null"}]})),
+            down(json!({"anyOf": [{"$ref": "#/components/schemas/A"}, {"type": "null"}]})),
             json!({"$ref": "#/components/schemas/A"})
         );
         assert_eq!(
@@ -405,18 +405,18 @@ mod tests {
     fn keeps_a_real_union_and_only_drops_its_null_branch() {
         assert_eq!(
             down(json!({
-                "oneOf": [{"$ref": "#/c/A"}, {"$ref": "#/c/B"}, {"type": "null"}],
+                "anyOf": [{"$ref": "#/c/A"}, {"$ref": "#/c/B"}, {"type": "null"}],
                 "description": "d"
             })),
-            json!({"oneOf": [{"$ref": "#/c/A"}, {"$ref": "#/c/B"}], "description": "d"})
+            json!({"anyOf": [{"$ref": "#/c/A"}, {"$ref": "#/c/B"}], "description": "d"})
         );
     }
 
     #[test]
     fn keeps_a_sole_member_wrapped_when_the_union_has_siblings() {
         assert_eq!(
-            down(json!({"oneOf": [{"$ref": "#/c/A"}, {"type": "null"}], "description": "d"})),
-            json!({"oneOf": [{"$ref": "#/c/A"}], "description": "d"})
+            down(json!({"anyOf": [{"$ref": "#/c/A"}, {"type": "null"}], "description": "d"})),
+            json!({"anyOf": [{"$ref": "#/c/A"}], "description": "d"})
         );
     }
 
@@ -657,7 +657,7 @@ mod tests {
             "type": "object",
             "properties": {
                 "a": {"type": ["string", "null"]},
-                "b": {"oneOf": [{"$ref": "#/c/A"}, {"type": "null"}]},
+                "b": {"anyOf": [{"$ref": "#/c/A"}, {"type": "null"}]},
                 "c": {"type": "array", "prefixItems": [{"type": "number"}], "items": false}
             }
         }));
