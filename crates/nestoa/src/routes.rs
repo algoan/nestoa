@@ -1196,7 +1196,9 @@ fn reachable_schemas(
 ) -> std::collections::HashSet<String> {
     let mut reachable = std::collections::HashSet::new();
     let mut queue: Vec<String> = Vec::new();
-    collect_refs(&Value::Object(paths.clone()), &mut queue);
+    for item in paths.values() {
+        collect_refs(item, &mut queue);
+    }
 
     while let Some(name) = queue.pop() {
         if !reachable.insert(name.clone()) {
