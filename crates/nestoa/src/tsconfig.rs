@@ -38,7 +38,7 @@ impl TsPaths {
         let (targets, captured) = best_match(patterns, specifier, false)?;
         targets.iter().find_map(|target| {
             let rel = target.replace('*', &captured);
-            resolve_file_with_exts(&self.base_url.join(rel.trim_start_matches("./")))
+            crate::symbols::module_file(&self.base_url.join(rel.trim_start_matches("./")))
         })
     }
 }
@@ -95,33 +95,6 @@ fn match_pattern(pattern: &str, specifier: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Try a candidate path as-is and with the usual TypeScript extensions.
-fn resolve_file_with_exts(candidate: &Path) -> Option<PathBuf> {
-    if candidate.is_file() {
-        return Some(
-            candidate
-                .canonicalize()
-                .unwrap_or_else(|_| candidate.to_path_buf()),
-        );
-    }
-    for ext in [
-        ".ts",
-        ".tsx",
-        ".d.ts",
-        "/index.ts",
-        "/index.tsx",
-        "/index.d.ts",
-    ] {
-        let mut p = candidate.as_os_str().to_os_string();
-        p.push(ext);
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p.canonicalize().unwrap_or(p));
-        }
-    }
-    None
 }
 
 /// Load path aliases for a project: read its `tsconfig.json` (or an explicit

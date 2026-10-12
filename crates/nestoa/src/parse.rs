@@ -31,7 +31,10 @@ impl ParsingContext {
             .load_file(path)
             .with_context(|| format!("loading {}", path.display()))?;
         let _ = FileName::Real(path.to_path_buf());
-        let is_dts = path.to_string_lossy().ends_with(".d.ts");
+        let name = path.to_string_lossy();
+        let is_dts = [".d.ts", ".d.mts", ".d.cts"]
+            .iter()
+            .any(|ext| name.ends_with(ext));
         let lexer = Lexer::new(
             Syntax::Typescript(TsSyntax {
                 tsx: path.extension().and_then(|s| s.to_str()) == Some("tsx"),

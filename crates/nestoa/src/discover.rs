@@ -43,7 +43,7 @@ fn push_if_ts(path: &Path, root: &Path, exclude: &globset::GlobSet, out: &mut Ve
     let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
         return;
     };
-    if ext != "ts" && ext != "tsx" {
+    if !matches!(ext, "ts" | "tsx" | "mts" | "cts") {
         return;
     }
     if let Ok(rel) = path.strip_prefix(root)
