@@ -11,19 +11,17 @@ mod schema;
 mod symbols;
 mod tsconfig;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use swc_common::BytePos;
 
 use crate::config::{Config, OpenApiVersion, OutputFormat};
 use crate::parse::ParsingContext;
 use crate::routes::{Extractor, to_openapi};
 use crate::schema::ComponentSchemas;
-use crate::symbols::{Project, package_name, resolve_module_path, resolve_package_types};
+use crate::symbols::{Project, package_name};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -66,13 +64,7 @@ fn build_package_allowlist(patterns: &[String]) -> Result<GlobSet> {
 /// (and the relative files they re-export) into the symbol table, so their
 /// exported types resolve to real schemas. Only ever adds files under
 /// `node_modules`; the project's own sources come solely from discovery.
-fn expand_packages(
-    project: &mut Project,
-    parser: &ParsingContext,
-    sources: &mut HashMap<PathBuf, String>,
-    file_starts: &mut HashMap<PathBuf, BytePos>,
-    allow: &GlobSet,
-) {
+fn expand_packages(project: &mut Project, parser: &ParsingContext, allow: &GlobSet) {
     let mut worklist: Vec<PathBuf> = project.files.keys().cloned().collect();
     while let Some(file) = worklist.pop() {
         let Some(fs) = project.symbols.get(&file) else {
@@ -89,13 +81,13 @@ fn expand_packages(
                 // Follow relative re-exports so a pulled-in package/lib entry
                 // file drags in the modules it re-exports. Re-discovering an
                 // already-parsed project file is a no-op (guarded below).
-                resolve_module_path(&file, &spec)
+                project.resolver.relative(&file, &spec)
             } else {
                 // Workspace alias (tsconfig paths) wins over a node_modules copy;
                 // fall back to an allowlisted package's declarations.
                 project.resolve_alias(&spec).or_else(|| {
                     if allow.is_match(package_name(&spec)) {
-                        resolve_package_types(&file, &spec)
+                        project.resolver.package_types(&file, &spec)
                     } else {
                         None
                     }
@@ -107,15 +99,6 @@ fn expand_packages(
             }
             match parser.parse_file(&target) {
                 Ok(parsed) => {
-                    if let Ok(s) = std::fs::read_to_string(&target) {
-                        sources.insert(target.clone(), s);
-                    }
-                    if let Some(fm) = parser
-                        .source_map
-                        .get_source_file(&swc_common::FileName::Real(target.clone()))
-                    {
-                        file_starts.insert(target.clone(), fm.start_pos);
-                    }
                     project.add(parsed);
                     worklist.push(target);
                 }
@@ -155,8 +138,6 @@ fn main() -> Result<()> {
 
     let parser = ParsingContext::default();
     let mut project = Project::default();
-    let mut sources: HashMap<PathBuf, String> = HashMap::new();
-    let mut file_starts: HashMap<PathBuf, BytePos> = HashMap::new();
 
     for file in &files {
         let parsed = match parser.parse_file(file) {
@@ -166,16 +147,6 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        // Capture source text + start position for JSDoc lookups before storing parsed.
-        if let Ok(s) = std::fs::read_to_string(file) {
-            sources.insert(file.clone(), s);
-        }
-        if let Some(fm) = parser
-            .source_map
-            .get_source_file(&swc_common::FileName::Real(file.clone()))
-        {
-            file_starts.insert(file.clone(), fm.start_pos);
-        }
         project.add(parsed);
     }
 
@@ -198,13 +169,7 @@ fn main() -> Result<()> {
         .is_some_and(|p| p.has_entries());
     if !cfg.resolve_packages.is_empty() || has_aliases {
         match build_package_allowlist(&cfg.resolve_packages) {
-            Ok(allow) => expand_packages(
-                &mut project,
-                &parser,
-                &mut sources,
-                &mut file_starts,
-                &allow,
-            ),
+            Ok(allow) => expand_packages(&mut project, &parser, &allow),
             Err(e) => eprintln!("warning: invalid resolvePackages pattern: {}", e),
         }
     }
@@ -229,8 +194,6 @@ fn main() -> Result<()> {
             config: &cfg,
             project: &project,
             entry_files: &files,
-            sources: &sources,
-            file_starts: &file_starts,
             components: &mut components,
         };
         extractor.extract_all()

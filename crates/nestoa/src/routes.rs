@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
-use swc_common::BytePos;
 use swc_ecma_ast::{
     Callee, Class, ClassMember, Decorator, Expr, ExprOrSpread, Function, Lit, MethodKind, Param,
     Pat, PropName, TsEntityName, TsType, TsTypeRef,
@@ -156,8 +155,6 @@ pub struct Extractor<'a> {
     /// here, so package declarations pulled into the symbol table for type
     /// resolution cannot introduce phantom routes.
     pub entry_files: &'a [PathBuf],
-    pub sources: &'a HashMap<PathBuf, String>,
-    pub file_starts: &'a HashMap<PathBuf, BytePos>,
     pub components: &'a mut ComponentSchemas,
 }
 
@@ -322,8 +319,6 @@ impl<'a> Extractor<'a> {
                         &ret.type_ann,
                         &interceptor_names,
                         self.components,
-                        self.sources,
-                        self.file_starts,
                     )
                 };
                 if rewritten.is_some() {
@@ -331,8 +326,6 @@ impl<'a> Extractor<'a> {
                 } else {
                     let mut ctx = SchemaCtx {
                         project: self.project,
-                        sources: self.sources,
-                        file_starts: self.file_starts,
                         components: self.components,
                         type_env: None,
                         current_owner: None,
@@ -355,8 +348,6 @@ impl<'a> Extractor<'a> {
             } else {
                 let mut ctx = SchemaCtx {
                     project: self.project,
-                    sources: self.sources,
-                    file_starts: self.file_starts,
                     components: self.components,
                     type_env: None,
                     current_owner: None,
@@ -515,8 +506,6 @@ impl<'a> Extractor<'a> {
         let name = decorator_arg.unwrap_or_else(|| pat_info.name.clone());
         let mut ctx = SchemaCtx {
             project: self.project,
-            sources: self.sources,
-            file_starts: self.file_starts,
             components: self.components,
             type_env: None,
             current_owner: None,
@@ -1207,7 +1196,9 @@ fn reachable_schemas(
 ) -> std::collections::HashSet<String> {
     let mut reachable = std::collections::HashSet::new();
     let mut queue: Vec<String> = Vec::new();
-    collect_refs(&Value::Object(paths.clone()), &mut queue);
+    for item in paths.values() {
+        collect_refs(item, &mut queue);
+    }
 
     while let Some(name) = queue.pop() {
         if !reachable.insert(name.clone()) {
@@ -1273,9 +1264,9 @@ mod tests {
         assert!(!path_matches_suffix("/pets/{id}/cats", ""));
     }
 
-    /// Build a `Project` plus the `sources`/`file_starts` maps JSDoc lookups
-    /// need, from a set of in-memory files, then extract routes + components.
-    fn extract_with_sources(
+    /// Build a `Project` from a set of in-memory files, then extract routes +
+    /// components.
+    fn extract_from(
         name: &str,
         files: &[(&str, &str)],
         entry_rel: &str,
@@ -1291,22 +1282,12 @@ mod tests {
 
         let parser = ParsingContext::default();
         let mut project = Project::default();
-        let mut sources: HashMap<PathBuf, String> = HashMap::new();
-        let mut file_starts: HashMap<PathBuf, BytePos> = HashMap::new();
         let mut entry = Vec::new();
         for (rel, body) in files {
             let path = dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, body).unwrap();
-            let parsed = parser.parse_file(&path).unwrap();
-            sources.insert(path.clone(), body.to_string());
-            if let Some(fm) = parser
-                .source_map
-                .get_source_file(&swc_common::FileName::Real(path.clone()))
-            {
-                file_starts.insert(path.clone(), fm.start_pos);
-            }
-            project.add(parsed);
+            project.add(parser.parse_file(&path).unwrap());
             if *rel == entry_rel {
                 entry.push(path);
             }
@@ -1319,8 +1300,6 @@ mod tests {
                 config: &config,
                 project: &project,
                 entry_files: &entry,
-                sources: &sources,
-                file_starts: &file_starts,
                 components: &mut components,
             };
             ex.extract_all()
@@ -1343,7 +1322,7 @@ mod tests {
                 public async create(): Promise<string> { return ''; }
             }
         "#;
-        let (routes, _components) = extract_with_sources(
+        let (routes, _components) = extract_from(
             "httpcode-const",
             &[
                 ("batch.controller.ts", controller),
@@ -1385,7 +1364,7 @@ mod tests {
             }
         "#;
         let dto = "export interface CreateDto { name: string; }";
-        let (routes, components) = extract_with_sources(
+        let (routes, components) = extract_from(
             "errors-e2e",
             &[("items.controller.ts", controller), ("create.dto.ts", dto)],
             "items.controller.ts",
@@ -1445,7 +1424,7 @@ mod tests {
                 }
             }
         "#;
-        let (routes, components) = extract_with_sources(
+        let (routes, components) = extract_from(
             "per-path",
             &[
                 ("cat.dto.ts", "export class Cat { meow: boolean; }"),
@@ -1497,7 +1476,7 @@ mod tests {
                 }
             }
         "#;
-        let (routes, _components) = extract_with_sources(
+        let (routes, _components) = extract_from(
             "fallback",
             &[
                 ("cat.dto.ts", "export class Cat { meow: boolean; }"),
@@ -1554,16 +1533,12 @@ mod tests {
 
         let config = Config::default();
         let entry = vec![path];
-        let sources = HashMap::new();
-        let file_starts = HashMap::new();
         let mut components = ComponentSchemas::default();
         let routes = {
             let mut ex = Extractor {
                 config: &config,
                 project: &project,
                 entry_files: &entry,
-                sources: &sources,
-                file_starts: &file_starts,
                 components: &mut components,
             };
             ex.extract_all()
@@ -1600,7 +1575,7 @@ mod tests {
 
     /// Extract the routes of a single in-memory controller file.
     fn extract_routes(name: &str, body: &str) -> Vec<Route> {
-        extract_with_sources(name, &[("ctrl.ts", body)], "ctrl.ts").0
+        extract_from(name, &[("ctrl.ts", body)], "ctrl.ts").0
     }
 
     fn find<'r>(routes: &'r [Route], method: HttpMethod, path: &str) -> &'r Route {
@@ -1672,7 +1647,7 @@ mod tests {
                 read() {}
             }
         "#;
-        let (routes, _) = extract_with_sources(
+        let (routes, _) = extract_from(
             "httpcode-enum",
             &[
                 ("ctrl.ts", controller),

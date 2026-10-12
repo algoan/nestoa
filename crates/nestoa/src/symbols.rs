@@ -1,10 +1,13 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use swc_ecma_ast::{
-    ClassDecl, Decl, DefaultDecl, ExportDecl, ExportDefaultDecl, ExportSpecifier, ImportDecl,
-    ImportSpecifier, ModuleDecl, ModuleItem, Stmt, TsEnumDecl, TsInterfaceDecl, TsTypeAliasDecl,
+    Class, Decl, DefaultDecl, ExportDecl, ExportDefaultDecl, ExportSpecifier, Ident, ImportDecl,
+    ImportSpecifier, Module, ModuleDecl, ModuleItem, Stmt, TsEnumDecl, TsInterfaceDecl,
+    TsTypeAliasDecl,
 };
 
 use crate::parse::ParsedFile;
@@ -14,10 +17,10 @@ use crate::tsconfig::best_match;
 /// within the file.
 #[derive(Clone)]
 pub enum Symbol {
-    Interface(Arc<TsInterfaceDecl>),
-    TypeAlias(Arc<TsTypeAliasDecl>),
-    Enum(Arc<TsEnumDecl>),
-    Class(Arc<ClassDecl>),
+    Interface(Shared<TsInterfaceDecl>),
+    TypeAlias(Shared<TsTypeAliasDecl>),
+    Enum(Shared<TsEnumDecl>),
+    Class(Shared<Class>),
 }
 
 impl Symbol {
@@ -27,8 +30,56 @@ impl Symbol {
             Symbol::Interface(i) => i.id.sym.to_string(),
             Symbol::TypeAlias(t) => t.id.sym.to_string(),
             Symbol::Enum(e) => e.id.sym.to_string(),
-            Symbol::Class(c) => c.ident.sym.to_string(),
+            Symbol::Class(c) => {
+                class_of(c.item()).map_or_else(String::new, |(id, _)| id.sym.to_string())
+            }
         }
+    }
+}
+
+/// A top-level declaration of a parsed module, shared with the module rather
+/// than copied out of it. Dereferences to the declaration.
+#[derive(Clone)]
+pub struct Shared<T: 'static> {
+    module: Arc<Module>,
+    index: usize,
+    get: fn(&ModuleItem) -> Option<&T>,
+}
+
+impl<T> Shared<T> {
+    fn item(&self) -> &ModuleItem {
+        &self.module.body[self.index]
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        (self.get)(self.item()).expect("a symbol's module item holds its declaration")
+    }
+}
+
+fn declaration(item: &ModuleItem) -> Option<&Decl> {
+    match item {
+        ModuleItem::Stmt(Stmt::Decl(decl))
+        | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl { decl, .. })) => Some(decl),
+        _ => None,
+    }
+}
+
+/// A named class declaration, `export default class X` included.
+fn class_of(item: &ModuleItem) -> Option<(&Ident, &Class)> {
+    match (declaration(item), item) {
+        (Some(Decl::Class(c)), _) => Some((&c.ident, &c.class)),
+        (
+            None,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(ExportDefaultDecl {
+                decl: DefaultDecl::Class(c),
+                ..
+            })),
+        ) => Some((c.ident.as_ref()?, &c.class)),
+        _ => None,
     }
 }
 
@@ -68,6 +119,7 @@ pub struct Project {
     /// TypeScript `compilerOptions.paths` aliases, used to resolve workspace
     /// package imports (e.g. `@algoan/core`) to in-repo source.
     pub tsconfig_paths: Option<crate::tsconfig::TsPaths>,
+    pub resolver: Resolver,
 }
 
 impl Project {
@@ -79,15 +131,18 @@ impl Project {
 
     /// Resolve a bare specifier through tsconfig `paths` aliases, if any.
     pub fn resolve_alias(&self, specifier: &str) -> Option<PathBuf> {
-        self.tsconfig_paths.as_ref()?.resolve(specifier)
+        memo(&self.resolver.aliases, specifier.to_string(), |s| {
+            self.tsconfig_paths.as_ref()?.resolve(s)
+        })
     }
 
     /// Resolve a module specifier (relative, tsconfig-aliased, or node_modules
     /// package) to a file in the symbol table.
     fn resolve_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
-        resolve_module_path(file, specifier)
+        self.resolver
+            .relative(file, specifier)
             .or_else(|| self.resolve_alias(specifier))
-            .or_else(|| resolve_package_types(file, specifier))
+            .or_else(|| self.resolver.package_types(file, specifier))
     }
 
     /// Resolve a namespace-qualified type `Ns.Member` (where `Ns` is a TS
@@ -200,7 +255,8 @@ impl Project {
     /// The parsed in-repo module (relative or tsconfig-aliased) a specifier
     /// names. `None` for a package.
     fn in_repo_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
-        resolve_module_path(file, specifier)
+        self.resolver
+            .relative(file, specifier)
             .or_else(|| self.resolve_alias(specifier))
             .filter(|t| self.symbols.contains_key(t))
     }
@@ -238,8 +294,10 @@ impl Project {
         name: &str,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<(String, String)> {
-        let in_repo =
-            resolve_module_path(file, specifier).or_else(|| self.resolve_alias(specifier));
+        let in_repo = self
+            .resolver
+            .relative(file, specifier)
+            .or_else(|| self.resolve_alias(specifier));
         match in_repo {
             Some(target) if self.symbols.contains_key(&target) => {
                 self.import_origin_inner(&target, name, visited)
@@ -359,26 +417,15 @@ impl Project {
 
 pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
     let mut fs = FileSymbols::default();
-    for item in &parsed.module.body {
+    for (index, item) in parsed.module.body.iter().enumerate() {
+        if let Some((name, symbol)) = declared_symbol(&parsed.module, index) {
+            fs.declared.insert(name, symbol);
+        }
         match item {
-            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_decl(decl, &mut fs),
+            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, &mut fs),
             ModuleItem::ModuleDecl(md) => match md {
                 ModuleDecl::Import(i) => collect_import(i, &mut fs),
-                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_decl(decl, &mut fs),
-                ModuleDecl::ExportDefaultDecl(ExportDefaultDecl { decl, .. }) => {
-                    if let DefaultDecl::Class(cd) = decl
-                        && let Some(ident) = &cd.ident
-                    {
-                        fs.declared.insert(
-                            ident.sym.to_string(),
-                            Symbol::Class(Arc::new(ClassDecl {
-                                ident: ident.clone(),
-                                declare: false,
-                                class: cd.class.clone(),
-                            })),
-                        );
-                    }
-                }
+                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_consts(decl, &mut fs),
                 ModuleDecl::ExportAll(ea) => {
                     fs.star_re_exports
                         .push(ea.src.value.to_string_lossy().into_owned());
@@ -429,41 +476,74 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
     fs
 }
 
-fn collect_decl(decl: &Decl, fs: &mut FileSymbols) {
-    match decl {
-        Decl::Class(c) => {
-            fs.declared
-                .insert(c.ident.sym.to_string(), Symbol::Class(Arc::new(c.clone())));
+/// The named class, interface, type alias or enum `module.body[index]`
+/// declares, if any.
+fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol)> {
+    fn share<T>(
+        module: &Arc<Module>,
+        index: usize,
+        get: fn(&ModuleItem) -> Option<&T>,
+    ) -> Shared<T> {
+        Shared {
+            module: module.clone(),
+            index,
+            get,
         }
-        Decl::TsInterface(i) => {
-            fs.declared.insert(
-                i.id.sym.to_string(),
-                Symbol::Interface(Arc::new(*i.clone())),
-            );
+    }
+    fn class(item: &ModuleItem) -> Option<&Class> {
+        class_of(item).map(|(_, c)| c)
+    }
+    fn interface(item: &ModuleItem) -> Option<&TsInterfaceDecl> {
+        match declaration(item)? {
+            Decl::TsInterface(i) => Some(i),
+            _ => None,
         }
-        Decl::TsTypeAlias(t) => {
-            fs.declared.insert(
-                t.id.sym.to_string(),
-                Symbol::TypeAlias(Arc::new(*t.clone())),
-            );
+    }
+    fn alias(item: &ModuleItem) -> Option<&TsTypeAliasDecl> {
+        match declaration(item)? {
+            Decl::TsTypeAlias(t) => Some(t),
+            _ => None,
         }
-        Decl::TsEnum(e) => {
-            fs.declared
-                .insert(e.id.sym.to_string(), Symbol::Enum(Arc::new(*e.clone())));
+    }
+    fn enumeration(item: &ModuleItem) -> Option<&TsEnumDecl> {
+        match declaration(item)? {
+            Decl::TsEnum(e) => Some(e),
+            _ => None,
         }
-        Decl::Var(v) => {
-            // Record numeric `const NAME = <literal>` so decorator arguments that
-            // reference the constant (e.g. `@HttpCode(MULTI_STATUS)`) can be
-            // resolved to their value, including across module boundaries.
-            for d in &v.decls {
-                if let (swc_ecma_ast::Pat::Ident(id), Some(init)) = (&d.name, &d.init)
-                    && let Some(n) = numeric_expr(init)
-                {
-                    fs.const_numbers.insert(id.id.sym.to_string(), n);
-                }
-            }
+    }
+    let item = &module.body[index];
+    if let Some((ident, _)) = class_of(item) {
+        let symbol = Symbol::Class(share(module, index, class));
+        return Some((ident.sym.to_string(), symbol));
+    }
+    Some(match declaration(item)? {
+        Decl::TsInterface(i) => (
+            i.id.sym.to_string(),
+            Symbol::Interface(share(module, index, interface)),
+        ),
+        Decl::TsTypeAlias(t) => (
+            t.id.sym.to_string(),
+            Symbol::TypeAlias(share(module, index, alias)),
+        ),
+        Decl::TsEnum(e) => (
+            e.id.sym.to_string(),
+            Symbol::Enum(share(module, index, enumeration)),
+        ),
+        _ => return None,
+    })
+}
+
+/// Record numeric `const NAME = <literal>` so decorator arguments that
+/// reference the constant (e.g. `@HttpCode(MULTI_STATUS)`) can be resolved to
+/// their value, including across module boundaries.
+fn collect_consts(decl: &Decl, fs: &mut FileSymbols) {
+    let Decl::Var(v) = decl else { return };
+    for d in &v.decls {
+        if let (swc_ecma_ast::Pat::Ident(id), Some(init)) = (&d.name, &d.init)
+            && let Some(n) = numeric_expr(init)
+        {
+            fs.const_numbers.insert(id.id.sym.to_string(), n);
         }
-        _ => {}
     }
 }
 
@@ -569,13 +649,70 @@ fn module_export_name(n: &swc_ecma_ast::ModuleExportName) -> String {
     }
 }
 
-/// Resolve `./other` relative to `current_file` to an absolute `.ts` path.
-/// Returns None for package imports (e.g. `@nestjs/common`).
-pub fn resolve_module_path(current_file: &Path, specifier: &str) -> Option<PathBuf> {
-    if !specifier.starts_with('.') {
-        return None;
+/// Memoised module resolution: the same modules are imported from many files,
+/// and each lookup stats candidate files or reads a `package.json`.
+#[derive(Default)]
+pub struct Resolver {
+    /// Relative import target -> the module file it loads.
+    relative: RefCell<HashMap<PathBuf, Option<PathBuf>>>,
+    /// tsconfig `paths` specifier -> the module file it loads.
+    aliases: RefCell<HashMap<String, Option<PathBuf>>>,
+    /// `(directory, package)` -> the nearest `node_modules/<package>` from it.
+    package_dirs: RefCell<HashMap<(PathBuf, String), Option<PathBuf>>>,
+    /// `(package directory, subpath, import mode)` -> its declaration file.
+    package_entries: RefCell<HashMap<(PathBuf, String, ImportMode), Option<PathBuf>>>,
+}
+
+impl Resolver {
+    /// Resolve `./other` relative to `current_file` to an absolute `.ts` path.
+    /// Returns None for package imports (e.g. `@nestjs/common`).
+    pub fn relative(&self, current_file: &Path, specifier: &str) -> Option<PathBuf> {
+        if !specifier.starts_with('.') {
+            return None;
+        }
+        let candidate = current_file.parent()?.join(specifier);
+        memo(&self.relative, candidate, |c| module_file(c))
     }
-    module_file(&current_file.parent()?.join(specifier))
+
+    /// Locate the TypeScript declaration file for a bare package import
+    /// (including subpaths), so its exported types can be parsed.
+    pub fn package_types(&self, current_file: &Path, specifier: &str) -> Option<PathBuf> {
+        let (pkg, subpath) = split_package_specifier(specifier);
+        let pkg_dir = self.package_dir(current_file.parent()?, &pkg)?;
+        let key = (pkg_dir, subpath, ImportMode::of(current_file));
+        memo(&self.package_entries, key, |(dir, subpath, mode)| {
+            package_entry(dir, subpath, *mode)
+        })
+    }
+
+    /// `find_package_dir`, memoised per directory on the way up.
+    fn package_dir(&self, dir: &Path, pkg: &str) -> Option<PathBuf> {
+        memo(
+            &self.package_dirs,
+            (dir.to_path_buf(), pkg.to_string()),
+            |_| {
+                let candidate = dir.join("node_modules").join(pkg);
+                if candidate.is_dir() {
+                    Some(candidate)
+                } else {
+                    self.package_dir(dir.parent()?, pkg)
+                }
+            },
+        )
+    }
+}
+
+fn memo<K: Eq + Hash, V: Clone>(
+    cache: &RefCell<HashMap<K, V>>,
+    key: K,
+    compute: impl FnOnce(&K) -> V,
+) -> V {
+    if let Some(hit) = cache.borrow().get(&key) {
+        return hit.clone();
+    }
+    let value = compute(&key);
+    cache.borrow_mut().insert(key, value.clone());
+    value
 }
 
 /// The file an import of `candidate` loads: its TypeScript counterpart when it
@@ -721,7 +858,7 @@ fn dts_from_exports_value(
 }
 
 /// The module format of an importing file, as far as its extension tells.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ImportMode {
     Esm,
     CommonJs,
@@ -883,18 +1020,15 @@ fn declaration_file(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Locate the TypeScript declaration file for a bare package import (including
-/// subpaths), so its exported types can be parsed. Returns the `.d.ts` path.
-pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<PathBuf> {
-    let (pkg, subpath) = split_package_specifier(specifier);
-    let mode = ImportMode::of(current_file);
-    let pkg_dir = find_package_dir(current_file.parent()?, &pkg)?;
+/// The declaration file a package's `subpath` (empty for its root) resolves
+/// to, from its `package.json`.
+fn package_entry(pkg_dir: &Path, subpath: &str, mode: ImportMode) -> Option<PathBuf> {
     let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
     let in_package = |rel: &str| declaration_file(&pkg_dir.join(rel.trim_start_matches("./")));
     if subpath.is_empty() {
-        if let Some(found) = types_from_exports(&json, &pkg_dir, "", mode) {
+        if let Some(found) = types_from_exports(&json, pkg_dir, "", mode) {
             return Some(found);
         }
         // Without `typings`/`types`, TypeScript looks for the declaration next
@@ -904,14 +1038,14 @@ pub fn resolve_package_types(current_file: &Path, specifier: &str) -> Option<Pat
             .into_iter()
             .find_map(|k| json.get(k)?.as_str());
         let remapped = |rel: &str| {
-            types_from_versions(&json, &pkg_dir, rel.trim_start_matches("./"))
+            types_from_versions(&json, pkg_dir, rel.trim_start_matches("./"))
                 .or_else(|| in_package(rel))
         };
         return entry.and_then(remapped).or_else(|| remapped("index.d.ts"));
     }
-    types_from_exports(&json, &pkg_dir, &subpath, mode)
-        .or_else(|| types_from_versions(&json, &pkg_dir, &subpath))
-        .or_else(|| declaration_file(&pkg_dir.join(&subpath)))
+    types_from_exports(&json, pkg_dir, subpath, mode)
+        .or_else(|| types_from_versions(&json, pkg_dir, subpath))
+        .or_else(|| declaration_file(&pkg_dir.join(subpath)))
 }
 
 #[cfg(test)]
@@ -971,9 +1105,13 @@ mod tests {
         std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
         std::fs::write(&consumer, "").unwrap();
 
-        let root = resolve_package_types(&consumer, "@scope/lib").expect("bare import");
+        let root = Resolver::default()
+            .package_types(&consumer, "@scope/lib")
+            .expect("bare import");
         assert!(root.ends_with("dist/index.d.ts"), "got {:?}", root);
-        let sub = resolve_package_types(&consumer, "@scope/lib/sub").expect("subpath import");
+        let sub = Resolver::default()
+            .package_types(&consumer, "@scope/lib/sub")
+            .expect("subpath import");
         assert!(sub.ends_with("dist/sub/index.d.ts"), "got {:?}", sub);
     }
 
@@ -995,8 +1133,65 @@ mod tests {
         consumer
     }
 
+    #[test]
+    fn symbols_share_the_parsed_declarations() {
+        let dir = std::env::temp_dir().join(format!("nestoa-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dto.ts");
+        std::fs::write(
+            &file,
+            "import { X } from './x';\n\
+             export default class Account<T> { id: string; }\n\
+             export interface Owner { name: string; }\n\
+             type Id = string;\n\
+             export enum Kind { A = 'a' }\n",
+        )
+        .unwrap();
+        let mut project = Project::default();
+        project.add(
+            crate::parse::ParsingContext::default()
+                .parse_file(&file)
+                .unwrap(),
+        );
+
+        let Some((_, Symbol::Class(class))) = project.resolve(&file, "Account") else {
+            panic!("default-exported class");
+        };
+        assert!(class.type_params.is_some());
+        let names: Vec<_> = ["Account", "Owner", "Id", "Kind"]
+            .iter()
+            .map(|n| project.resolve(&file, n).map(|(_, s)| s.name()))
+            .collect();
+        assert_eq!(
+            names,
+            ["Account", "Owner", "Id", "Kind"].map(|n| Some(n.to_string()))
+        );
+    }
+
+    #[test]
+    fn resolver_reads_a_package_once_for_every_importer() {
+        let consumer = package("memo", r#"{ "types": "./index.d.ts" }"#, &["index.d.ts"]);
+        let nested = consumer.parent().unwrap().join("deep/file.ts");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let resolver = Resolver::default();
+        let first = resolver.package_types(&consumer, "lib").expect("resolved");
+
+        let pkg = consumer
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("node_modules");
+        std::fs::remove_dir_all(pkg).unwrap();
+        assert_eq!(resolver.package_types(&nested, "lib"), Some(first));
+        assert_eq!(resolver.relative(&consumer, "./gone"), None);
+        std::fs::write(consumer.with_file_name("gone.ts"), "").unwrap();
+        assert_eq!(resolver.relative(&consumer, "./gone"), None);
+    }
+
     fn resolved(consumer: &Path, specifier: &str) -> Option<String> {
-        let path = resolve_package_types(consumer, specifier)?;
+        let path = Resolver::default().package_types(consumer, specifier)?;
         let pkg = consumer
             .parent()?
             .parent()?
@@ -1164,7 +1359,9 @@ mod tests {
         let dir = main.parent().unwrap();
         for (rel, specifier) in [("dto.ts", "./dto.js"), ("esm.d.mts", "./esm.mjs")] {
             std::fs::write(dir.join(rel), "").unwrap();
-            let found = resolve_module_path(&main, specifier).expect(specifier);
+            let found = Resolver::default()
+                .relative(&main, specifier)
+                .expect(specifier);
             assert!(found.ends_with(rel), "{specifier}: {found:?}");
         }
     }
