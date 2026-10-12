@@ -378,7 +378,7 @@ impl<'a> SchemaCtx<'a> {
                     out.insert("enum".into(), Value::Array(merged));
                     Value::Object(out)
                 } else {
-                    json!({ "oneOf": non_null })
+                    json!({ "anyOf": non_null })
                 };
                 if nullable {
                     make_nullable(schema)
@@ -1364,7 +1364,7 @@ fn filter_union(
         0 if nullable => return Some(json!({ "type": "null" })),
         0 => json!({ "not": {} }),
         1 => branches.remove(0),
-        _ => json!({ "oneOf": branches }),
+        _ => json!({ "anyOf": branches }),
     };
     Some(if nullable {
         make_nullable(schema)
@@ -1698,7 +1698,7 @@ fn make_nullable(schema: Value) -> Value {
         }
     }
     // `$ref`, `allOf`, `x-unresolved`: no type keyword of our own to widen.
-    json!({ "oneOf": [Value::Object(m), { "type": "null" }] })
+    json!({ "anyOf": [Value::Object(m), { "type": "null" }] })
 }
 
 /// Make a schema map a legal place to hang annotation keywords.
@@ -2905,9 +2905,41 @@ mod tests {
     }
 
     #[test]
+    fn unions_use_any_of_so_overlapping_members_validate() {
+        // A `Child` is also a valid `Base`: under `oneOf` it would match both
+        // branches and be rejected.
+        let (project, dir, sources, file_starts) = project_with_sources(&[(
+            "dto.ts",
+            "export interface Base { id: string; }\nexport interface Child extends Base { name: string; }\nexport interface Dto { item: Base | Child; }",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            sources: &sources,
+            file_starts: &file_starts,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project
+            .resolve(&dir.join("dto.ts"), "Dto")
+            .expect("resolve Dto");
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(
+            schema.pointer("/properties/item").unwrap(),
+            &json!({"anyOf": [
+                {"$ref": "#/components/schemas/Base"},
+                {"$ref": "#/components/schemas/Child"}
+            ]})
+        );
+    }
+
+    #[test]
     fn nullable_unions_use_json_schema_null_not_nullable_keyword() {
         // `nullable: true` is a 3.0 keyword with no meaning in the 3.1 document
-        // nestoa emits, and beside a `$ref`/`oneOf` it is a no-op even in 3.0.
+        // nestoa emits, and beside a `$ref`/`anyOf` it is a no-op even in 3.0.
         let (project, dir, sources, file_starts) = project_with_sources(&[
             ("kind.ts", "export interface Kind { label: string; }"),
             (
@@ -2944,25 +2976,25 @@ mod tests {
         // A reference has no type keyword of its own: add a null branch.
         let kind = props.get("kind").unwrap();
         assert_eq!(
-            kind.pointer("/oneOf/0/$ref").and_then(|v| v.as_str()),
+            kind.pointer("/anyOf/0/$ref").and_then(|v| v.as_str()),
             Some("#/components/schemas/Kind"),
             "got {kind}"
         );
-        assert_eq!(kind.pointer("/oneOf/1/type").unwrap(), &json!("null"));
+        assert_eq!(kind.pointer("/anyOf/1/type").unwrap(), &json!("null"));
 
         // An enum constrains values independently of `type`, so `null` joins both.
         let state = props.get("state").unwrap();
         assert_eq!(state.get("type").unwrap(), &json!(["string", "null"]));
         assert_eq!(state.get("enum").unwrap(), &json!(["a", "b", null]));
 
-        // A oneOf gains an explicit null member rather than a sibling keyword.
+        // An anyOf gains an explicit null member rather than a sibling keyword.
         let mixed = props.get("mixed").unwrap();
-        let branches = mixed.get("oneOf").and_then(|v| v.as_array()).unwrap();
+        let branches = mixed.get("anyOf").and_then(|v| v.as_array()).unwrap();
         assert_eq!(branches.len(), 3, "got {mixed}");
         assert_eq!(branches[2].get("type").unwrap(), &json!("null"));
 
         // `| undefined` has no wire representation: it must not leak a JSON null
-        // into a `oneOf`, and optionality is already carried by `required`.
+        // into an `anyOf`, and optionality is already carried by `required`.
         assert_eq!(
             props.pointer("/maybe/$ref").and_then(|v| v.as_str()),
             Some("#/components/schemas/Kind"),
