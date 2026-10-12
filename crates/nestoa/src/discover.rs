@@ -9,10 +9,17 @@ pub fn discover_files(
     excludes: &[String],
 ) -> Result<Vec<PathBuf>> {
     let mut exclude = GlobSetBuilder::new();
+    // `dir/**` excludes everything under a directory matching `dir`, so the
+    // walk skips those directories instead of listing node_modules or dist.
+    let mut excluded_dirs = GlobSetBuilder::new();
     for pat in excludes {
         exclude.add(Glob::new(pat)?);
+        if let Some(dir) = pat.strip_suffix("/**") {
+            excluded_dirs.add(Glob::new(dir)?);
+        }
     }
     let exclude = exclude.build()?;
+    let excluded_dirs = excluded_dirs.build()?;
 
     let mut out = Vec::new();
     for inc in includes {
@@ -26,6 +33,7 @@ pub fn discover_files(
         }
         for entry in walkdir::WalkDir::new(&start)
             .into_iter()
+            .filter_entry(|e| !(e.file_type().is_dir() && is_match(&excluded_dirs, e.path(), root)))
             .filter_map(|e| e.ok())
         {
             if !entry.file_type().is_file() {
@@ -46,13 +54,47 @@ fn push_if_ts(path: &Path, root: &Path, exclude: &globset::GlobSet, out: &mut Ve
     if !matches!(ext, "ts" | "tsx" | "mts" | "cts") {
         return;
     }
-    if let Ok(rel) = path.strip_prefix(root)
-        && exclude.is_match(rel)
-    {
-        return;
+    if !is_match(exclude, path, root) {
+        out.push(path.to_path_buf());
     }
-    if exclude.is_match(path) {
-        return;
+}
+
+/// Whether `path`, relative to `root` or as is, matches `globs`.
+fn is_match(globs: &globset::GlobSet, path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| globs.is_match(rel)) || globs.is_match(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_directories_are_skipped() {
+        let root = std::env::temp_dir().join(format!("nestoa-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for rel in [
+            "src/app.ts",
+            "src/node_modules/pkg/index.d.ts",
+            "src/feature/dist/out.ts",
+            "src/feature/distance.ts",
+            "src/feature/feature.spec.ts",
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let excludes = ["**/node_modules/**", "**/dist/**", "**/*.spec.ts"].map(String::from);
+        let found = discover_files(&root, &["src".to_string()], &excludes).unwrap();
+        let rel: Vec<_> = found
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap())
+            .collect();
+        assert_eq!(
+            rel,
+            [
+                Path::new("src/app.ts"),
+                Path::new("src/feature/distance.ts")
+            ]
+        );
     }
-    out.push(path.to_path_buf());
 }
