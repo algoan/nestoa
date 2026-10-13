@@ -155,9 +155,6 @@ pub struct RequestBody {
     pub description: Option<String>,
 }
 
-/// How many base classes a controller's handlers are looked for in.
-const MAX_INHERITANCE_DEPTH: usize = 16;
-
 /// What a controller contributes to each of its handlers' routes.
 struct ClassCtx<'c> {
     name: &'c str,
@@ -253,8 +250,13 @@ impl<'a> Extractor<'a> {
         };
         let mut seen = std::collections::HashSet::new();
         let mut owner = (file.to_path_buf(), None::<crate::symbols::Shared<Class>>);
-        for _ in 0..MAX_INHERITANCE_DEPTH {
+        // Classes already walked, by file and position, in case of a cycle.
+        let mut walked = std::collections::HashSet::new();
+        loop {
             let class: &Class = owner.1.as_deref().unwrap_or(class);
+            if !walked.insert((owner.0.clone(), class.span.lo)) {
+                break;
+            }
             for member in &class.body {
                 let ClassMember::Method(m) = member else {
                     continue;
@@ -2356,6 +2358,30 @@ mod tests {
                 "get /public/docs/x",
             ]
         );
+    }
+
+    #[test]
+    fn handlers_are_found_in_deep_hierarchies_and_cycles_end() {
+        let mut base = String::from("export class L0 { @Get('deepest') deepest() {} }\n");
+        for i in 1..=20 {
+            base.push_str(&format!("export class L{i} extends L{} {{}}\n", i - 1));
+        }
+        base.push_str("export class A extends B {}\nexport class B extends A {}\n");
+        let (routes, _) = extract_from(
+            "deep",
+            &[
+                ("base.ts", &base),
+                (
+                    "ctrl.ts",
+                    "import { L20, A } from './base';\n\
+                     @Controller('deep') export class DeepController extends L20 {}\n\
+                     @Controller('cycle') export class CycleController extends A { @Get() own() {} }",
+                ),
+            ],
+            "ctrl.ts",
+        );
+        find(&routes, HttpMethod::Get, "/deep/deepest");
+        find(&routes, HttpMethod::Get, "/cycle");
     }
 
     #[test]
