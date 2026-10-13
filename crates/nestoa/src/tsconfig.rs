@@ -202,9 +202,6 @@ fn collect(path: &Path, required: bool, chain: &mut Chain, found: &mut Inherited
             .collect();
         found.paths = Some((dir.to_path_buf(), entries));
     }
-    if found.paths.is_some() && found.base_url.is_some() {
-        return;
-    }
     let parents: Vec<&str> = match json.get("extends") {
         Some(serde_json::Value::String(e)) => vec![e.as_str()],
         Some(serde_json::Value::Array(a)) => a.iter().filter_map(|e| e.as_str()).rev().collect(),
@@ -534,6 +531,18 @@ mod tests {
             &[("tsconfig.json", r#"{ "extends": "./nope.json" }"#)],
         );
         assert!(load_tsconfig_paths(&dir, None).is_none());
+        let warnings = crate::diag::take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("nope.json"), "{warnings:?}");
+
+        let complete = tree(
+            "missing-after-paths",
+            &[(
+                "tsconfig.json",
+                r#"{ "extends": "./nope.json", "compilerOptions": { "baseUrl": ".", "paths": { "a": ["b"] } } }"#,
+            )],
+        );
+        assert!(load_tsconfig_paths(&complete, None).is_some());
         let warnings = crate::diag::take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("nope.json"), "{warnings:?}");
