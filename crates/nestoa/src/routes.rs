@@ -173,26 +173,28 @@ impl<'a> Extractor<'a> {
             }
             let parsed = &self.project.files[file];
             for item in &parsed.module.body {
-                let class_decl = match item {
-                    swc_ecma_ast::ModuleItem::ModuleDecl(swc_ecma_ast::ModuleDecl::ExportDecl(
-                        e,
-                    )) => match &e.decl {
-                        swc_ecma_ast::Decl::Class(c) => Some(c),
-                        _ => None,
+                use swc_ecma_ast::{Decl, DefaultDecl, ModuleDecl, ModuleItem, Stmt};
+                let (ident, class) = match item {
+                    ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => match &e.decl {
+                        Decl::Class(c) => (&c.ident, &*c.class),
+                        _ => continue,
                     },
-                    swc_ecma_ast::ModuleItem::Stmt(swc_ecma_ast::Stmt::Decl(
-                        swc_ecma_ast::Decl::Class(c),
-                    )) => Some(c),
-                    _ => None,
+                    ModuleItem::Stmt(Stmt::Decl(Decl::Class(c))) => (&c.ident, &*c.class),
+                    ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
+                        DefaultDecl::Class(c) => match &c.ident {
+                            Some(ident) => (ident, &*c.class),
+                            None => continue,
+                        },
+                        _ => continue,
+                    },
+                    _ => continue,
                 };
-                if let Some(cd) = class_decl
-                    && let Some(base_paths) = controller_base_paths(&cd.class)
-                {
-                    let class_tag = strip_suffix_ci(&cd.ident.sym, "Controller").to_string();
+                if let Some(base_paths) = controller_base_paths(class) {
+                    let class_tag = strip_suffix_ci(&ident.sym, "Controller").to_string();
                     self.extract_class(
                         file,
-                        &cd.ident.sym,
-                        &cd.class,
+                        &ident.sym,
+                        class,
                         &base_paths,
                         &class_tag,
                         &mut routes,
@@ -1668,6 +1670,21 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn default_exported_controllers_are_extracted() {
+        let routes = extract_routes(
+            "default-export",
+            r#"
+            @Controller('items')
+            export default class ItemsController {
+                @Get()
+                list() {}
+            }
+            "#,
+        );
+        assert_eq!(find(&routes, HttpMethod::Get, "/items").tags, ["Items"]);
     }
 
     #[test]
