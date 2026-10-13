@@ -110,6 +110,18 @@ pub struct FileSymbols {
     /// `export { Local as Exported }` without `from`: exported name -> the
     /// local declaration or import it names.
     pub local_exports: HashMap<String, String>,
+    /// Declarations and imports exported under their own name (`export class
+    /// X`, `export { X }`). Unused for a declaration file, which exports all.
+    pub exported: std::collections::HashSet<String>,
+    pub is_declaration_file: bool,
+}
+
+impl FileSymbols {
+    /// Whether another module importing `name` from this one sees this
+    /// module's own declaration or import of it.
+    fn exports(&self, name: &str) -> bool {
+        self.is_declaration_file || self.exported.contains(name)
+    }
 }
 
 /// All files indexed by path.
@@ -168,7 +180,7 @@ impl Project {
     ) -> Option<(PathBuf, Symbol)> {
         let mut visited = std::collections::HashSet::new();
         let module = self.resolve_namespace_module(file, ns, &mut visited)?;
-        self.resolve(&module, member)
+        self.resolve_inner(&module, member, true, &mut std::collections::HashSet::new())
     }
 
     /// Find the module file that namespace `ns` aliases, following imports and
@@ -316,7 +328,7 @@ impl Project {
     pub fn resolve(&self, file: &Path, name: &str) -> Option<(PathBuf, Symbol)> {
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
-        self.resolve_inner(file, name, &mut visited)
+        self.resolve_inner(file, name, false, &mut visited)
     }
 
     /// Resolve a numeric `const` by name, following imports and re-exports the
@@ -326,7 +338,7 @@ impl Project {
     pub fn resolve_const_number(&self, file: &Path, name: &str) -> Option<f64> {
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
-        self.resolve_const_inner(file, name, &mut visited)
+        self.resolve_const_inner(file, name, false, &mut visited)
     }
 
     /// Resolve the numeric value of `enum_name.member`, following imports the
@@ -350,33 +362,40 @@ impl Project {
         }
     }
 
+    /// `from_importer`: `name` is looked up as an export of `file`, so a
+    /// declaration or import it doesn't export is skipped.
     fn resolve_const_inner(
         &self,
         file: &Path,
         name: &str,
+        from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<f64> {
         if !visited.insert((file.to_path_buf(), name.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
-        if let Some(v) = fs.const_numbers.get(name) {
+        let visible = !from_importer || fs.exports(name);
+        if visible && let Some(v) = fs.const_numbers.get(name) {
             return Some(*v);
         }
         if let Some(local) = fs.local_exports.get(name) {
-            return self.resolve_const_inner(file, local, visited);
+            return self.resolve_const_inner(file, local, false, visited);
         }
-        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
+        if let Some(binding) = fs
+            .re_exports
+            .get(name)
+            .or_else(|| fs.imports.get(name).filter(|_| visible))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
             let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
-            if let Some(found) = self.resolve_const_inner(&target, &next_name, visited) {
+            if let Some(found) = self.resolve_const_inner(&target, &next_name, true, visited) {
                 return Some(found);
             }
         }
         for spec in &fs.star_re_exports {
             if let Some(target) = self.resolve_module(file, spec)
-                && let Some(found) = self.resolve_const_inner(&target, name, visited)
+                && let Some(found) = self.resolve_const_inner(&target, name, true, visited)
             {
                 return Some(found);
             }
@@ -384,34 +403,40 @@ impl Project {
         None
     }
 
+    /// `from_importer` as in `resolve_const_inner`.
     fn resolve_inner(
         &self,
         file: &Path,
         name: &str,
+        from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<(PathBuf, Symbol)> {
         if !visited.insert((file.to_path_buf(), name.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
-        if let Some(sym) = fs.declared.get(name) {
+        let visible = !from_importer || fs.exports(name);
+        if visible && let Some(sym) = fs.declared.get(name) {
             return Some((file.to_path_buf(), sym.clone()));
         }
         if let Some(local) = fs.local_exports.get(name) {
-            return self.resolve_inner(file, local, visited);
+            return self.resolve_inner(file, local, false, visited);
         }
-        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
+        if let Some(binding) = fs
+            .re_exports
+            .get(name)
+            .or_else(|| fs.imports.get(name).filter(|_| visible))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
             let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
-            if let Some(found) = self.resolve_inner(&target, &next_name, visited) {
+            if let Some(found) = self.resolve_inner(&target, &next_name, true, visited) {
                 return Some(found);
             }
         }
         // `export * from './other'` — search each one.
         for spec in &fs.star_re_exports {
             if let Some(target) = self.resolve_module(file, spec)
-                && let Some(found) = self.resolve_inner(&target, name, visited)
+                && let Some(found) = self.resolve_inner(&target, name, true, visited)
             {
                 return Some(found);
             }
@@ -421,7 +446,10 @@ impl Project {
 }
 
 pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
-    let mut fs = FileSymbols::default();
+    let mut fs = FileSymbols {
+        is_declaration_file: crate::parse::is_declaration_file(&parsed.path),
+        ..FileSymbols::default()
+    };
     for (index, item) in parsed.module.body.iter().enumerate() {
         if let Some((name, symbol)) = declared_symbol(&parsed.module, index) {
             fs.declared.insert(name, symbol);
@@ -433,7 +461,10 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
             ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, &mut fs),
             ModuleItem::ModuleDecl(md) => match md {
                 ModuleDecl::Import(i) => collect_import(i, &mut fs),
-                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_consts(decl, &mut fs),
+                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => {
+                    collect_consts(decl, &mut fs);
+                    fs.exported.extend(declared_names(decl));
+                }
                 ModuleDecl::ExportAll(ea) => {
                     fs.star_re_exports
                         .push(ea.src.value.to_string_lossy().into_owned());
@@ -462,8 +493,9 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
                                     );
                                 } else if exported_local != orig_name {
                                     fs.local_exports.insert(exported_local, orig_name);
+                                } else {
+                                    fs.exported.insert(orig_name);
                                 }
-                                // Bare `export { X }` — X is already in declared/imports.
                             }
                             ExportSpecifier::Namespace(ns) => {
                                 // `export * as Ns from "./other"`.
@@ -482,6 +514,22 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
         }
     }
     fs
+}
+
+/// The names a declaration introduces.
+fn declared_names(decl: &Decl) -> Vec<String> {
+    match decl {
+        Decl::Class(c) => vec![c.ident.sym.to_string()],
+        Decl::TsInterface(i) => vec![i.id.sym.to_string()],
+        Decl::TsTypeAlias(t) => vec![t.id.sym.to_string()],
+        Decl::TsEnum(e) => vec![e.id.sym.to_string()],
+        Decl::Var(v) => v
+            .decls
+            .iter()
+            .filter_map(|d| d.name.as_ident().map(|i| i.id.sym.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The local name `export default …` exports: a named class or interface
@@ -1259,6 +1307,36 @@ mod tests {
             names,
             ["Account", "Card", "Plain", "Legacy", "Account", "Card"].map(|n| Some(n.to_string()))
         );
+    }
+
+    #[test]
+    fn importers_see_only_what_a_module_exports() {
+        let (dir, project) = project(
+            "exported",
+            &[
+                ("real.ts", "export interface Hidden { real: string; }"),
+                (
+                    "barrel.ts",
+                    "interface Hidden { wrong: string; }\nexport * from './real';\n\
+                     const LIMIT = 1;\nexport * from './limits';",
+                ),
+                ("limits.ts", "export const LIMIT = 2;"),
+                ("app.ts", "import { Hidden, LIMIT } from './barrel';"),
+                ("ambient.d.ts", "declare class Ambient { a: string; }"),
+                ("uses-ambient.ts", "import { Ambient } from './ambient';"),
+            ],
+        );
+        let app = dir.join("app.ts");
+        let (file, _) = project.resolve(&app, "Hidden").expect("Hidden resolves");
+        assert_eq!(file, dir.join("real.ts"));
+        assert_eq!(project.resolve_const_number(&app, "LIMIT"), Some(2.0));
+        assert_eq!(
+            resolved_name(&project, &dir.join("uses-ambient.ts"), "Ambient"),
+            Some("Ambient".to_string())
+        );
+        // Inside its own module, the local declaration still wins.
+        let (file, _) = project.resolve(&dir.join("barrel.ts"), "Hidden").unwrap();
+        assert_eq!(file, dir.join("barrel.ts"));
     }
 
     #[test]

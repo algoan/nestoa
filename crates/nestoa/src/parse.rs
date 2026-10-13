@@ -19,6 +19,13 @@ pub struct ParsedFile {
     pub source: Lrc<SourceFile>,
 }
 
+pub fn is_declaration_file(path: &Path) -> bool {
+    let name = path.to_string_lossy();
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
 pub struct ParsingContext {
     pub source_map: Lrc<SourceMap>,
 }
@@ -42,10 +49,7 @@ impl ParsingContext {
             .source_map
             .load_file(path)
             .with_context(|| format!("loading {}", path.display()))?;
-        let name = path.to_string_lossy();
-        let is_dts = [".d.ts", ".d.mts", ".d.cts"]
-            .iter()
-            .any(|ext| name.ends_with(ext));
+        let is_dts = is_declaration_file(path);
         let comments = SingleThreadedComments::default();
         let lexer = Lexer::new(
             Syntax::Typescript(TsSyntax {
