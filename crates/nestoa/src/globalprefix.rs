@@ -103,22 +103,27 @@ impl Bootstrap {
 pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Bootstrap {
     let mut files: Vec<&PathBuf> = files.iter().collect();
     files.sort_by_key(|f| (f.file_name().is_none_or(|n| n != "main.ts"), *f));
-    let versioning = files.iter().find_map(|f| uri_versioning(project, f));
+    // The first `enableVersioning` call decides, even one that leaves paths
+    // unversioned (header versioning).
+    let versioning = files
+        .iter()
+        .find_map(|f| Some((*f, call_args(project, f, "enableVersioning")?)))
+        .and_then(|(f, args)| uri_versioning(project, f, &args));
     let mut bootstrap = global_prefix(project, &files, project_root);
     bootstrap.versioning = versioning;
     bootstrap
 }
 
-/// `app.enableVersioning(...)` in `file`, if it enables URI versioning (the
-/// default type).
-fn uri_versioning(project: &Project, file: &Path) -> Option<UriVersioning> {
-    let parsed = project.files.get(file)?;
-    let mut finder = CallFinder {
-        method: "enableVersioning",
-        args: None,
-    };
-    parsed.module.visit_with(&mut finder);
-    let args = finder.args?;
+/// The arguments of the first `*.<method>(...)` call in `file`.
+fn call_args(project: &Project, file: &Path, method: &'static str) -> Option<Vec<Expr>> {
+    let mut finder = CallFinder { method, args: None };
+    project.files.get(file)?.module.visit_with(&mut finder);
+    finder.args
+}
+
+/// The URI versioning `enableVersioning(args)`, written in `file`, enables:
+/// `None` for another type (URI is the default).
+fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVersioning> {
     let mut versioning = UriVersioning {
         prefix: "v".to_string(),
         default_versions: vec![None],
@@ -126,19 +131,22 @@ fn uri_versioning(project: &Project, file: &Path) -> Option<UriVersioning> {
     // Options passed through a variable are read from its initializer; any
     // other expression, or a `type` that isn't plainly `VersioningType.URI`,
     // can't be told apart from header versioning, which leaves paths alone.
+    // Their values are evaluated in the file declaring them.
     let resolved;
-    let options = match args.first() {
+    let (file, options) = match args.first() {
         None => return Some(versioning),
-        Some(Expr::Object(o)) => o,
+        Some(Expr::Object(o)) => (file.to_path_buf(), o),
         Some(Expr::Ident(i)) => {
-            resolved = project.resolve_const(file, &i.sym)?.1;
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            resolved = c;
             match resolved.init() {
-                Expr::Object(o) => o,
+                Expr::Object(o) => (decl_file, o),
                 _ => return None,
             }
         }
         Some(_) => return None,
     };
+    let file = file.as_path();
     match object_value(options, "type") {
         None => {}
         Some(Expr::Member(MemberExpr {
@@ -407,7 +415,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nestoa-gp-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        dir.canonicalize().unwrap()
     }
 
     #[test]
@@ -529,5 +537,46 @@ mod tests {
                 .versioning
                 .is_none()
         );
+    }
+
+    #[test]
+    fn the_first_versioning_call_decides_and_imported_options_use_their_module() {
+        let root = temp_root("versioning-first");
+        let project = project_from(
+            &root,
+            &[
+                (
+                    "src/main.ts",
+                    "app.enableVersioning({ type: VersioningType.HEADER, header: 'X-V' });",
+                ),
+                ("src/other.ts", "app.enableVersioning();"),
+            ],
+        );
+        assert!(
+            detect(&project, &files(&project), &root)
+                .versioning
+                .is_none()
+        );
+
+        let imported = temp_root("versioning-imported");
+        let project = project_from(
+            &imported,
+            &[
+                (
+                    "src/versioning.ts",
+                    "const PREFIX = 'ver';\nconst DEFAULT = '3';\n\
+                     export const options = { type: VersioningType.URI, prefix: PREFIX, defaultVersion: DEFAULT };",
+                ),
+                (
+                    "src/main.ts",
+                    "import { options } from './versioning';\napp.enableVersioning(options);",
+                ),
+            ],
+        );
+        let versioning = detect(&project, &files(&project), &imported)
+            .versioning
+            .expect("URI versioning");
+        assert_eq!(versioning.prefix, "ver");
+        assert_eq!(versioning.default_versions, [Some("3".to_string())]);
     }
 }
