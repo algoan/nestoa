@@ -154,6 +154,22 @@ pub struct RequestBody {
     pub description: Option<String>,
 }
 
+/// How many base classes a controller's handlers are looked for in.
+const MAX_INHERITANCE_DEPTH: usize = 16;
+
+/// What a controller contributes to each of its handlers' routes.
+struct ClassCtx<'c> {
+    name: &'c str,
+    base_paths: &'c [String],
+    tag: &'c str,
+    /// `@UseInterceptors(...)` on the controller, which run before the
+    /// method's own.
+    interceptors: Vec<String>,
+    opted_out: bool,
+    has_roles: bool,
+    guarded: bool,
+}
+
 pub struct Extractor<'a> {
     pub config: &'a Config,
     pub project: &'a Project,
@@ -215,163 +231,184 @@ impl<'a> Extractor<'a> {
         tag: &str,
         out: &mut Vec<Route>,
     ) {
-        // `@UseInterceptors(...)` applied at the controller level — these run
-        // before any method-level ones, so they lead the combined list.
-        let class_interceptors = collect_interceptors(&class.decorators);
         // Controller-level error signals: a decorator on the class applies to
         // every method (auth opt-out, roles, and — in per-controller auth mode —
         // an `@UseGuards(AuthGuard)`). Computed to plain bools so no borrow of
         // `self.config` is held across the `&mut self` calls in the loop below.
-        let er_cfg = &self.config.error_responses;
-        let class_opted_out = has_any_decorator(&class.decorators, &er_cfg.auth_opt_out);
-        let class_has_roles = has_any_decorator(&class.decorators, &er_cfg.role_decorators);
-        let class_guarded = has_use_guards(&class.decorators, &er_cfg.auth_guards);
-        for member in &class.body {
-            let ClassMember::Method(m) = member else {
-                continue;
-            };
-            if !matches!(m.kind, MethodKind::Method) {
-                continue;
-            }
-            // Decorators apply bottom-up, so with several verb decorators the
-            // topmost one is applied last and is the one NestJS registers.
-            let mut http: Option<(VerbDecorator, &Decorator)> = None;
-            let mut deprecated = false;
-            let mut http_code: Option<u16> = None;
-            for d in &m.function.decorators {
-                let name = decorator_name(d);
-                if let Some(verb) = VerbDecorator::from_name(&name) {
-                    if http.is_none() {
-                        http = Some((verb, d));
-                    }
+        let er = &self.config.error_responses;
+        let class_ctx = ClassCtx {
+            name: class_name,
+            base_paths,
+            tag,
+            interceptors: collect_interceptors(&class.decorators),
+            opted_out: has_any_decorator(&class.decorators, &er.auth_opt_out),
+            has_roles: has_any_decorator(&class.decorators, &er.role_decorators),
+            guarded: has_use_guards(&class.decorators, &er.auth_guards),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut owner = (file.to_path_buf(), None::<crate::symbols::Shared<Class>>);
+        for _ in 0..MAX_INHERITANCE_DEPTH {
+            let class: &Class = owner.1.as_deref().unwrap_or(class);
+            for member in &class.body {
+                let ClassMember::Method(m) = member else {
                     continue;
-                }
-                if name == "HttpCode" {
-                    // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
-                    // where the argument names a numeric `const` (possibly
-                    // imported from another module, e.g. `@algoan/multi-status`).
-                    http_code = numeric_arg(d)
-                        .or_else(|| {
-                            ident_arg(d)
-                                .and_then(|c| self.project.resolve_const_number(file, &c))
-                                .map(|v| v as u16)
-                        })
-                        .or_else(|| {
-                            member_arg(d)
-                                .and_then(|(obj, prop)| self.member_status(file, &obj, &prop))
-                        });
-                }
-            }
-            let Some((verb, verb_decorator)) = http else {
-                continue;
-            };
-            let handler = format!("{class_name}.{}", prop_name_text(&m.key));
-            let Some(sub_paths) = self.decorator_paths(file, verb_decorator, &handler) else {
-                continue;
-            };
-            let mut interceptor_names = class_interceptors.clone();
-            interceptor_names.extend(collect_interceptors(&m.function.decorators));
-            // A controller and/or a route may declare multiple paths; the
-            // effective routes are the cross product. A route with no path
-            // argument contributes a single `None` sub-path.
-            let sub_opts: Vec<Option<&str>> = if sub_paths.is_empty() {
-                vec![None]
-            } else {
-                sub_paths.iter().map(|s| Some(s.as_str())).collect()
-            };
-            let mut full_paths: Vec<ConcretePath> = Vec::new();
-            for base in base_paths {
-                for sub in &sub_opts {
-                    let joined = join_paths(self.config.base_path.as_deref(), base, *sub);
-                    for path in concrete_paths(&joined) {
-                        if !full_paths.contains(&path) {
-                            full_paths.push(path);
-                        }
-                    }
-                }
-            }
-
-            // JSDoc on the method
-            let mut method_doc = JsDoc::default();
-            if let Some(doc) = self
-                .project
-                .files
-                .get(file)
-                .and_then(|f| f.docs.jsdoc(m.span.lo))
-            {
-                method_doc = doc;
-            }
-            if method_doc.deprecated {
-                deprecated = true;
-            }
-
-            // Parameters
-            let mut params: Vec<RouteParam> = Vec::new();
-            let mut request_body: Option<RequestBody> = None;
-            let mut body_fields: Vec<BodyField> = Vec::new();
-            for p in &m.function.params {
-                if let Some(parsed) = self.classify_param(file, p, &method_doc) {
-                    match parsed {
-                        ParsedParam::Routed(rp) => params.push(rp),
-                        ParsedParam::Body(b) => request_body = Some(b),
-                        ParsedParam::BodyField(f) => body_fields.push(f),
-                        ParsedParam::Ignored => {}
-                    }
-                }
-            }
-            // `@Body('field')` reads one property of the body; a whole-body
-            // `@Body()` alongside already describes all of them.
-            if request_body.is_none() && !body_fields.is_empty() {
-                request_body = Some(body_from_fields(body_fields));
-            }
-            // Interceptors may accept a request body in a different shape than
-            // the handler's `@Body` parameter (e.g. single-object-or-array).
-            if let Some(body) = request_body.as_mut() {
-                request_body_transform(self.config, &interceptor_names, body);
-            }
-
-            // Response type. An interceptor may reshape the wire response (e.g.
-            // pagination); when it does, the rewritten schema replaces the
-            // declared return type — and we skip lowering the declared type at
-            // all so its now-unreferenced components don't leak into the doc.
-            let mut response_value: Option<Value> = None;
-            if let Some(ret) = m.function.return_type.as_ref() {
-                let rewritten = if interceptor_names.is_empty() {
-                    None
-                } else {
-                    rewrite_response(
-                        self.project,
-                        self.config,
-                        file,
-                        &ret.type_ann,
-                        &interceptor_names,
-                        self.components,
-                    )
                 };
-                if rewritten.is_some() {
-                    response_value = rewritten;
-                } else {
-                    let mut ctx = SchemaCtx {
-                        project: self.project,
-                        components: self.components,
-                        type_env: None,
-                        current_owner: None,
-                        instantiating: Vec::new(),
-                        passthrough_types: &self.config.passthrough_types,
-                    };
-                    let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
-                    if !schema.is_null() && schema != json!({}) {
-                        response_value = Some(schema);
+                // A method the subclass redeclares shadows the base one.
+                if matches!(m.kind, MethodKind::Method) && seen.insert(prop_name_text(&m.key)) {
+                    self.extract_method(&owner.0, m, &class_ctx, out);
+                }
+            }
+            let Some(base) = self.base_class(&owner.0, class) else {
+                break;
+            };
+            owner = (base.0, Some(base.1));
+        }
+    }
+
+    /// The class `class` extends, with its file, when it is a named class.
+    fn base_class(
+        &self,
+        file: &Path,
+        class: &Class,
+    ) -> Option<(PathBuf, crate::symbols::Shared<Class>)> {
+        let Expr::Ident(name) = class.super_class.as_deref()? else {
+            return None;
+        };
+        match self.project.resolve(file, &name.sym)? {
+            (base_file, crate::symbols::Symbol::Class(c)) => Some((base_file, c)),
+            _ => None,
+        }
+    }
+
+    /// The routes of one handler method of a controller, declared in `file`
+    /// (the controller's, or a base class's).
+    fn extract_method(
+        &mut self,
+        file: &Path,
+        m: &swc_ecma_ast::ClassMethod,
+        class: &ClassCtx,
+        out: &mut Vec<Route>,
+    ) {
+        let (class_name, base_paths, tag) = (class.name, class.base_paths, class.tag);
+        let class_interceptors = &class.interceptors;
+        let (class_opted_out, class_has_roles, class_guarded) =
+            (class.opted_out, class.has_roles, class.guarded);
+        // Decorators apply bottom-up, so with several verb decorators the
+        // topmost one is applied last and is the one NestJS registers.
+        let mut http: Option<(VerbDecorator, &Decorator)> = None;
+        let mut deprecated = false;
+        let mut http_code: Option<u16> = None;
+        for d in &m.function.decorators {
+            let name = decorator_name(d);
+            if let Some(verb) = VerbDecorator::from_name(&name) {
+                if http.is_none() {
+                    http = Some((verb, d));
+                }
+                continue;
+            }
+            if name == "HttpCode" {
+                // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
+                // where the argument names a numeric `const` (possibly
+                // imported from another module, e.g. `@algoan/multi-status`).
+                http_code = numeric_arg(d)
+                    .or_else(|| {
+                        ident_arg(d)
+                            .and_then(|c| self.project.resolve_const_number(file, &c))
+                            .map(|v| v as u16)
+                    })
+                    .or_else(|| {
+                        member_arg(d).and_then(|(obj, prop)| self.member_status(file, &obj, &prop))
+                    });
+            }
+        }
+        let Some((verb, verb_decorator)) = http else {
+            return;
+        };
+        let handler = format!("{class_name}.{}", prop_name_text(&m.key));
+        let Some(sub_paths) = self.decorator_paths(file, verb_decorator, &handler) else {
+            return;
+        };
+        let mut interceptor_names = class_interceptors.clone();
+        interceptor_names.extend(collect_interceptors(&m.function.decorators));
+        // A controller and/or a route may declare multiple paths; the
+        // effective routes are the cross product. A route with no path
+        // argument contributes a single `None` sub-path.
+        let sub_opts: Vec<Option<&str>> = if sub_paths.is_empty() {
+            vec![None]
+        } else {
+            sub_paths.iter().map(|s| Some(s.as_str())).collect()
+        };
+        let mut full_paths: Vec<ConcretePath> = Vec::new();
+        for base in base_paths {
+            for sub in &sub_opts {
+                let joined = join_paths(self.config.base_path.as_deref(), base, *sub);
+                for path in concrete_paths(&joined) {
+                    if !full_paths.contains(&path) {
+                        full_paths.push(path);
                     }
                 }
             }
+        }
 
-            // `@route-mapping` lets one method serving several paths return a
-            // distinct schema per path, keyed by a trailing path suffix. Resolve
-            // each mapped type once (resolution registers components), then match
-            // it against each concrete path below.
-            let route_mapping: Vec<(String, Value)> = if method_doc.route_mapping.is_empty() {
-                Vec::new()
+        // JSDoc on the method
+        let mut method_doc = JsDoc::default();
+        if let Some(doc) = self
+            .project
+            .files
+            .get(file)
+            .and_then(|f| f.docs.jsdoc(m.span.lo))
+        {
+            method_doc = doc;
+        }
+        if method_doc.deprecated {
+            deprecated = true;
+        }
+
+        // Parameters
+        let mut params: Vec<RouteParam> = Vec::new();
+        let mut request_body: Option<RequestBody> = None;
+        let mut body_fields: Vec<BodyField> = Vec::new();
+        for p in &m.function.params {
+            if let Some(parsed) = self.classify_param(file, p, &method_doc) {
+                match parsed {
+                    ParsedParam::Routed(rp) => params.push(rp),
+                    ParsedParam::Body(b) => request_body = Some(b),
+                    ParsedParam::BodyField(f) => body_fields.push(f),
+                    ParsedParam::Ignored => {}
+                }
+            }
+        }
+        // `@Body('field')` reads one property of the body; a whole-body
+        // `@Body()` alongside already describes all of them.
+        if request_body.is_none() && !body_fields.is_empty() {
+            request_body = Some(body_from_fields(body_fields));
+        }
+        // Interceptors may accept a request body in a different shape than
+        // the handler's `@Body` parameter (e.g. single-object-or-array).
+        if let Some(body) = request_body.as_mut() {
+            request_body_transform(self.config, &interceptor_names, body);
+        }
+
+        // Response type. An interceptor may reshape the wire response (e.g.
+        // pagination); when it does, the rewritten schema replaces the
+        // declared return type — and we skip lowering the declared type at
+        // all so its now-unreferenced components don't leak into the doc.
+        let mut response_value: Option<Value> = None;
+        if let Some(ret) = m.function.return_type.as_ref() {
+            let rewritten = if interceptor_names.is_empty() {
+                None
+            } else {
+                rewrite_response(
+                    self.project,
+                    self.config,
+                    file,
+                    &ret.type_ann,
+                    &interceptor_names,
+                    self.components,
+                )
+            };
+            if rewritten.is_some() {
+                response_value = rewritten;
             } else {
                 let mut ctx = SchemaCtx {
                     project: self.project,
@@ -381,103 +418,124 @@ impl<'a> Extractor<'a> {
                     instantiating: Vec::new(),
                     passthrough_types: &self.config.passthrough_types,
                 };
-                method_doc
-                    .route_mapping
-                    .iter()
-                    .map(|(suffix, type_name)| {
-                        (suffix.clone(), ctx.named_type_to_schema(file, type_name))
-                    })
-                    .collect()
-            };
-
-            let status_code = http_code.unwrap_or(verb.default_status());
-
-            // Error-response signals for this method (path-independent parts).
-            // The auth opt-out and role decorators apply if present on either the
-            // method or its controller; `auth_active` follows the configured
-            // scope. Pipe names come from every parameter's decorators.
-            let er = &self.config.error_responses;
-            let opted_out =
-                class_opted_out || has_any_decorator(&m.function.decorators, &er.auth_opt_out);
-            let has_roles =
-                class_has_roles || has_any_decorator(&m.function.decorators, &er.role_decorators);
-            let auth_active = match er.auth {
-                AuthScope::Global => true,
-                AuthScope::PerController => {
-                    class_guarded || has_use_guards(&m.function.decorators, &er.auth_guards)
+                let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
+                if !schema.is_null() && schema != json!({}) {
+                    response_value = Some(schema);
                 }
-                AuthScope::None => false,
-            };
-            let pipe_names: Vec<String> = m
-                .function
-                .params
-                .iter()
-                .flat_map(param_pipe_names)
-                .collect();
-            let scanned_throws: Vec<u16> = if er.scan_throws {
-                scanned_throw_statuses(&m.function)
-            } else {
-                Vec::new()
-            };
-
-            // Per-path response is filled in below: an interceptor may override
-            // it for only some of the route's sibling paths (e.g. a signing
-            // interceptor that rewrites the body solely on the `/jws` variant).
-            let template = Route {
-                method: HttpMethod::Get,
-                path: String::new(),
-                summary: method_doc.summary.clone(),
-                description: method_doc.description.clone(),
-                deprecated,
-                parameters: params,
-                request_body,
-                response: None,
-                status_code,
-                tags: vec![tag.to_string()],
-                errors: BTreeMap::new(),
-                catch_all: matches!(verb, VerbDecorator::All),
-                handler,
-                file: file.to_path_buf(),
-            };
-            let has_body = template.request_body.is_some();
-            for (&method, concrete) in verb
-                .methods()
-                .iter()
-                .flat_map(|m| full_paths.iter().map(move |p| (m, p)))
-            {
-                let full_path = concrete.path.clone();
-                // A `@route-mapping` match is the most specific author intent, so
-                // it wins over an interceptor override or the declared return type.
-                let response = route_mapping
-                    .iter()
-                    .find(|(suffix, _)| path_matches_suffix(&full_path, suffix))
-                    .map(|(_, schema)| schema.clone())
-                    .or_else(|| response_override(self.config, &interceptor_names, &full_path))
-                    .or_else(|| response_value.clone());
-                let signals = errors::RouteSignals {
-                    auth_active,
-                    auth_opted_out: opted_out,
-                    has_roles,
-                    has_body,
-                    pipes: &pipe_names,
-                    throws: &method_doc.throws,
-                    scanned_throws: &scanned_throws,
-                    method: method.as_lower(),
-                    path: &full_path,
-                };
-                let route_errors = errors::compute(&signals, er);
-                out.push(Route {
-                    method,
-                    parameters: with_patterns(
-                        params_for_path(&template.parameters, &full_path),
-                        &concrete.patterns,
-                    ),
-                    path: full_path,
-                    response,
-                    errors: route_errors,
-                    ..template.clone()
-                });
             }
+        }
+
+        // `@route-mapping` lets one method serving several paths return a
+        // distinct schema per path, keyed by a trailing path suffix. Resolve
+        // each mapped type once (resolution registers components), then match
+        // it against each concrete path below.
+        let route_mapping: Vec<(String, Value)> = if method_doc.route_mapping.is_empty() {
+            Vec::new()
+        } else {
+            let mut ctx = SchemaCtx {
+                project: self.project,
+                components: self.components,
+                type_env: None,
+                current_owner: None,
+                instantiating: Vec::new(),
+                passthrough_types: &self.config.passthrough_types,
+            };
+            method_doc
+                .route_mapping
+                .iter()
+                .map(|(suffix, type_name)| {
+                    (suffix.clone(), ctx.named_type_to_schema(file, type_name))
+                })
+                .collect()
+        };
+
+        let status_code = http_code.unwrap_or(verb.default_status());
+
+        // Error-response signals for this method (path-independent parts).
+        // The auth opt-out and role decorators apply if present on either the
+        // method or its controller; `auth_active` follows the configured
+        // scope. Pipe names come from every parameter's decorators.
+        let er = &self.config.error_responses;
+        let opted_out =
+            class_opted_out || has_any_decorator(&m.function.decorators, &er.auth_opt_out);
+        let has_roles =
+            class_has_roles || has_any_decorator(&m.function.decorators, &er.role_decorators);
+        let auth_active = match er.auth {
+            AuthScope::Global => true,
+            AuthScope::PerController => {
+                class_guarded || has_use_guards(&m.function.decorators, &er.auth_guards)
+            }
+            AuthScope::None => false,
+        };
+        let pipe_names: Vec<String> = m
+            .function
+            .params
+            .iter()
+            .flat_map(param_pipe_names)
+            .collect();
+        let scanned_throws: Vec<u16> = if er.scan_throws {
+            scanned_throw_statuses(&m.function)
+        } else {
+            Vec::new()
+        };
+
+        // Per-path response is filled in below: an interceptor may override
+        // it for only some of the route's sibling paths (e.g. a signing
+        // interceptor that rewrites the body solely on the `/jws` variant).
+        let template = Route {
+            method: HttpMethod::Get,
+            path: String::new(),
+            summary: method_doc.summary.clone(),
+            description: method_doc.description.clone(),
+            deprecated,
+            parameters: params,
+            request_body,
+            response: None,
+            status_code,
+            tags: vec![tag.to_string()],
+            errors: BTreeMap::new(),
+            catch_all: matches!(verb, VerbDecorator::All),
+            handler,
+            file: file.to_path_buf(),
+        };
+        let has_body = template.request_body.is_some();
+        for (&method, concrete) in verb
+            .methods()
+            .iter()
+            .flat_map(|m| full_paths.iter().map(move |p| (m, p)))
+        {
+            let full_path = concrete.path.clone();
+            // A `@route-mapping` match is the most specific author intent, so
+            // it wins over an interceptor override or the declared return type.
+            let response = route_mapping
+                .iter()
+                .find(|(suffix, _)| path_matches_suffix(&full_path, suffix))
+                .map(|(_, schema)| schema.clone())
+                .or_else(|| response_override(self.config, &interceptor_names, &full_path))
+                .or_else(|| response_value.clone());
+            let signals = errors::RouteSignals {
+                auth_active,
+                auth_opted_out: opted_out,
+                has_roles,
+                has_body,
+                pipes: &pipe_names,
+                throws: &method_doc.throws,
+                scanned_throws: &scanned_throws,
+                method: method.as_lower(),
+                path: &full_path,
+            };
+            let route_errors = errors::compute(&signals, er);
+            out.push(Route {
+                method,
+                parameters: with_patterns(
+                    params_for_path(&template.parameters, &full_path),
+                    &concrete.patterns,
+                ),
+                path: full_path,
+                response,
+                errors: route_errors,
+                ..template.clone()
+            });
         }
     }
 
@@ -1833,6 +1891,55 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn inherited_handlers_are_extracted() {
+        let (routes, _) = extract_from(
+            "inherited",
+            &[
+                (
+                    "base.ts",
+                    "export class Item { id: string; }\n\
+                     export class Root { @Get('root') root(): Item { return null as any; } }\n\
+                     export class BaseCrud extends Root {\n\
+                       @Get('inherited') inherited(): Item { return null as any; }\n\
+                       @Get('shadowed') shadowed() {}\n\
+                     }",
+                ),
+                (
+                    "ctrl.ts",
+                    r#"
+                    import { BaseCrud } from './base';
+                    @Controller('crud')
+                    export class CrudController extends BaseCrud {
+                        @Get('own') own() {}
+                        @Post('shadowed') shadowed() {}
+                    }
+                    "#,
+                ),
+            ],
+            "ctrl.ts",
+        );
+        let mut found: Vec<String> = routes
+            .iter()
+            .map(|r| format!("{} {} {}", r.method.as_lower(), r.path, r.handler))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "get /crud/inherited CrudController.inherited",
+                "get /crud/own CrudController.own",
+                "get /crud/root CrudController.root",
+                "post /crud/shadowed CrudController.shadowed",
+            ]
+        );
+        let inherited = find(&routes, HttpMethod::Get, "/crud/inherited");
+        assert_eq!(
+            inherited.response,
+            Some(json!({"$ref": "#/components/schemas/Item"}))
+        );
     }
 
     #[test]
