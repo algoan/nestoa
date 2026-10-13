@@ -85,7 +85,8 @@ fn class_of(item: &ModuleItem) -> Option<(&Ident, &Class)> {
 
 #[derive(Clone)]
 pub struct ImportBinding {
-    /// The exported name on the other side. None for default imports / namespace imports.
+    /// The exported name on the other side (`default` for a default import).
+    /// None for a namespace import.
     pub imported: Option<String>,
     /// Raw module specifier (e.g. "./foo", "@nestjs/common").
     pub specifier: String,
@@ -193,8 +194,7 @@ impl Project {
             let target = self.resolve_module(file, &binding.specifier)?;
             return match &binding.imported {
                 // `import * as Ns from "spec"` — the target module is the namespace.
-                None if binding.is_namespace => Some(target),
-                None => None, // default import — not a namespace
+                None => Some(target),
                 // `import { Ns } from "spec"` — find namespace `Ns` in the target.
                 Some(imported) => self.resolve_namespace_module(&target, imported, visited),
             };
@@ -426,6 +426,9 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
         if let Some((name, symbol)) = declared_symbol(&parsed.module, index) {
             fs.declared.insert(name, symbol);
         }
+        if let Some(name) = default_export_name(item) {
+            fs.local_exports.insert("default".to_string(), name);
+        }
         match item {
             ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, &mut fs),
             ModuleItem::ModuleDecl(md) => match md {
@@ -481,6 +484,29 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
     fs
 }
 
+/// The local name `export default …` exports: a named class or interface
+/// declaration, or an identifier (`export default Account;`, or a CommonJS
+/// declaration file's `export = Account;`).
+fn default_export_name(item: &ModuleItem) -> Option<String> {
+    match item {
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
+            DefaultDecl::Class(c) => c.ident.as_ref().map(|i| i.sym.to_string()),
+            DefaultDecl::TsInterfaceDecl(i) => Some(i.id.sym.to_string()),
+            DefaultDecl::Fn(_) => None,
+        },
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(
+            swc_ecma_ast::ExportDefaultExpr { expr, .. },
+        ))
+        | ModuleItem::ModuleDecl(ModuleDecl::TsExportAssignment(
+            swc_ecma_ast::TsExportAssignment { expr, .. },
+        )) => match &**expr {
+            swc_ecma_ast::Expr::Ident(i) => Some(i.sym.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The named class, interface, type alias or enum `module.body[index]`
 /// declares, if any.
 fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol)> {
@@ -499,8 +525,15 @@ fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol
         class_of(item).map(|(_, c)| c)
     }
     fn interface(item: &ModuleItem) -> Option<&TsInterfaceDecl> {
-        match declaration(item)? {
-            Decl::TsInterface(i) => Some(i),
+        match (declaration(item), item) {
+            (Some(Decl::TsInterface(i)), _) => Some(i),
+            (
+                None,
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(ExportDefaultDecl {
+                    decl: DefaultDecl::TsInterfaceDecl(i),
+                    ..
+                })),
+            ) => Some(i),
             _ => None,
         }
     }
@@ -521,11 +554,11 @@ fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol
         let symbol = Symbol::Class(share(module, index, class));
         return Some((ident.sym.to_string(), symbol));
     }
+    if let Some(i) = interface(item) {
+        let symbol = Symbol::Interface(share(module, index, interface));
+        return Some((i.id.sym.to_string(), symbol));
+    }
     Some(match declaration(item)? {
-        Decl::TsInterface(i) => (
-            i.id.sym.to_string(),
-            Symbol::Interface(share(module, index, interface)),
-        ),
         Decl::TsTypeAlias(t) => (
             t.id.sym.to_string(),
             Symbol::TypeAlias(share(module, index, alias)),
@@ -627,7 +660,7 @@ fn collect_import(i: &ImportDecl, fs: &mut FileSymbols) {
                 fs.imports.insert(
                     d.local.sym.to_string(),
                     ImportBinding {
-                        imported: None,
+                        imported: Some("default".to_string()),
                         specifier: specifier.clone(),
                         is_namespace: false,
                     },
@@ -1185,6 +1218,46 @@ mod tests {
         assert_eq!(
             resolved_name(&project, &dir.join("src/app.ts"), "Ghost"),
             None
+        );
+    }
+
+    #[test]
+    fn default_imports_and_exports_resolve() {
+        let (dir, project) = project(
+            "default",
+            &[
+                ("a.dto.ts", "export default class Account { id: string; }"),
+                (
+                    "card.ts",
+                    "export default interface Card { last4: string; }",
+                ),
+                (
+                    "plain.ts",
+                    "class Plain { p: string; }\nexport default Plain;",
+                ),
+                (
+                    "legacy.d.ts",
+                    "declare class Legacy { l: string; }\nexport = Legacy;",
+                ),
+                (
+                    "barrel.ts",
+                    "export { default as Owner } from './a.dto';\nexport { default } from './card';",
+                ),
+                (
+                    "app.ts",
+                    "import Acc from './a.dto';\nimport C from './card';\nimport P from './plain';\n\
+                     import L from './legacy';\nimport Def, { Owner } from './barrel';",
+                ),
+            ],
+        );
+        let app = dir.join("app.ts");
+        let names: Vec<_> = ["Acc", "C", "P", "L", "Owner", "Def"]
+            .iter()
+            .map(|n| resolved_name(&project, &app, n))
+            .collect();
+        assert_eq!(
+            names,
+            ["Account", "Card", "Plain", "Legacy", "Account", "Card"].map(|n| Some(n.to_string()))
         );
     }
 
