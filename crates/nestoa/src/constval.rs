@@ -99,12 +99,46 @@ fn member(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<E
             .1;
     }
     let (decl_file, c) = project.resolve_const(file, &root)?;
-    let mut value = unwrap(c.init());
-    for prop in &props {
-        let Expr::Object(o) = value else { return None };
-        value = unwrap(object_prop(o, prop)?);
+    walk(project, &decl_file, c.init(), &props, depth + 1)
+}
+
+/// The value at `props` inside `value`, written in `file`: object literals,
+/// shorthand properties (`{ LIST }`) and constants naming other objects are
+/// followed.
+fn walk(
+    project: &Project,
+    file: &Path,
+    value: &Expr,
+    props: &[String],
+    depth: usize,
+) -> Option<EnumValue> {
+    let Some((first, rest)) = props.split_first() else {
+        return eval(project, file, value, depth);
+    };
+    if depth > MAX_DEPTH {
+        return None;
     }
-    eval(project, &decl_file, value, depth + 1)
+    match unwrap(value) {
+        Expr::Object(o) => match object_prop(o, first)? {
+            Property::Value(v) => walk(project, file, v, rest, depth),
+            Property::Shorthand(name) => {
+                let (decl_file, c) = project.resolve_const(file, name)?;
+                walk(project, &decl_file, c.init(), rest, depth + 1)
+            }
+        },
+        Expr::Ident(i) => {
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            walk(project, &decl_file, c.init(), props, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// An object literal property's value: an expression, or the variable a
+/// shorthand property (`{ LIST }`) names.
+enum Property<'a> {
+    Value(&'a Expr),
+    Shorthand(&'a str),
 }
 
 /// `a.b.c` as `("a", ["b", "c"])`.
@@ -123,26 +157,40 @@ fn member_chain(expr: &Expr) -> Option<(String, Vec<String>)> {
     }
 }
 
-fn object_prop<'a>(o: &'a ObjectLit, name: &str) -> Option<&'a Expr> {
+fn object_prop<'a>(o: &'a ObjectLit, name: &str) -> Option<Property<'a>> {
     o.props.iter().rev().find_map(|p| {
         let PropOrSpread::Prop(p) = p else {
             return None;
         };
-        let Prop::KeyValue(kv) = p.as_ref() else {
-            return None;
-        };
-        let key = match &kv.key {
-            PropName::Ident(i) => i.sym.to_string(),
-            PropName::Str(s) => s.value.to_string_lossy().into_owned(),
-            _ => return None,
-        };
-        (key == name).then_some(&*kv.value)
+        match p.as_ref() {
+            Prop::KeyValue(kv) => {
+                let key = match &kv.key {
+                    PropName::Ident(i) => i.sym.to_string(),
+                    PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+                    _ => return None,
+                };
+                (key == name).then_some(Property::Value(&kv.value))
+            }
+            Prop::Shorthand(i) => (i.sym == name).then_some(Property::Shorthand(&i.sym)),
+            _ => None,
+        }
     })
+}
+
+/// `a.b.c` for an identifier or a chain of property accesses.
+pub fn dotted_name(expr: &Expr) -> Option<String> {
+    let (root, props) = member_chain(expr)?;
+    Some(
+        std::iter::once(root)
+            .chain(props)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
 /// `expr` without the wrappers that don't change its value: parentheses,
 /// `as const`, `as T`, `satisfies T`.
-fn unwrap(expr: &Expr) -> &Expr {
+pub fn unwrap(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(p) => unwrap(&p.expr),
         Expr::TsConstAssertion(c) => unwrap(&c.expr),

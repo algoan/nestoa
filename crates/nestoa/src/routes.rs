@@ -279,16 +279,15 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// The class `class` extends, with its file, when it is a named class.
+    /// The class `class` extends, with its file, when it is a named class
+    /// (`Base`, or a namespace member such as `Crud.Base`).
     fn base_class(
         &self,
         file: &Path,
         class: &Class,
     ) -> Option<(PathBuf, crate::symbols::Shared<Class>)> {
-        let Expr::Ident(name) = class.super_class.as_deref()? else {
-            return None;
-        };
-        match self.project.resolve(file, &name.sym)? {
+        let name = crate::constval::dotted_name(class.super_class.as_deref()?)?;
+        match self.project.resolve(file, &name)? {
             (base_file, crate::symbols::Symbol::Class(c)) => Some((base_file, c)),
             _ => None,
         }
@@ -2440,15 +2439,17 @@ mod tests {
                 ("base.ts", &base),
                 (
                     "ctrl.ts",
-                    "import { L20, A } from './base';\n\
+                    "import { L20, A } from './base';\nimport * as Base from './base';\n\
                      @Controller('deep') export class DeepController extends L20 {}\n\
-                     @Controller('cycle') export class CycleController extends A { @Get() own() {} }",
+                     @Controller('cycle') export class CycleController extends A { @Get() own() {} }\n\
+                     @Controller('qualified') export class QualifiedController extends Base.L0 {}",
                 ),
             ],
             "ctrl.ts",
         );
         find(&routes, HttpMethod::Get, "/deep/deepest");
         find(&routes, HttpMethod::Get, "/cycle");
+        find(&routes, HttpMethod::Get, "/qualified/deepest");
     }
 
     #[test]
@@ -2550,7 +2551,9 @@ mod tests {
                 (
                     "routes.ts",
                     "export const BASE = 'things';\n\
-                     export const ROUTES = { LIST: 'list', ITEM: { ONE: ':id' } } as const;\n\
+                     const SHORT = 'short';\n\
+                     const NESTED = { DEEP: 'deep' };\n\
+                     export const ROUTES = { LIST: 'list', ITEM: { ONE: ':id' }, SHORT, NESTED } as const;\n\
                      export enum Alias { LINXO = 'linxo' }\n\
                      export const BOTH = ['a', 'b'];",
                 ),
@@ -2565,6 +2568,8 @@ mod tests {
                     export class ThingsController {
                         @Get(ROUTES.LIST) list() {}
                         @Get(ROUTES.ITEM.ONE) one() {}
+                        @Get(ROUTES.SHORT) short() {}
+                        @Get(ROUTES.NESTED.DEEP) deep() {}
                         @Get(`redirect/${Alias.LINXO}`) linxo() {}
                         @Get(LOCAL + '/x') local() {}
                         @Get(`v${1 + 1}`) sum() {}
@@ -2584,9 +2589,11 @@ mod tests {
             [
                 "/things/a",
                 "/things/b",
+                "/things/deep",
                 "/things/list",
                 "/things/local/x",
                 "/things/redirect/linxo",
+                "/things/short",
                 "/things/v2",
                 "/things/{id}"
             ]
