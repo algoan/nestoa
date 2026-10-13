@@ -2529,6 +2529,8 @@ mod tests {
                     r#"
                     import { BASE, ROUTES, Alias, BOTH } from './routes';
                     const LOCAL = 'local';
+                    let MUTABLE = 'old';
+                    MUTABLE = 'new';
                     @Controller(BASE)
                     export class ThingsController {
                         @Get(ROUTES.LIST) list() {}
@@ -2538,6 +2540,7 @@ mod tests {
                         @Get(`v${1 + 1}`) sum() {}
                         @Get(BOTH) both() {}
                         @Get(UNKNOWN) unknown() {}
+                        @Get(MUTABLE) mutable() {}
                     }
                     "#,
                 ),
@@ -2560,7 +2563,10 @@ mod tests {
         );
         assert_eq!(
             crate::diag::take_warnings(),
-            ["ThingsController.unknown: cannot evaluate the path UNKNOWN; its routes are left out"]
+            [
+                "ThingsController.unknown: cannot evaluate the path UNKNOWN; its routes are left out",
+                "ThingsController.mutable: cannot evaluate the path MUTABLE; its routes are left out"
+            ]
         );
     }
 

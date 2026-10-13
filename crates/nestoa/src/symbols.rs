@@ -138,7 +138,7 @@ pub struct ImportBinding {
 #[derive(Clone, Default)]
 pub struct FileSymbols {
     pub declared: HashMap<String, Symbol>,
-    /// Variables with an initializer (`export const MULTI_STATUS = 207`,
+    /// Constants with an initializer (`export const MULTI_STATUS = 207`,
     /// `const ROUTES = { LIST: 'list' }`), so decorator arguments that name
     /// them (`@HttpCode(MULTI_STATUS)`, `@Get(ROUTES.LIST)`) can be evaluated.
     pub consts: HashMap<String, ConstInit>,
@@ -790,8 +790,12 @@ fn declared_symbol(module: &Arc<Module>, path: &Arc<[usize]>) -> Option<(String,
 }
 
 /// Record each `const NAME = <init>` of the variable declaration at `path`.
+/// A `let` or `var` may be reassigned, so its initializer isn't its value.
 fn collect_consts(module: &Arc<Module>, path: &Arc<[usize]>, decl: &Decl, fs: &mut FileSymbols) {
     let Decl::Var(v) = decl else { return };
+    if v.kind != swc_ecma_ast::VarDeclKind::Const {
+        return;
+    }
     for (i, d) in v.decls.iter().enumerate() {
         if let (swc_ecma_ast::Pat::Ident(id), Some(_)) = (&d.name, &d.init) {
             let init = ConstInit {
