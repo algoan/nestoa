@@ -67,6 +67,14 @@ pub fn versions(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<Versi
     };
     match expr {
         Expr::Array(a) => a.elems.iter().map(|el| one(&el.as_ref()?.expr)).collect(),
+        // `const VERSIONS = ['1', '2']`, evaluated where it is declared.
+        Expr::Ident(i) if i.sym != "VERSION_NEUTRAL" => {
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            match c.init() {
+                init @ Expr::Array(_) => versions(project, &decl_file, init),
+                _ => one(expr).map(|v| vec![v]),
+            }
+        }
         e => one(e).map(|v| vec![v]),
     }
 }
@@ -523,6 +531,18 @@ mod tests {
         assert_eq!(versioning.prefix, "ver");
         assert_eq!(versioning.default_versions, [Some("1".to_string()), None]);
         assert_eq!(versioning.segment(&Some("2".into())), "ver2");
+        let consts = temp_root("versioning-const");
+        let project = project_from(
+            &consts,
+            &[(
+                "src/main.ts",
+                "const VERSIONS = ['1', VERSION_NEUTRAL];\napp.enableVersioning({ defaultVersion: VERSIONS });",
+            )],
+        );
+        let versioning = detect(&project, &files(&project), &consts)
+            .versioning
+            .unwrap();
+        assert_eq!(versioning.default_versions, [Some("1".to_string()), None]);
 
         let header = temp_root("versioning-header");
         let project = project_from(
