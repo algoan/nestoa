@@ -125,6 +125,9 @@ pub struct Route {
     pub catch_all: bool,
     /// `Controller.method`, for diagnostics.
     pub handler: String,
+    /// The file declaring the handler, which tells apart two controllers of
+    /// the same name.
+    pub file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +423,7 @@ impl<'a> Extractor<'a> {
                 errors: BTreeMap::new(),
                 catch_all: matches!(verb, VerbDecorator::All),
                 handler: format!("{class_name}.{}", prop_name_text(&m.key)),
+                file: file.to_path_buf(),
             };
             let has_body = template.request_body.is_some();
             for (&method, full_path) in verb
@@ -1006,7 +1010,7 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
     // a warning naming both.
     let mut catch_all_slots: std::collections::HashSet<(&str, HttpMethod)> =
         std::collections::HashSet::new();
-    let mut handlers: std::collections::HashMap<(&str, HttpMethod), &str> =
+    let mut handlers: std::collections::HashMap<(&str, HttpMethod), &Route> =
         std::collections::HashMap::new();
     for r in routes {
         let slot = (r.path.as_str(), r.method);
@@ -1019,15 +1023,21 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         if r.catch_all {
             catch_all_slots.insert(slot);
         }
-        if let Some(previous) = handlers.insert(slot, &r.handler)
-            && previous != r.handler
+        if let Some(previous) = handlers.insert(slot, r)
+            && (previous.file != r.file || previous.handler != r.handler)
         {
+            let (overriding, overridden) = if previous.handler == r.handler {
+                (
+                    format!("{} ({})", r.handler, r.file.display()),
+                    format!("{} ({})", previous.handler, previous.file.display()),
+                )
+            } else {
+                (r.handler.clone(), previous.handler.clone())
+            };
             crate::diag::warn(format!(
-                "{} {}: {} overrides {}",
+                "{} {}: {overriding} overrides {overridden}",
                 r.method.as_lower().to_uppercase(),
                 r.path,
-                r.handler,
-                previous
             ));
         }
         let entry = paths.entry(r.path.clone()).or_default();
@@ -1796,6 +1806,25 @@ mod tests {
     }
 
     #[test]
+    fn same_named_handlers_from_two_files_warn() {
+        crate::diag::take_warnings();
+        let first = route(HttpMethod::Get, "/ping");
+        let second = Route {
+            file: PathBuf::from("other.ts"),
+            ..first.clone()
+        };
+        to_openapi(
+            &Config::default(),
+            &[first, second],
+            ComponentSchemas::default(),
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["GET /ping: Test.get (other.ts) overrides Test.get (test.ts)"]
+        );
+    }
+
+    #[test]
     fn path_params_follow_each_concrete_path() {
         let routes = extract_routes(
             "sibling-params",
@@ -1905,6 +1934,7 @@ mod tests {
             errors: BTreeMap::new(),
             catch_all: false,
             handler: format!("Test.{}", method.as_lower()),
+            file: PathBuf::from("test.ts"),
         }
     }
 
