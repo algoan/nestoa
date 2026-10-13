@@ -27,10 +27,6 @@ impl TsPaths {
         self.entries.len()
     }
 
-    pub fn has_entries(&self) -> bool {
-        !self.entries.is_empty()
-    }
-
     /// Resolve a bare import specifier through the alias table to a file path.
     /// Only the best-matching pattern's targets are tried, as TypeScript does.
     pub fn resolve(&self, specifier: &str) -> Option<PathBuf> {
