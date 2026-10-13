@@ -25,6 +25,13 @@ pub fn discover_files(
     for inc in includes {
         let start = root.join(inc);
         if !start.exists() {
+            if inc.contains(['*', '?', '[', '{']) {
+                crate::diag::warn(format!(
+                    "include entry {inc:?} is a glob; include takes paths, use exclude to filter"
+                ));
+            } else {
+                crate::diag::warn(format!("include path {} does not exist", start.display()));
+            }
             continue;
         }
         if start.is_file() {
@@ -96,5 +103,17 @@ mod tests {
                 Path::new("src/feature/distance.ts")
             ]
         );
+    }
+
+    #[test]
+    fn missing_and_glob_include_entries_warn() {
+        crate::diag::take_warnings();
+        let root = std::env::temp_dir();
+        let found = discover_files(&root, &["nestoa-absent".into(), "src/**".into()], &[]).unwrap();
+        assert!(found.is_empty());
+        let warnings = crate::diag::take_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("does not exist"), "{warnings:?}");
+        assert!(warnings[1].contains("is a glob"), "{warnings:?}");
     }
 }

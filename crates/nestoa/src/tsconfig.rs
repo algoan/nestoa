@@ -111,7 +111,15 @@ pub fn load_tsconfig_paths(project_root: &Path, explicit: Option<&Path>) -> Opti
         None => project_root.join("tsconfig.json"),
     };
     let mut found = Inherited::default();
-    collect(&start, &mut std::collections::HashSet::new(), &mut found);
+    let config_dir = start
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut chain = Chain {
+        config_dir: config_dir.canonicalize().unwrap_or(config_dir),
+        visited: std::collections::HashSet::new(),
+    };
+    collect(&start, explicit.is_some(), &mut chain, &mut found);
     let (paths_dir, entries) = found.paths?;
     Some(TsPaths {
         base_url: found.base_url.unwrap_or(paths_dir),
@@ -128,25 +136,50 @@ struct Inherited {
     base_url: Option<PathBuf>,
 }
 
+/// The `extends` chain being walked from one tsconfig.
+struct Chain {
+    /// Directory of the config the chain starts from, which TypeScript 5.5
+    /// substitutes for `${configDir}` in every config of the chain.
+    config_dir: PathBuf,
+    visited: std::collections::HashSet<PathBuf>,
+}
+
+impl Chain {
+    fn expand(&self, value: &str) -> String {
+        value.replace("${configDir}", &self.config_dir.to_string_lossy())
+    }
+}
+
 /// Fill `found` from `path`, then from what it extends, most derived first: in
-/// an `extends` array a later config overrides an earlier one.
-fn collect(path: &Path, visited: &mut std::collections::HashSet<PathBuf>, found: &mut Inherited) {
+/// an `extends` array a later config overrides an earlier one. A missing file
+/// is only reported when `required`, since most projects have no tsconfig at
+/// the default location.
+fn collect(path: &Path, required: bool, chain: &mut Chain, found: &mut Inherited) {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(path.clone()) {
+    if !chain.visited.insert(path.clone()) {
         return;
     }
-    let Some(json) = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)).ok())
-    else {
-        return;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => return,
+        Err(e) => {
+            crate::diag::warn(format!("reading {}: {e}", path.display()));
+            return;
+        }
+    };
+    let json = match serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)) {
+        Ok(json) => json,
+        Err(e) => {
+            crate::diag::warn(format!("parsing {}: {e}", path.display()));
+            return;
+        }
     };
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let co = json.get("compilerOptions");
     if found.base_url.is_none()
         && let Some(base) = co.and_then(|c| c.get("baseUrl")).and_then(|b| b.as_str())
     {
-        let base_url = dir.join(base);
+        let base_url = dir.join(chain.expand(base));
         found.base_url = Some(base_url.canonicalize().unwrap_or(base_url));
     }
     if found.paths.is_none()
@@ -160,7 +193,7 @@ fn collect(path: &Path, visited: &mut std::collections::HashSet<PathBuf>, found:
                     .as_array()
                     .map(|a| {
                         a.iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .filter_map(|t| t.as_str().map(|t| chain.expand(t)))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -178,8 +211,12 @@ fn collect(path: &Path, visited: &mut std::collections::HashSet<PathBuf>, found:
         _ => Vec::new(),
     };
     for parent in parents {
-        if let Some(parent) = extends_path(dir, parent) {
-            collect(&parent, visited, found);
+        match extends_path(dir, &chain.expand(parent)) {
+            Some(parent) => collect(&parent, true, chain, found),
+            None => crate::diag::warn(format!(
+                "{}: cannot find the extended tsconfig {parent:?}",
+                path.display()
+            )),
         }
     }
 }
@@ -189,7 +226,7 @@ fn collect(path: &Path, visited: &mut std::collections::HashSet<PathBuf>, found:
 /// `node_modules` above it.
 fn extends_path(dir: &Path, entry: &str) -> Option<PathBuf> {
     let with_json = |p: PathBuf| {
-        if p.is_file() {
+        if p.is_file() || p.extension().is_some_and(|e| e == "json") {
             p
         } else {
             let mut j = p.into_os_string();
@@ -464,5 +501,50 @@ mod tests {
             resolved
         );
         assert!(paths.resolve("@algoan/missing").is_none());
+    }
+
+    #[test]
+    fn config_dir_is_the_directory_of_the_starting_config() {
+        let dir = tree(
+            "config-dir",
+            &[
+                ("svc/src/dto/index.ts", ""),
+                (
+                    "tsconfig.base.json",
+                    r#"{ "compilerOptions": { "paths": { "@dto": ["${configDir}/src/dto"] } } }"#,
+                ),
+                (
+                    "svc/tsconfig.json",
+                    r#"{ "extends": "../tsconfig.base.json" }"#,
+                ),
+            ],
+        );
+        let paths = load_tsconfig_paths(&dir.join("svc"), None).unwrap();
+        assert_eq!(
+            paths.resolve("@dto"),
+            Some(dir.join("svc/src/dto/index.ts"))
+        );
+    }
+
+    #[test]
+    fn a_missing_explicit_tsconfig_or_extends_target_warns() {
+        crate::diag::take_warnings();
+        let dir = tree(
+            "missing",
+            &[("tsconfig.json", r#"{ "extends": "./nope.json" }"#)],
+        );
+        assert!(load_tsconfig_paths(&dir, None).is_none());
+        let warnings = crate::diag::take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("nope.json"), "{warnings:?}");
+
+        assert!(load_tsconfig_paths(&dir, Some(Path::new("absent.json"))).is_none());
+        let warnings = crate::diag::take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("absent.json"), "{warnings:?}");
+
+        let empty = tree("no-tsconfig", &[("src/app.ts", "")]);
+        assert!(load_tsconfig_paths(&empty, None).is_none());
+        assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
     }
 }
