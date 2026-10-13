@@ -974,6 +974,36 @@ fn path_matches_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
 }
 
+/// Warn about paths that differ only in their parameter names
+/// (`/users/{id}` and `/users/{slug}`): OpenAPI forbids them, as the router
+/// can't tell them apart either.
+fn warn_param_name_conflicts<'a>(paths: impl Iterator<Item = &'a String>) {
+    let mut by_template: IndexMap<String, Vec<&str>> = IndexMap::new();
+    for path in paths {
+        let mut template = String::with_capacity(path.len());
+        let mut in_param = false;
+        for c in path.chars() {
+            match c {
+                '{' => in_param = true,
+                '}' => {
+                    in_param = false;
+                    template.push_str("{}");
+                }
+                _ if !in_param => template.push(c),
+                _ => {}
+            }
+        }
+        by_template.entry(template).or_default().push(path);
+    }
+    for mut group in by_template.into_values().filter(|g| g.len() > 1) {
+        group.sort_unstable();
+        crate::diag::warn(format!(
+            "paths {} differ only in parameter names, which OpenAPI forbids",
+            group.join(" and ")
+        ));
+    }
+}
+
 fn prop_name_text(key: &PropName) -> String {
     match key {
         PropName::Ident(i) => i.sym.to_string(),
@@ -1138,6 +1168,8 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         op.insert("responses".into(), Value::Object(responses));
         entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
+
+    warn_param_name_conflicts(paths.keys());
 
     // Sort paths, and the HTTP methods within each path, alphabetically. Routes
     // are collected in source/file order, so without this the output would drift
@@ -1802,6 +1834,23 @@ mod tests {
         assert_eq!(
             crate::diag::take_warnings(),
             ["GET /items: ItemsController.listAgain overrides ItemsController.list"]
+        );
+    }
+
+    #[test]
+    fn paths_differing_only_in_param_names_warn() {
+        crate::diag::take_warnings();
+        let routes = [
+            route(HttpMethod::Get, "/users/{id}"),
+            route(HttpMethod::Delete, "/users/{slug}"),
+            route(HttpMethod::Get, "/users/{id}/posts"),
+        ];
+        to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        assert_eq!(
+            crate::diag::take_warnings(),
+            [
+                "paths /users/{id} and /users/{slug} differ only in parameter names, which OpenAPI forbids"
+            ]
         );
     }
 
