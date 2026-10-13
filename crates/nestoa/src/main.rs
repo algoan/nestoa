@@ -51,6 +51,11 @@ struct Cli {
     /// Print the resolved configuration and exit.
     #[arg(long)]
     print_config: bool,
+
+    /// Exit with an error after writing the output if there was any warning or
+    /// any `x-unresolved` type, listing where each unresolved type is.
+    #[arg(long)]
+    strict: bool,
 }
 
 /// Compile the `resolvePackages` glob patterns into a matcher over package names.
@@ -236,25 +241,40 @@ fn main() -> Result<()> {
     };
     std::fs::write(&output_path, body)
         .with_context(|| format!("writing {}", output_path.display()))?;
+    let schemas = doc
+        .get("components")
+        .and_then(|c| c.get("schemas"))
+        .and_then(|s| s.as_object().map(|o| o.len()))
+        .unwrap_or(0);
+    let unresolved = diag::unresolved(&doc);
     eprintln!(
-        "nestoa: wrote {} ({} route{}, {} schema{})",
+        "nestoa: wrote {} ({}, {}{})",
         output_path.display(),
-        routes.len(),
-        if routes.len() == 1 { "" } else { "s" },
-        doc.get("components")
-            .and_then(|c| c.get("schemas"))
-            .and_then(|s| s.as_object().map(|o| o.len()))
-            .unwrap_or(0),
-        if doc
-            .get("components")
-            .and_then(|c| c.get("schemas"))
-            .and_then(|s| s.as_object().map(|o| o.len() == 1))
-            .unwrap_or(false)
-        {
-            ""
+        plural(routes.len(), "route"),
+        plural(schemas, "schema"),
+        if unresolved.is_empty() {
+            String::new()
         } else {
-            "s"
+            format!(", {} unresolved", unresolved.len())
         },
     );
+
+    if cli.strict {
+        for (pointer, name) in &unresolved {
+            eprintln!("unresolved: {name} at {pointer}");
+        }
+        let warnings = diag::warning_count();
+        if warnings > 0 || !unresolved.is_empty() {
+            anyhow::bail!(
+                "--strict: {} and {}",
+                plural(warnings, "warning"),
+                plural(unresolved.len(), "unresolved type")
+            );
+        }
+    }
     Ok(())
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }

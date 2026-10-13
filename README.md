@@ -14,6 +14,7 @@ platform-specific optional dependencies.
 npm install --save-dev nestoa
 npx nestoa                  # writes openapi.json from ./src
 npx nestoa -o spec.yaml     # YAML output
+npx nestoa --strict         # fail on any warning or x-unresolved type (for CI)
 ```
 
 Optional `nestoa.config.json` (or `.yaml` / `.yml`) at the project root:
