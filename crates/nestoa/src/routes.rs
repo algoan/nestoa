@@ -747,6 +747,7 @@ impl<'a> Extractor<'a> {
                 .unwrap_or_else(|| json!({}))
         });
         if let Some(default) = &pipes.default
+            && pipes.optional
             && let Some(o) = schema.as_object_mut()
         {
             o.insert("default".into(), default.clone());
@@ -843,11 +844,14 @@ struct PipeEffects {
     optional: bool,
 }
 
+/// Pipes run in order, so a missing value is only safe if it reaches a
+/// `DefaultValuePipe` without first meeting a parse pipe that rejects it.
 fn pipe_effects(d: &Decorator) -> PipeEffects {
     let mut effects = PipeEffects::default();
     let Expr::Call(call) = &*d.expr else {
         return effects;
     };
+    let mut rejects_missing = false;
     for arg in &call.args {
         let (name, args) = match arg.expr.as_ref() {
             Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
@@ -860,7 +864,7 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
         let schema = match name {
             "DefaultValuePipe" => {
                 effects.default = args.first().and_then(|a| literal_json(&a.expr));
-                effects.optional |= effects.default.is_some();
+                effects.optional |= effects.default.is_some() && !rejects_missing;
                 continue;
             }
             "ParseIntPipe" => json!({ "type": "integer" }),
@@ -870,10 +874,15 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
             _ => continue,
         };
         effects.schema = Some(schema);
-        if let Some(Expr::Object(options)) = args.first().map(|a| a.expr.as_ref())
-            && let Some(Expr::Lit(Lit::Bool(b))) = object_value(options, "optional")
-        {
-            effects.optional |= b.value;
+        let optional = matches!(
+            args.first().map(|a| a.expr.as_ref()),
+            Some(Expr::Object(options))
+                if matches!(object_value(options, "optional"), Some(Expr::Lit(Lit::Bool(b))) if b.value)
+        );
+        if optional {
+            effects.optional |= !rejects_missing;
+        } else if effects.default.is_none() {
+            rejects_missing = true;
         }
     }
     effects
@@ -2199,6 +2208,7 @@ mod tests {
                     @Query('ratio', new ParseFloatPipe({ optional: true })) ratio: number,
                     @Query('all', ParseBoolPipe) all: string,
                     @Query('sort', new DefaultValuePipe('asc')) sort: string,
+                    @Query('late', ParseIntPipe, new DefaultValuePipe(1)) late: number,
                 ) {}
             }
             "#,
@@ -2216,6 +2226,7 @@ mod tests {
                 r#"ratio false {"type":"number"}"#,
                 r#"all true {"type":"boolean"}"#,
                 r#"sort false {"type":"string","default":"asc"}"#,
+                r#"late true {"type":"integer"}"#,
             ]
         );
     }
