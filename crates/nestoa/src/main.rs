@@ -103,7 +103,7 @@ fn expand_packages(project: &mut Project, parser: &ParsingContext, allow: &GlobS
                     project.add(parsed);
                     worklist.push(target);
                 }
-                Err(e) => diag::warn(format!("{e:#}")),
+                Err(e) => diag::warn(format!("{e:#}; skipping the file")),
             }
         }
     }
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
         let parsed = match parser.parse_file(file) {
             Ok(p) => p,
             Err(e) => {
-                diag::warn(format!("{e:#}"));
+                diag::warn(format!("{e:#}; skipping the file"));
                 continue;
             }
         };
@@ -216,7 +216,8 @@ fn main() -> Result<()> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     let body = match cfg.output_format() {

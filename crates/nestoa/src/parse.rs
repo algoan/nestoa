@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use swc_common::{BytePos, SourceFile, SourceMap, comments::SingleThreadedComments, sync::Lrc};
+use swc_common::{
+    BytePos, SourceFile, SourceMap, Spanned, comments::SingleThreadedComments, sync::Lrc,
+};
 use swc_ecma_ast::{Decl, DefaultDecl, EsVersion, Module, ModuleDecl, ModuleItem, Stmt};
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 
@@ -30,6 +32,11 @@ impl Default for ParsingContext {
 }
 
 impl ParsingContext {
+    fn describe(&self, path: &Path, e: &swc_ecma_parser::error::Error) -> String {
+        let line = self.source_map.lookup_char_pos(e.span().lo).line;
+        format!("{}:{line}: {}", path.display(), e.kind().msg())
+    }
+
     pub fn parse_file(&self, path: &Path) -> Result<ParsedFile> {
         let fm = self
             .source_map
@@ -55,7 +62,13 @@ impl ParsingContext {
         let mut parser = Parser::new_from(lexer);
         let module = parser
             .parse_module()
-            .map_err(|e| anyhow::anyhow!("parse error in {}: {:?}", path.display(), e.kind()))?;
+            .map_err(|e| anyhow::anyhow!("parse error in {}", self.describe(path, &e)))?;
+        for e in parser.take_errors() {
+            crate::diag::warn(format!(
+                "recovered from a syntax error in {}",
+                self.describe(path, &e)
+            ));
+        }
         let mut docs = DocComments::new(&fm.src, fm.start_pos, comments);
         for item in &module.body {
             if let Some((decl, start)) = decl_doc_start(item) {

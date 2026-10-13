@@ -34,7 +34,7 @@ pub fn discover_files(
         for entry in walkdir::WalkDir::new(&start)
             .into_iter()
             .filter_entry(|e| !(e.file_type().is_dir() && is_match(&excluded_dirs, e.path(), root)))
-            .filter_map(|e| e.ok())
+            .filter_map(|e| e.inspect_err(|e| crate::diag::warn(e)).ok())
         {
             if !entry.file_type().is_file() {
                 continue;
