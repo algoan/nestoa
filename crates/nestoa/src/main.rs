@@ -35,11 +35,12 @@ struct Cli {
     #[arg(default_value = ".")]
     project: PathBuf,
 
-    /// Path to a config file (defaults to nestoa.config.{json,yaml,yml} in the project root).
+    /// Path to a config file, relative to the current directory (defaults to
+    /// nestoa.config.{json,yaml,yml} in the project root).
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Override the output file path.
+    /// Override the output file path, relative to the current directory.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -116,8 +117,11 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("resolving project path {}", cli.project.display()))?;
     let mut cfg = Config::load(cli.config.as_deref(), &project_root)?;
+    // Paths given on the command line are relative to where nestoa runs; only
+    // the config's own `output` is relative to the project.
     if let Some(o) = cli.output {
-        cfg.output = o;
+        cfg.output = std::path::absolute(&o)
+            .with_context(|| format!("resolving output path {}", o.display()))?;
     }
     if let Some(v) = cli.openapi_version {
         cfg.openapi_version = v;
