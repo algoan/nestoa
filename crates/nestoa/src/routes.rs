@@ -257,15 +257,24 @@ impl<'a> Extractor<'a> {
             if !walked.insert((owner.0.clone(), class.span.lo)) {
                 break;
             }
+            // A method the subclass redeclares shadows the base one. Names are
+            // recorded once the whole class is read: an overload signature
+            // comes before the decorated implementation of the same name.
+            let mut declared = Vec::new();
             for member in &class.body {
                 let ClassMember::Method(m) = member else {
                     continue;
                 };
-                // A method the subclass redeclares shadows the base one.
-                if matches!(m.kind, MethodKind::Method) && seen.insert(prop_name_text(&m.key)) {
+                let name = prop_name_text(&m.key);
+                if matches!(m.kind, MethodKind::Method)
+                    && m.function.body.is_some()
+                    && !seen.contains(&name)
+                {
                     self.extract_method(&owner.0, m, &class_ctx, out);
                 }
+                declared.push(name);
             }
+            seen.extend(declared);
             let Some(base) = self.base_class(&owner.0, class) else {
                 break;
             };
@@ -2410,6 +2419,24 @@ mod tests {
         );
         find(&routes, HttpMethod::Get, "/deep/deepest");
         find(&routes, HttpMethod::Get, "/cycle");
+    }
+
+    #[test]
+    fn an_overloaded_handler_is_extracted() {
+        let routes = extract_routes(
+            "overload",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                get(id: string): string;
+                get(id: number): string;
+                @Get(':id')
+                get(id: string | number): string { return ''; }
+            }
+            "#,
+        );
+        assert_eq!(routes.len(), 1);
+        find(&routes, HttpMethod::Get, "/items/{id}");
     }
 
     #[test]
