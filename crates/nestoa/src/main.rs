@@ -187,7 +187,7 @@ fn main() -> Result<()> {
     // explicitly or opted out.
     if cfg.base_path.is_none()
         && cfg.detect_global_prefix
-        && let Some(prefix) = globalprefix::detect_global_prefix(&project, &project_root)
+        && let Some(prefix) = globalprefix::detect_global_prefix(&project, &files, &project_root)
     {
         eprintln!(
             "nestoa: detected global prefix \"{}\" from bootstrap",

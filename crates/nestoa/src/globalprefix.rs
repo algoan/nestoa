@@ -12,7 +12,7 @@
 //! 3. a `node-config-ts` member access — `app.setGlobalPrefix(config.globalPrefix)`,
 //!    resolved against the project's `config/default.json`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use swc_ecma_ast::{
     Callee, Decl, Expr, Lit, MemberExpr, MemberProp, ModuleDecl, ModuleItem, Pat, Stmt,
@@ -22,14 +22,22 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::parse::ParsedFile;
 use crate::symbols::Project;
 
-/// Scan every parsed file for `app.setGlobalPrefix(...)` and resolve the first
-/// argument to a literal prefix. Files are visited in sorted order so the
-/// result is deterministic when several bootstrap files are present.
-pub fn detect_global_prefix(project: &Project, project_root: &Path) -> Option<String> {
-    let mut files: Vec<_> = project.files.keys().cloned().collect();
-    files.sort();
-    for file in &files {
-        let parsed = &project.files[file];
+/// Scan the discovered `files` for `app.setGlobalPrefix(...)` and resolve
+/// the first argument to a literal prefix. A `main.ts` is tried first, then
+/// the others in sorted order. Files pulled in only for type resolution
+/// (workspace libs, packages) are never scanned: a test helper in a lib may
+/// set a prefix of its own.
+pub fn detect_global_prefix(
+    project: &Project,
+    files: &[PathBuf],
+    project_root: &Path,
+) -> Option<String> {
+    let mut files: Vec<&PathBuf> = files.iter().collect();
+    files.sort_by_key(|f| (f.file_name().is_none_or(|n| n != "main.ts"), *f));
+    for file in files {
+        let Some(parsed) = project.files.get(file) else {
+            continue;
+        };
         let mut finder = PrefixCallFinder { arg: None };
         parsed.module.visit_with(&mut finder);
         let Some(arg) = finder.arg else { continue };
@@ -184,6 +192,10 @@ mod tests {
         project
     }
 
+    fn files(project: &Project) -> Vec<PathBuf> {
+        project.files.keys().cloned().collect()
+    }
+
     fn temp_root(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("nestoa-gp-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -202,7 +214,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect_global_prefix(&project, &root).as_deref(),
+            detect_global_prefix(&project, &files(&project), &root).as_deref(),
             Some("api")
         );
     }
@@ -217,7 +229,10 @@ mod tests {
                 "const globalPrefix: string = 'v2';\nasync function bootstrap() { app.setGlobalPrefix(globalPrefix); }",
             )],
         );
-        assert_eq!(detect_global_prefix(&project, &root).as_deref(), Some("v2"));
+        assert_eq!(
+            detect_global_prefix(&project, &files(&project), &root).as_deref(),
+            Some("v2")
+        );
     }
 
     #[test]
@@ -236,7 +251,10 @@ mod tests {
                 "import { config } from 'node-config-ts';\nasync function bootstrap() { app.setGlobalPrefix(config.globalPrefix); }",
             )],
         );
-        assert_eq!(detect_global_prefix(&project, &root).as_deref(), Some("v2"));
+        assert_eq!(
+            detect_global_prefix(&project, &files(&project), &root).as_deref(),
+            Some("v2")
+        );
     }
 
     #[test]
@@ -249,6 +267,31 @@ mod tests {
                 "import { settings } from './local';\nasync function bootstrap() { app.setGlobalPrefix(settings.prefix); }",
             )],
         );
-        assert_eq!(detect_global_prefix(&project, &root), None);
+        assert_eq!(
+            detect_global_prefix(&project, &files(&project), &root),
+            None
+        );
+    }
+
+    #[test]
+    fn only_entry_files_are_scanned_and_main_ts_comes_first() {
+        let root = temp_root("entry");
+        let project = project_from(
+            &root,
+            &[
+                ("libs/testing/src/index.ts", "app.setGlobalPrefix('e2e');"),
+                ("src/a-setup.ts", "app.setGlobalPrefix('setup');"),
+                ("src/main.ts", "app.setGlobalPrefix('api');"),
+            ],
+        );
+        let entry = [root.join("src/a-setup.ts"), root.join("src/main.ts")];
+        assert_eq!(
+            detect_global_prefix(&project, &entry, &root).as_deref(),
+            Some("api")
+        );
+        assert_eq!(
+            detect_global_prefix(&project, &entry[..1], &root).as_deref(),
+            Some("setup")
+        );
     }
 }
