@@ -183,16 +183,17 @@ fn main() -> Result<()> {
     expand_packages(&mut project, &parser, &allow);
 
     // Recover the NestJS global prefix from the bootstrap file (e.g.
-    // `app.setGlobalPrefix(...)` in main.ts) unless the user pinned `basePath`
-    // explicitly or opted out.
-    if cfg.base_path.is_none()
-        && cfg.detect_global_prefix
-        && let Some(prefix) = globalprefix::detect_global_prefix(&project, &files, &project_root)
-    {
-        eprintln!(
-            "nestoa: detected global prefix \"{}\" from bootstrap",
-            prefix
-        );
+    // `app.setGlobalPrefix(...)` in main.ts) unless the user opted out. An
+    // explicit `basePath` wins over the detected prefix and its `exclude`.
+    let mut bootstrap = if cfg.detect_global_prefix {
+        globalprefix::detect(&project, &files, &project_root)
+    } else {
+        globalprefix::Bootstrap::default()
+    };
+    if cfg.base_path.is_some() {
+        bootstrap.exclude.clear();
+    } else if let Some(prefix) = bootstrap.prefix.take() {
+        eprintln!("nestoa: detected global prefix \"{prefix}\" from bootstrap");
         cfg.base_path = Some(prefix);
     }
 
@@ -200,6 +201,7 @@ fn main() -> Result<()> {
     let routes = {
         let mut extractor = Extractor {
             config: &cfg,
+            bootstrap: &bootstrap,
             project: &project,
             entry_files: &files,
             components: &mut components,

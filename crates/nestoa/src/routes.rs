@@ -13,6 +13,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
 use crate::dialect;
 use crate::errors::{self, ERROR_SCHEMA_NAME};
+use crate::globalprefix::Bootstrap;
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
@@ -172,6 +173,8 @@ struct ClassCtx<'c> {
 
 pub struct Extractor<'a> {
     pub config: &'a Config,
+    /// What `main.ts` configures about route paths.
+    pub bootstrap: &'a Bootstrap,
     pub project: &'a Project,
     /// The originally-discovered source files. Controllers are only looked for
     /// here, so package declarations pulled into the symbol table for type
@@ -338,13 +341,21 @@ impl<'a> Extractor<'a> {
         } else {
             sub_paths.iter().map(|s| Some(s.as_str())).collect()
         };
-        let mut full_paths: Vec<ConcretePath> = Vec::new();
-        for base in base_paths {
-            for sub in &sub_opts {
-                let joined = join_paths(self.config.base_path.as_deref(), base, *sub);
-                for path in concrete_paths(&joined) {
-                    if !full_paths.contains(&path) {
-                        full_paths.push(path);
+        let mut full_paths: Vec<(HttpMethod, ConcretePath)> = Vec::new();
+        for &method in verb.methods() {
+            for base in base_paths {
+                for sub in &sub_opts {
+                    let route = join_paths(None, base, *sub);
+                    let prefix = self
+                        .config
+                        .base_path
+                        .as_deref()
+                        .filter(|_| !self.bootstrap.excludes(method.as_lower(), &route));
+                    for path in concrete_paths(&join_paths(prefix, base, *sub)) {
+                        let entry = (method, path);
+                        if !full_paths.contains(&entry) {
+                            full_paths.push(entry);
+                        }
                     }
                 }
             }
@@ -499,11 +510,8 @@ impl<'a> Extractor<'a> {
             file: file.to_path_buf(),
         };
         let has_body = template.request_body.is_some();
-        for (&method, concrete) in verb
-            .methods()
-            .iter()
-            .flat_map(|m| full_paths.iter().map(move |p| (m, p)))
-        {
+        for (method, concrete) in &full_paths {
+            let method = *method;
             let full_path = concrete.path.clone();
             // A `@route-mapping` match is the most specific author intent, so
             // it wins over an interceptor override or the declared return type.
@@ -1570,7 +1578,17 @@ mod tests {
         files: &[(&str, &str)],
         entry_rel: &str,
     ) -> (Vec<Route>, crate::schema::ComponentSchemas) {
-        use crate::config::Config;
+        extract_with(name, files, &[entry_rel], crate::config::Config::default())
+    }
+
+    /// `extract_from` with several entry files and a config, detecting the
+    /// bootstrap in the entry files as `main` does.
+    fn extract_with(
+        name: &str,
+        files: &[(&str, &str)],
+        entries: &[&str],
+        mut config: crate::config::Config,
+    ) -> (Vec<Route>, crate::schema::ComponentSchemas) {
         use crate::parse::ParsingContext;
         use crate::schema::ComponentSchemas;
 
@@ -1587,16 +1605,20 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, body).unwrap();
             project.add(parser.parse_file(&path).unwrap());
-            if *rel == entry_rel {
+            if entries.contains(rel) {
                 entry.push(path);
             }
         }
 
-        let config = Config::default();
+        let mut bootstrap = crate::globalprefix::detect(&project, &entry, &dir);
+        if config.base_path.is_none() {
+            config.base_path = bootstrap.prefix.take();
+        }
         let mut components = ComponentSchemas::default();
         let routes = {
             let mut ex = Extractor {
                 config: &config,
+                bootstrap: &bootstrap,
                 project: &project,
                 entry_files: &entry,
                 components: &mut components,
@@ -1836,6 +1858,7 @@ mod tests {
         let routes = {
             let mut ex = Extractor {
                 config: &config,
+                bootstrap: &crate::globalprefix::Bootstrap::default(),
                 project: &project,
                 entry_files: &entry,
                 components: &mut components,
@@ -1891,6 +1914,50 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn global_prefix_exclude_leaves_routes_unprefixed() {
+        let (routes, _) = extract_with(
+            "prefix-exclude",
+            &[
+                (
+                    "main.ts",
+                    "app.setGlobalPrefix('api', { exclude: ['health', \
+                     { path: 'items/:id', method: RequestMethod.GET }, 'public/(.*)'] });",
+                ),
+                (
+                    "ctrl.ts",
+                    r#"
+                    @Controller()
+                    export class AppController {
+                        @Get('health') health() {}
+                        @Get('items/:id') get() {}
+                        @Delete('items/:id') remove() {}
+                        @Get('public/docs/x') docs() {}
+                        @Get('other') other() {}
+                    }
+                    "#,
+                ),
+            ],
+            &["main.ts", "ctrl.ts"],
+            crate::config::Config::default(),
+        );
+        let mut found: Vec<String> = routes
+            .iter()
+            .map(|r| format!("{} {}", r.method.as_lower(), r.path))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "delete /api/items/{id}",
+                "get /api/other",
+                "get /health",
+                "get /items/{id}",
+                "get /public/docs/x",
+            ]
+        );
     }
 
     #[test]

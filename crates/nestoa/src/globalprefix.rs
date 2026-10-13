@@ -22,51 +22,155 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::parse::ParsedFile;
 use crate::symbols::Project;
 
-/// Scan the discovered `files` for `app.setGlobalPrefix(...)` and resolve
-/// the first argument to a literal prefix. A `main.ts` is tried first, then
-/// the others in sorted order. Files pulled in only for type resolution
-/// (workspace libs, packages) are never scanned: a test helper in a lib may
-/// set a prefix of its own.
-pub fn detect_global_prefix(
-    project: &Project,
-    files: &[PathBuf],
-    project_root: &Path,
-) -> Option<String> {
+/// What the bootstrap file configures about every route's path.
+#[derive(Debug, Default)]
+pub struct Bootstrap {
+    /// `setGlobalPrefix`'s prefix.
+    pub prefix: Option<String>,
+    /// The routes `setGlobalPrefix`'s `exclude` option leaves unprefixed.
+    pub exclude: Vec<PrefixExclude>,
+}
+
+/// One `exclude` entry: a route path (OpenAPI form, without surrounding
+/// slashes), possibly ending in a wildcard, and the method it is limited to.
+#[derive(Debug, PartialEq)]
+pub struct PrefixExclude {
+    path: String,
+    wildcard: bool,
+    method: Option<String>,
+}
+
+impl Bootstrap {
+    /// Whether the global prefix is left off `route` (the controller and
+    /// method paths, joined) for `method` (lowercase).
+    pub fn excludes(&self, method: &str, route: &str) -> bool {
+        let route = crate::routes::openapi_params(route.trim_matches('/'));
+        self.exclude.iter().any(|e| {
+            let path_matches = if e.wildcard {
+                route == e.path || route.starts_with(&format!("{}/", e.path)) || e.path.is_empty()
+            } else {
+                route == e.path
+            };
+            path_matches && e.method.as_deref().is_none_or(|m| m == method)
+        })
+    }
+}
+
+/// Scan the discovered `files` for `app.setGlobalPrefix(...)`. A `main.ts`
+/// is tried first, then the others in sorted order. Files pulled in only
+/// for type resolution (workspace libs, packages) are never scanned: a test
+/// helper in a lib may set a prefix of its own.
+pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Bootstrap {
     let mut files: Vec<&PathBuf> = files.iter().collect();
     files.sort_by_key(|f| (f.file_name().is_none_or(|n| n != "main.ts"), *f));
     for file in files {
         let Some(parsed) = project.files.get(file) else {
             continue;
         };
-        let mut finder = PrefixCallFinder { arg: None };
+        let mut finder = CallFinder {
+            method: "setGlobalPrefix",
+            args: None,
+        };
         parsed.module.visit_with(&mut finder);
-        let Some(arg) = finder.arg else { continue };
-        if let Some(prefix) = resolve_prefix_expr(&arg, parsed, project, project_root) {
-            return Some(prefix);
-        }
+        let Some(args) = finder.args else { continue };
+        let Some(prefix) = args
+            .first()
+            .and_then(|arg| resolve_prefix_expr(arg, parsed, project, project_root))
+        else {
+            continue;
+        };
+        let exclude = args
+            .get(1)
+            .map(|options| prefix_excludes(project, file, options))
+            .unwrap_or_default();
+        return Bootstrap {
+            prefix: Some(prefix),
+            exclude,
+        };
     }
-    None
+    Bootstrap::default()
 }
 
-/// Visitor that captures the first argument of the first `*.setGlobalPrefix(...)`
-/// call it encounters anywhere in the module (including inside the bootstrap
+/// The `exclude` entries of `setGlobalPrefix`'s options: `'health'`, or
+/// `{ path: 'health', method: RequestMethod.GET }`.
+fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<PrefixExclude> {
+    let Expr::Object(options) = options else {
+        return Vec::new();
+    };
+    let Some(Expr::Array(entries)) = object_value(options, "exclude") else {
+        return Vec::new();
+    };
+    entries
+        .elems
+        .iter()
+        .flatten()
+        .filter_map(|entry| {
+            let (path, method) = match entry.expr.as_ref() {
+                Expr::Object(o) => {
+                    let method = match object_value(o, "method") {
+                        Some(Expr::Member(MemberExpr {
+                            prop: MemberProp::Ident(m),
+                            ..
+                        })) if m.sym != "ALL" => Some(m.sym.to_lowercase()),
+                        _ => None,
+                    };
+                    (
+                        crate::constval::string(project, file, object_value(o, "path")?)?,
+                        method,
+                    )
+                }
+                expr => (crate::constval::string(project, file, expr)?, None),
+            };
+            let path = path.trim_matches('/');
+            let (path, wildcard) = match ["(.*)", "*", "{*splat}"]
+                .iter()
+                .find_map(|w| path.strip_suffix(w))
+            {
+                Some(stem) => (stem.trim_end_matches('/'), true),
+                None => (path, false),
+            };
+            Some(PrefixExclude {
+                path: crate::routes::openapi_params(path),
+                wildcard,
+                method,
+            })
+        })
+        .collect()
+}
+
+fn object_value<'a>(o: &'a swc_ecma_ast::ObjectLit, key: &str) -> Option<&'a Expr> {
+    o.props.iter().find_map(|prop| match prop {
+        swc_ecma_ast::PropOrSpread::Prop(p) => match p.as_ref() {
+            swc_ecma_ast::Prop::KeyValue(kv) => match &kv.key {
+                swc_ecma_ast::PropName::Ident(i) if i.sym == key => Some(&*kv.value),
+                swc_ecma_ast::PropName::Str(s) if s.value == key => Some(&*kv.value),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Visitor that captures the arguments of the first `*.<method>(...)` call
+/// it encounters anywhere in the module (including inside the bootstrap
 /// function body).
-struct PrefixCallFinder {
-    arg: Option<Expr>,
+struct CallFinder {
+    method: &'static str,
+    args: Option<Vec<Expr>>,
 }
 
-impl Visit for PrefixCallFinder {
+impl Visit for CallFinder {
     fn visit_call_expr(&mut self, call: &swc_ecma_ast::CallExpr) {
-        if self.arg.is_none()
+        if self.args.is_none()
             && let Callee::Expr(callee) = &call.callee
             && let Expr::Member(MemberExpr {
                 prop: MemberProp::Ident(p),
                 ..
             }) = callee.as_ref()
-            && p.sym == "setGlobalPrefix"
-            && let Some(first) = call.args.first()
+            && p.sym == self.method
         {
-            self.arg = Some((*first.expr).clone());
+            self.args = Some(call.args.iter().map(|a| (*a.expr).clone()).collect());
         }
         call.visit_children_with(self);
     }
@@ -214,7 +318,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect_global_prefix(&project, &files(&project), &root).as_deref(),
+            detect(&project, &files(&project), &root).prefix.as_deref(),
             Some("api")
         );
     }
@@ -230,7 +334,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect_global_prefix(&project, &files(&project), &root).as_deref(),
+            detect(&project, &files(&project), &root).prefix.as_deref(),
             Some("v2")
         );
     }
@@ -252,7 +356,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect_global_prefix(&project, &files(&project), &root).as_deref(),
+            detect(&project, &files(&project), &root).prefix.as_deref(),
             Some("v2")
         );
     }
@@ -267,10 +371,7 @@ mod tests {
                 "import { settings } from './local';\nasync function bootstrap() { app.setGlobalPrefix(settings.prefix); }",
             )],
         );
-        assert_eq!(
-            detect_global_prefix(&project, &files(&project), &root),
-            None
-        );
+        assert_eq!(detect(&project, &files(&project), &root).prefix, None);
     }
 
     #[test]
@@ -286,11 +387,11 @@ mod tests {
         );
         let entry = [root.join("src/a-setup.ts"), root.join("src/main.ts")];
         assert_eq!(
-            detect_global_prefix(&project, &entry, &root).as_deref(),
+            detect(&project, &entry, &root).prefix.as_deref(),
             Some("api")
         );
         assert_eq!(
-            detect_global_prefix(&project, &entry[..1], &root).as_deref(),
+            detect(&project, &entry[..1], &root).prefix.as_deref(),
             Some("setup")
         );
     }
