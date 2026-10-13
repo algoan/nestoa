@@ -2454,6 +2454,7 @@ mod tests {
                         @Get(ROUTES.ITEM.ONE) one() {}
                         @Get(`redirect/${Alias.LINXO}`) linxo() {}
                         @Get(LOCAL + '/x') local() {}
+                        @Get(`v${1 + 1}`) sum() {}
                         @Get(BOTH) both() {}
                         @Get(UNKNOWN) unknown() {}
                     }
@@ -2472,6 +2473,7 @@ mod tests {
                 "/things/list",
                 "/things/local/x",
                 "/things/redirect/linxo",
+                "/things/v2",
                 "/things/{id}"
             ]
         );

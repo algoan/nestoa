@@ -37,30 +37,43 @@ pub fn strings(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<String
 
 /// The string `expr` evaluates to.
 pub fn string(project: &Project, file: &Path, expr: &Expr) -> Option<String> {
-    eval(project, file, expr, 0)
+    eval(project, file, expr, 0).map(text)
 }
 
-fn eval(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<String> {
+/// A value as JavaScript turns it into a string.
+fn text(value: EnumValue) -> String {
+    match value {
+        EnumValue::Str(s) => s,
+        EnumValue::Num(n) => n.to_string(),
+    }
+}
+
+fn eval(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<EnumValue> {
     if depth > MAX_DEPTH {
         return None;
     }
     match unwrap(expr) {
-        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-        Expr::Lit(Lit::Num(n)) => Some(n.value.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(EnumValue::Str(s.value.to_string_lossy().into_owned())),
+        Expr::Lit(Lit::Num(n)) => Some(EnumValue::Num(n.value)),
         Expr::Tpl(t) => {
             let mut out = String::new();
             for (i, quasi) in t.quasis.iter().enumerate() {
                 out.push_str(&quasi.cooked.as_ref()?.to_string_lossy());
                 if let Some(e) = t.exprs.get(i) {
-                    out.push_str(&eval(project, file, e, depth)?);
+                    out.push_str(&text(eval(project, file, e, depth)?));
                 }
             }
-            Some(out)
+            Some(EnumValue::Str(out))
         }
+        // `+` adds two numbers and concatenates anything else.
         Expr::Bin(b) if b.op == BinaryOp::Add => {
-            let mut out = eval(project, file, &b.left, depth)?;
-            out.push_str(&eval(project, file, &b.right, depth)?);
-            Some(out)
+            match (
+                eval(project, file, &b.left, depth)?,
+                eval(project, file, &b.right, depth)?,
+            ) {
+                (EnumValue::Num(l), EnumValue::Num(r)) => Some(EnumValue::Num(l + r)),
+                (l, r) => Some(EnumValue::Str(format!("{}{}", text(l), text(r)))),
+            }
         }
         Expr::Ident(i) => {
             let (decl_file, c) = project.resolve_const(file, &i.sym)?;
@@ -72,7 +85,7 @@ fn eval(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<Str
 }
 
 /// `Enum.MEMBER` (possibly namespace-qualified) or `CONST.a.b`.
-fn member(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<String> {
+fn member(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<EnumValue> {
     let (root, props) = member_chain(expr)?;
     let (last, parents) = props.split_last()?;
     let owner = std::iter::once(root.as_str())
@@ -80,14 +93,10 @@ fn member(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<S
         .collect::<Vec<_>>()
         .join(".");
     if let Some((_, Symbol::Enum(e))) = project.resolve(file, &owner) {
-        return match enum_member_values(&e)
+        return enum_member_values(&e)
             .into_iter()
             .find(|(n, _)| n == last)?
-        {
-            (_, Some(EnumValue::Str(s))) => Some(s),
-            (_, Some(EnumValue::Num(n))) => Some(n.to_string()),
-            (_, None) => None,
-        };
+            .1;
     }
     let (decl_file, c) = project.resolve_const(file, &root)?;
     let mut value = unwrap(c.init());
