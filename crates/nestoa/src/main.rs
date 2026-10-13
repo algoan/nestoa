@@ -185,12 +185,10 @@ fn main() -> Result<()> {
     // Recover the NestJS global prefix from the bootstrap file (e.g.
     // `app.setGlobalPrefix(...)` in main.ts) unless the user opted out. An
     // explicit `basePath` wins over the detected prefix and its `exclude`.
-    let mut bootstrap = if cfg.detect_global_prefix {
-        globalprefix::detect(&project, &files, &project_root)
-    } else {
-        globalprefix::Bootstrap::default()
-    };
-    if cfg.base_path.is_some() {
+    // Versioning is always read; `detectGlobalPrefix` only governs the prefix.
+    let mut bootstrap = globalprefix::detect(&project, &files, &project_root);
+    if cfg.base_path.is_some() || !cfg.detect_global_prefix {
+        bootstrap.prefix = None;
         bootstrap.exclude.clear();
     } else if let Some(prefix) = bootstrap.prefix.take() {
         eprintln!("nestoa: detected global prefix \"{prefix}\" from bootstrap");
