@@ -1,4 +1,5 @@
 mod config;
+mod constval;
 mod diag;
 mod dialect;
 mod discover;

@@ -138,9 +138,10 @@ pub struct ImportBinding {
 #[derive(Clone, Default)]
 pub struct FileSymbols {
     pub declared: HashMap<String, Symbol>,
-    /// Numeric `const` values (`export const MULTI_STATUS = 207`), used to
-    /// resolve identifier arguments to decorators like `@HttpCode(MULTI_STATUS)`.
-    pub const_numbers: HashMap<String, f64>,
+    /// Variables with an initializer (`export const MULTI_STATUS = 207`,
+    /// `const ROUTES = { LIST: 'list' }`), so decorator arguments that name
+    /// them (`@HttpCode(MULTI_STATUS)`, `@Get(ROUTES.LIST)`) can be evaluated.
+    pub consts: HashMap<String, ConstInit>,
     pub imports: HashMap<String, ImportBinding>,
     /// `export { Foo } from "./other"` re-exports: local-name -> ImportBinding
     pub re_exports: HashMap<String, ImportBinding>,
@@ -164,6 +165,27 @@ impl FileSymbols {
     /// module's own declaration or import of it.
     fn exports(&self, name: &str) -> bool {
         self.is_declaration_file || self.exported.contains(name)
+    }
+}
+
+/// The initializer of a top-level variable, shared with its module.
+#[derive(Clone)]
+pub struct ConstInit {
+    module: Arc<Module>,
+    path: Arc<[usize]>,
+    decl: usize,
+}
+
+impl ConstInit {
+    pub fn init(&self) -> &swc_ecma_ast::Expr {
+        let item = item_at(&self.module.body, &self.path).expect("a const's path names an item");
+        let Some(Decl::Var(v)) = declaration(item) else {
+            unreachable!("a const's item is a variable declaration")
+        };
+        v.decls[self.decl]
+            .init
+            .as_deref()
+            .expect("a const has an initializer")
     }
 }
 
@@ -438,6 +460,14 @@ impl Project {
     pub fn resolve_const_number(&self, file: &Path, name: &str) -> Option<f64> {
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
+        let (_, c) = self.resolve_const_inner(file, name, false, &mut visited)?;
+        numeric_expr(c.init())
+    }
+
+    /// The variable `name` refers to in `file`, following imports and
+    /// re-exports, with the file declaring it.
+    pub fn resolve_const(&self, file: &Path, name: &str) -> Option<(PathBuf, ConstInit)> {
+        let mut visited = std::collections::HashSet::new();
         self.resolve_const_inner(file, name, false, &mut visited)
     }
 
@@ -470,14 +500,14 @@ impl Project {
         name: &str,
         from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
-    ) -> Option<f64> {
+    ) -> Option<(PathBuf, ConstInit)> {
         if !visited.insert((file.to_path_buf(), name.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
         let visible = !from_importer || fs.exports(name);
-        if visible && let Some(v) = fs.const_numbers.get(name) {
-            return Some(*v);
+        if visible && let Some(c) = fs.consts.get(name) {
+            return Some((file.to_path_buf(), c.clone()));
         }
         if let Some(local) = fs.local_exports.get(name) {
             return self.resolve_const_inner(file, local, false, visited);
@@ -593,11 +623,11 @@ fn collect_items(
             fs.local_exports.insert("default".to_string(), name);
         }
         match item {
-            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, fs),
+            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(module, &path, decl, fs),
             ModuleItem::ModuleDecl(md) => match md {
                 ModuleDecl::Import(i) => collect_import(i, fs),
                 ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => {
-                    collect_consts(decl, fs);
+                    collect_consts(module, &path, decl, fs);
                     fs.exported.extend(declared_names(decl));
                 }
                 ModuleDecl::ExportAll(ea) => {
@@ -759,16 +789,17 @@ fn declared_symbol(module: &Arc<Module>, path: &Arc<[usize]>) -> Option<(String,
     })
 }
 
-/// Record numeric `const NAME = <literal>` so decorator arguments that
-/// reference the constant (e.g. `@HttpCode(MULTI_STATUS)`) can be resolved to
-/// their value, including across module boundaries.
-fn collect_consts(decl: &Decl, fs: &mut FileSymbols) {
+/// Record each `const NAME = <init>` of the variable declaration at `path`.
+fn collect_consts(module: &Arc<Module>, path: &Arc<[usize]>, decl: &Decl, fs: &mut FileSymbols) {
     let Decl::Var(v) = decl else { return };
-    for d in &v.decls {
-        if let (swc_ecma_ast::Pat::Ident(id), Some(init)) = (&d.name, &d.init)
-            && let Some(n) = numeric_expr(init)
-        {
-            fs.const_numbers.insert(id.id.sym.to_string(), n);
+    for (i, d) in v.decls.iter().enumerate() {
+        if let (swc_ecma_ast::Pat::Ident(id), Some(_)) = (&d.name, &d.init) {
+            let init = ConstInit {
+                module: module.clone(),
+                path: path.clone(),
+                decl: i,
+            };
+            fs.consts.insert(id.id.sym.to_string(), init);
         }
     }
 }

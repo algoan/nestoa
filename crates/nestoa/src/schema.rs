@@ -313,17 +313,7 @@ impl<'a> SchemaCtx<'a> {
     /// `kind` when the source is not at hand) so the gap stays visible.
     fn unsupported(&self, file: &Path, ty: &TsType, kind: &str) -> Value {
         let span = ty.span();
-        let text = self
-            .project
-            .files
-            .get(file)
-            .and_then(|f| {
-                let start = f.source.start_pos.0;
-                let lo = span.lo.0.checked_sub(start)? as usize;
-                let hi = span.hi.0.checked_sub(start)? as usize;
-                f.source.src.get(lo..hi)
-            })
-            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
+        let text = self.project.files.get(file).and_then(|f| f.text(span));
         json!({ "x-unresolved": text.unwrap_or_else(|| kind.to_string()) })
     }
 

@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
+use swc_common::Spanned;
 use swc_ecma_ast::{
-    Callee, Class, ClassMember, Decorator, Expr, ExprOrSpread, Function, Lit, MethodKind, Param,
-    Pat, PropName, TsEntityName, TsType, TsTypeRef,
+    Callee, Class, ClassMember, Decorator, Expr, Function, Lit, MethodKind, Param, Pat, PropName,
+    TsEntityName, TsType, TsTypeRef,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -189,7 +190,7 @@ impl<'a> Extractor<'a> {
                     },
                     _ => continue,
                 };
-                if let Some(base_paths) = controller_base_paths(class) {
+                if let Some(base_paths) = self.controller_base_paths(file, &ident.sym, class) {
                     let class_tag = strip_suffix_ci(&ident.sym, "Controller").to_string();
                     self.extract_class(
                         file,
@@ -234,14 +235,14 @@ impl<'a> Extractor<'a> {
             }
             // Decorators apply bottom-up, so with several verb decorators the
             // topmost one is applied last and is the one NestJS registers.
-            let mut http: Option<(VerbDecorator, Vec<String>)> = None;
+            let mut http: Option<(VerbDecorator, &Decorator)> = None;
             let mut deprecated = false;
             let mut http_code: Option<u16> = None;
             for d in &m.function.decorators {
                 let name = decorator_name(d);
                 if let Some(verb) = VerbDecorator::from_name(&name) {
                     if http.is_none() {
-                        http = Some((verb, path_args(d)));
+                        http = Some((verb, d));
                     }
                     continue;
                 }
@@ -261,7 +262,11 @@ impl<'a> Extractor<'a> {
                         });
                 }
             }
-            let Some((verb, sub_paths)) = http else {
+            let Some((verb, verb_decorator)) = http else {
+                continue;
+            };
+            let handler = format!("{class_name}.{}", prop_name_text(&m.key));
+            let Some(sub_paths) = self.decorator_paths(file, verb_decorator, &handler) else {
                 continue;
             };
             let mut interceptor_names = class_interceptors.clone();
@@ -426,7 +431,7 @@ impl<'a> Extractor<'a> {
                 tags: vec![tag.to_string()],
                 errors: BTreeMap::new(),
                 catch_all: matches!(verb, VerbDecorator::All),
-                handler: format!("{class_name}.{}", prop_name_text(&m.key)),
+                handler,
                 file: file.to_path_buf(),
             };
             let has_body = template.request_body.is_some();
@@ -465,6 +470,57 @@ impl<'a> Extractor<'a> {
                 });
             }
         }
+    }
+
+    /// The controller's base path(s), or `None` if the class is not a
+    /// `@Controller` or its path can't be evaluated. A bare `@Controller()`
+    /// yields a single empty path; `@Controller(['a', 'b'])` mounts the
+    /// controller at each.
+    fn controller_base_paths(&self, file: &Path, name: &str, class: &Class) -> Option<Vec<String>> {
+        let d = class
+            .decorators
+            .iter()
+            .find(|d| decorator_name(d) == "Controller")?;
+        let paths = self.decorator_paths(file, d, name)?;
+        Some(if paths.is_empty() {
+            vec![String::new()]
+        } else {
+            paths
+        })
+    }
+
+    /// The path(s) a `@Controller`/verb decorator's first argument names: a
+    /// string, an array, an expression `constval` evaluates (`ROUTES.LIST`,
+    /// `` `${BASE}/x` ``), or the object form's `path`. `None`, with a
+    /// warning, when the path can't be evaluated: the routes are left out
+    /// rather than mounted on the wrong path.
+    fn decorator_paths(&self, file: &Path, d: &Decorator, owner: &str) -> Option<Vec<String>> {
+        let Expr::Call(call) = &*d.expr else {
+            return Some(Vec::new());
+        };
+        let Some(arg) = call.args.first() else {
+            return Some(Vec::new());
+        };
+        let expr = match arg.expr.as_ref() {
+            Expr::Object(o) => match object_value(o, "path") {
+                Some(path) => path,
+                None => return Some(Vec::new()),
+            },
+            expr => expr,
+        };
+        let paths = crate::constval::strings(self.project, file, expr);
+        if paths.is_none() {
+            let text = self
+                .project
+                .files
+                .get(file)
+                .and_then(|f| f.text(expr.span()));
+            crate::diag::warn(format!(
+                "{owner}: cannot evaluate the path {}; its routes are left out",
+                text.as_deref().unwrap_or("argument")
+            ));
+        }
+        paths
     }
 
     /// The status named by `@HttpCode(<Enum>.<MEMBER>)`: a member of an enum
@@ -673,66 +729,15 @@ fn collect_interceptors(decorators: &[swc_ecma_ast::Decorator]) -> Vec<String> {
     names
 }
 
-/// Returns the controller's base path(s), or `None` if the class is not a
-/// `@Controller`. A bare `@Controller()` yields a single empty path. NestJS
-/// allows an array of paths (`@Controller(['a', 'b'])`), each of which becomes
-/// a distinct mount point.
-fn controller_base_paths(class: &Class) -> Option<Vec<String>> {
-    for d in &class.decorators {
-        if decorator_name(d) == "Controller" {
-            let paths = path_args(d);
-            return Some(if paths.is_empty() {
-                vec![String::new()]
-            } else {
-                paths
-            });
-        }
-    }
-    None
-}
-
-/// Extracts the path(s) from a decorator's first argument. Handles a string
-/// literal, an array of string literals (NestJS multi-path form), and the
-/// `@Controller({ path: ... })` object form (where `path` may itself be a
-/// string or an array). Non-literal entries are skipped.
-fn path_args(d: &swc_ecma_ast::Decorator) -> Vec<String> {
-    let call = match &*d.expr {
-        Expr::Call(c) => c,
-        _ => return Vec::new(),
-    };
-    match call.args.first() {
-        Some(ExprOrSpread { expr, .. }) => expr_to_paths(expr.as_ref()),
-        None => Vec::new(),
-    }
-}
-
-fn expr_to_paths(expr: &Expr) -> Vec<String> {
-    match expr {
-        Expr::Lit(Lit::Str(s)) => vec![s.value.to_string_lossy().into_owned()],
-        Expr::Array(arr) => arr
-            .elems
-            .iter()
-            .flatten()
-            .filter(|el| el.spread.is_none())
-            .filter_map(|el| match el.expr.as_ref() {
-                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect(),
-        Expr::Object(o) => {
-            // Support `@Controller({ path: 'foo' })` (path may be an array too).
-            for prop in &o.props {
-                if let swc_ecma_ast::PropOrSpread::Prop(p) = prop
-                    && let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref()
-                    && prop_name_text(&kv.key) == "path"
-                {
-                    return expr_to_paths(kv.value.as_ref());
-                }
-            }
-            Vec::new()
-        }
-        _ => Vec::new(),
-    }
+/// The value of the `key` property of an object literal.
+fn object_value<'a>(o: &'a swc_ecma_ast::ObjectLit, key: &str) -> Option<&'a Expr> {
+    o.props.iter().find_map(|prop| match prop {
+        swc_ecma_ast::PropOrSpread::Prop(p) => match p.as_ref() {
+            swc_ecma_ast::Prop::KeyValue(kv) if prop_name_text(&kv.key) == key => Some(&*kv.value),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 fn numeric_arg(d: &swc_ecma_ast::Decorator) -> Option<u16> {
@@ -1670,6 +1675,57 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn non_literal_paths_are_evaluated() {
+        crate::diag::take_warnings();
+        let (routes, _) = extract_from(
+            "non-literal",
+            &[
+                (
+                    "routes.ts",
+                    "export const BASE = 'things';\n\
+                     export const ROUTES = { LIST: 'list', ITEM: { ONE: ':id' } } as const;\n\
+                     export enum Alias { LINXO = 'linxo' }\n\
+                     export const BOTH = ['a', 'b'];",
+                ),
+                (
+                    "ctrl.ts",
+                    r#"
+                    import { BASE, ROUTES, Alias, BOTH } from './routes';
+                    const LOCAL = 'local';
+                    @Controller(BASE)
+                    export class ThingsController {
+                        @Get(ROUTES.LIST) list() {}
+                        @Get(ROUTES.ITEM.ONE) one() {}
+                        @Get(`redirect/${Alias.LINXO}`) linxo() {}
+                        @Get(LOCAL + '/x') local() {}
+                        @Get(BOTH) both() {}
+                        @Get(UNKNOWN) unknown() {}
+                    }
+                    "#,
+                ),
+            ],
+            "ctrl.ts",
+        );
+        let mut paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "/things/a",
+                "/things/b",
+                "/things/list",
+                "/things/local/x",
+                "/things/redirect/linxo",
+                "/things/{id}"
+            ]
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["ThingsController.unknown: cannot evaluate the path UNKNOWN; its routes are left out"]
+        );
     }
 
     #[test]
