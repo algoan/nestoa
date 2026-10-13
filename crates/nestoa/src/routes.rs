@@ -230,15 +230,17 @@ impl<'a> Extractor<'a> {
             if !matches!(m.kind, MethodKind::Method) {
                 continue;
             }
-            // Find HTTP verb decorator.
+            // Decorators apply bottom-up, so with several verb decorators the
+            // topmost one is applied last and is the one NestJS registers.
             let mut http: Option<(VerbDecorator, Vec<String>)> = None;
             let mut deprecated = false;
             let mut http_code: Option<u16> = None;
             for d in &m.function.decorators {
                 let name = decorator_name(d);
                 if let Some(verb) = VerbDecorator::from_name(&name) {
-                    let paths = path_args(d);
-                    http = Some((verb, paths));
+                    if http.is_none() {
+                        http = Some((verb, path_args(d)));
+                    }
                     continue;
                 }
                 if name == "HttpCode" {
@@ -1666,6 +1668,23 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn the_topmost_verb_decorator_wins() {
+        let routes = extract_routes(
+            "stacked",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                @Get('a')
+                @Post('b')
+                stacked() {}
+            }
+            "#,
+        );
+        assert_eq!(routes.len(), 1);
+        find(&routes, HttpMethod::Get, "/items/a");
     }
 
     #[test]
