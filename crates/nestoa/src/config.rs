@@ -308,7 +308,7 @@ impl OpenApiVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Info {
     #[serde(default = "default_title")]
     pub title: String,
@@ -421,28 +421,29 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load(explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
-        let candidates: Vec<PathBuf> = if let Some(p) = explicit {
-            vec![cwd.join(p)]
-        } else {
-            [
-                "nestoa.config.json",
-                "nestoa.config.yaml",
-                "nestoa.config.yml",
-            ]
-            .iter()
-            .map(|n| cwd.join(n))
-            .collect()
-        };
-        for path in candidates {
-            if path.is_file() {
-                let value = load_value(&path, &mut Vec::new())?;
-                let cfg: Config = serde_json::from_value(value)
-                    .with_context(|| format!("parsing {}", path.display()))?;
-                return Ok(cfg);
+    /// Load `explicit` (a path as given on the command line, so relative to
+    /// the process CWD), or else the first `nestoa.config.*` in `project_root`.
+    pub fn load(explicit: Option<&Path>, project_root: &Path) -> Result<Self> {
+        let path = match explicit {
+            Some(p) if !p.is_file() => bail!("config file {} not found", p.display()),
+            Some(p) => p.to_path_buf(),
+            None => {
+                let found = [
+                    "nestoa.config.json",
+                    "nestoa.config.yaml",
+                    "nestoa.config.yml",
+                ]
+                .iter()
+                .map(|n| project_root.join(n))
+                .find(|p| p.is_file());
+                let Some(found) = found else {
+                    return Ok(Config::default());
+                };
+                found
             }
-        }
-        Ok(Config::default())
+        };
+        let value = load_value(&path, &mut Vec::new())?;
+        serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn output_format(&self) -> OutputFormat {
@@ -605,7 +606,7 @@ mod tests {
         .unwrap();
 
         let cfg = Config::load(
-            Some(Path::new("nestoa.config.json")),
+            Some(&dir.join("services/svc/nestoa.config.json")),
             &dir.join("services/svc"),
         )
         .expect("config with extends loads");
@@ -627,9 +628,17 @@ mod tests {
             r#"{ "extends": "./does-not-exist.json" }"#,
         )
         .unwrap();
-        let err = Config::load(Some(Path::new("nestoa.config.json")), &dir);
+        let err = Config::load(Some(&dir.join("nestoa.config.json")), &dir);
         assert!(err.is_err(), "missing extends target should error");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_explicit_config_errors() {
+        let dir = std::env::temp_dir();
+        let missing = dir.join(format!("nestoa-missing-{}.json", std::process::id()));
+        let err = Config::load(Some(&missing), &dir).expect_err("a missing --config should error");
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
     }
 
     #[test]
@@ -647,12 +656,19 @@ mod tests {
             r#"{ "extends": "./nestoa.config.json" }"#,
         )
         .unwrap();
-        let err = Config::load(Some(Path::new("nestoa.config.json")), &dir)
+        let err = Config::load(Some(&dir.join("nestoa.config.json")), &dir)
             .expect_err("an extends cycle should error");
         let msg = format!("{err:#}");
         assert!(msg.contains("\"extends\" cycle"), "{msg}");
         assert!(msg.contains("b.json -> "), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_info_key_is_rejected() {
+        let err = serde_json::from_str::<Config>(r#"{ "info": { "titel": "X" } }"#)
+            .expect_err("a misspelt info key should error");
+        assert!(err.to_string().contains("titel"), "{err}");
     }
 
     #[test]

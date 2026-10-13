@@ -1,4 +1,5 @@
 mod config;
+mod diag;
 mod dialect;
 mod discover;
 mod errors;
@@ -34,11 +35,12 @@ struct Cli {
     #[arg(default_value = ".")]
     project: PathBuf,
 
-    /// Path to a config file (defaults to nestoa.config.{json,yaml,yml} in the project root).
+    /// Path to a config file, relative to the current directory (defaults to
+    /// nestoa.config.{json,yaml,yml} in the project root).
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Override the output file path.
+    /// Override the output file path, relative to the current directory.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -49,6 +51,11 @@ struct Cli {
     /// Print the resolved configuration and exit.
     #[arg(long)]
     print_config: bool,
+
+    /// Exit with an error after writing the output if there was any warning or
+    /// any `x-unresolved` type, listing where each unresolved type is.
+    #[arg(long)]
+    strict: bool,
 }
 
 /// Compile the `resolvePackages` glob patterns into a matcher over package names.
@@ -102,7 +109,7 @@ fn expand_packages(project: &mut Project, parser: &ParsingContext, allow: &GlobS
                     project.add(parsed);
                     worklist.push(target);
                 }
-                Err(e) => eprintln!("warning: {}", e),
+                Err(e) => diag::warn(format!("{e:#}; skipping the file")),
             }
         }
     }
@@ -115,8 +122,11 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("resolving project path {}", cli.project.display()))?;
     let mut cfg = Config::load(cli.config.as_deref(), &project_root)?;
+    // Paths given on the command line are relative to where nestoa runs; only
+    // the config's own `output` is relative to the project.
     if let Some(o) = cli.output {
-        cfg.output = o;
+        cfg.output = std::path::absolute(&o)
+            .with_context(|| format!("resolving output path {}", o.display()))?;
     }
     if let Some(v) = cli.openapi_version {
         cfg.openapi_version = v;
@@ -143,7 +153,7 @@ fn main() -> Result<()> {
         let parsed = match parser.parse_file(file) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: {}", e);
+                diag::warn(format!("{e:#}; skipping the file"));
                 continue;
             }
         };
@@ -170,7 +180,7 @@ fn main() -> Result<()> {
     if !cfg.resolve_packages.is_empty() || has_aliases {
         match build_package_allowlist(&cfg.resolve_packages) {
             Ok(allow) => expand_packages(&mut project, &parser, &allow),
-            Err(e) => eprintln!("warning: invalid resolvePackages pattern: {}", e),
+            Err(e) => diag::warn(format!("invalid resolvePackages pattern: {e}")),
         }
     }
 
@@ -199,8 +209,14 @@ fn main() -> Result<()> {
         extractor.extract_all()
     };
 
+    errors::warn_unmatched(
+        &cfg.error_responses,
+        routes
+            .iter()
+            .map(|r| (r.method.as_lower(), r.path.as_str())),
+    );
     if routes.is_empty() {
-        eprintln!("warning: no @Controller-decorated classes with HTTP routes were found");
+        diag::warn("no @Controller-decorated classes with HTTP routes were found");
     }
 
     let doc = to_openapi(&cfg, &routes, components);
@@ -215,7 +231,8 @@ fn main() -> Result<()> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     let body = match cfg.output_format() {
@@ -224,25 +241,40 @@ fn main() -> Result<()> {
     };
     std::fs::write(&output_path, body)
         .with_context(|| format!("writing {}", output_path.display()))?;
+    let schemas = doc
+        .get("components")
+        .and_then(|c| c.get("schemas"))
+        .and_then(|s| s.as_object().map(|o| o.len()))
+        .unwrap_or(0);
+    let unresolved = diag::unresolved(&doc);
     eprintln!(
-        "nestoa: wrote {} ({} route{}, {} schema{})",
+        "nestoa: wrote {} ({}, {}{})",
         output_path.display(),
-        routes.len(),
-        if routes.len() == 1 { "" } else { "s" },
-        doc.get("components")
-            .and_then(|c| c.get("schemas"))
-            .and_then(|s| s.as_object().map(|o| o.len()))
-            .unwrap_or(0),
-        if doc
-            .get("components")
-            .and_then(|c| c.get("schemas"))
-            .and_then(|s| s.as_object().map(|o| o.len() == 1))
-            .unwrap_or(false)
-        {
-            ""
+        plural(routes.len(), "route"),
+        plural(schemas, "schema"),
+        if unresolved.is_empty() {
+            String::new()
         } else {
-            "s"
+            format!(", {} unresolved", unresolved.len())
         },
     );
+
+    if cli.strict {
+        for (pointer, name) in &unresolved {
+            eprintln!("unresolved: {name} at {pointer}");
+        }
+        let warnings = diag::warning_count();
+        if warnings > 0 || !unresolved.is_empty() {
+            anyhow::bail!(
+                "--strict: {} and {}",
+                plural(warnings, "warning"),
+                plural(unresolved.len(), "unresolved type")
+            );
+        }
+    }
     Ok(())
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }

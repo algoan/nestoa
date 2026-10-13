@@ -123,6 +123,11 @@ pub struct Route {
     /// Registered by `@All` rather than an explicit verb decorator. Between
     /// the two, whichever was registered first serves the method.
     pub catch_all: bool,
+    /// `Controller.method`, for diagnostics.
+    pub handler: String,
+    /// The file declaring the handler, which tells apart two controllers of
+    /// the same name.
+    pub file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +189,14 @@ impl<'a> Extractor<'a> {
                     && let Some(base_paths) = controller_base_paths(&cd.class)
                 {
                     let class_tag = strip_suffix_ci(&cd.ident.sym, "Controller").to_string();
-                    self.extract_class(file, &cd.class, &base_paths, &class_tag, &mut routes);
+                    self.extract_class(
+                        file,
+                        &cd.ident.sym,
+                        &cd.class,
+                        &base_paths,
+                        &class_tag,
+                        &mut routes,
+                    );
                 }
             }
         }
@@ -194,6 +206,7 @@ impl<'a> Extractor<'a> {
     fn extract_class(
         &mut self,
         file: &Path,
+        class_name: &str,
         class: &Class,
         base_paths: &[String],
         tag: &str,
@@ -409,6 +422,8 @@ impl<'a> Extractor<'a> {
                 tags: vec![tag.to_string()],
                 errors: BTreeMap::new(),
                 catch_all: matches!(verb, VerbDecorator::All),
+                handler: format!("{class_name}.{}", prop_name_text(&m.key)),
+                file: file.to_path_buf(),
             };
             let has_body = template.request_body.is_some();
             for (&method, full_path) in verb
@@ -705,15 +720,9 @@ fn expr_to_paths(expr: &Expr) -> Vec<String> {
             for prop in &o.props {
                 if let swc_ecma_ast::PropOrSpread::Prop(p) = prop
                     && let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref()
+                    && prop_name_text(&kv.key) == "path"
                 {
-                    let k = match &kv.key {
-                        PropName::Ident(i) => i.sym.to_string(),
-                        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
-                        _ => continue,
-                    };
-                    if k == "path" {
-                        return expr_to_paths(kv.value.as_ref());
-                    }
+                    return expr_to_paths(kv.value.as_ref());
                 }
             }
             Vec::new()
@@ -923,9 +932,14 @@ fn join_paths(prefix: Option<&str>, base: &str, sub: Option<&str>) -> String {
     if out.is_empty() {
         return "/".to_string();
     }
-    // Convert :param to {param} for OpenAPI.
-    let mut formatted = String::with_capacity(out.len());
-    let mut chars = out.chars().peekable();
+    openapi_params(&out)
+}
+
+/// Convert Express-style `:param` placeholders to OpenAPI `{param}`, wherever
+/// they appear in a segment (`/files/:name.:ext` → `/files/{name}.{ext}`).
+pub(crate) fn openapi_params(path: &str) -> String {
+    let mut formatted = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
         if c == ':' {
             let mut name = String::new();
@@ -960,6 +974,44 @@ fn path_matches_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
 }
 
+/// Warn about paths that differ only in their parameter names
+/// (`/users/{id}` and `/users/{slug}`): OpenAPI forbids them, as the router
+/// can't tell them apart either.
+fn warn_param_name_conflicts<'a>(paths: impl Iterator<Item = &'a String>) {
+    let mut by_template: IndexMap<String, Vec<&str>> = IndexMap::new();
+    for path in paths {
+        let mut template = String::with_capacity(path.len());
+        let mut in_param = false;
+        for c in path.chars() {
+            match c {
+                '{' => in_param = true,
+                '}' => {
+                    in_param = false;
+                    template.push_str("{}");
+                }
+                _ if !in_param => template.push(c),
+                _ => {}
+            }
+        }
+        by_template.entry(template).or_default().push(path);
+    }
+    for mut group in by_template.into_values().filter(|g| g.len() > 1) {
+        group.sort_unstable();
+        crate::diag::warn(format!(
+            "paths {} differ only in parameter names, which OpenAPI forbids",
+            group.join(" and ")
+        ));
+    }
+}
+
+fn prop_name_text(key: &PropName) -> String {
+    match key {
+        PropName::Ident(i) => i.sym.to_string(),
+        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        _ => String::new(),
+    }
+}
+
 fn normalize_segment(s: &str) -> String {
     let s = s.trim().trim_matches('/');
     if s.is_empty() {
@@ -984,9 +1036,12 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
     // NestJS registers handlers in declaration order and the router serves the
     // first match, so an `@All` and an explicit verb on the same method and path
-    // resolve to whichever came first. Two explicit handlers keep last-wins.
+    // resolve to whichever came first. Two explicit handlers keep last-wins, with
+    // a warning naming both.
     let mut catch_all_slots: std::collections::HashSet<(&str, HttpMethod)> =
         std::collections::HashSet::new();
+    let mut handlers: std::collections::HashMap<(&str, HttpMethod), &Route> =
+        std::collections::HashMap::new();
     for r in routes {
         let slot = (r.path.as_str(), r.method);
         let taken = paths
@@ -997,6 +1052,23 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         }
         if r.catch_all {
             catch_all_slots.insert(slot);
+        }
+        if let Some(previous) = handlers.insert(slot, r)
+            && (previous.file != r.file || previous.handler != r.handler)
+        {
+            let (overriding, overridden) = if previous.handler == r.handler {
+                (
+                    format!("{} ({})", r.handler, r.file.display()),
+                    format!("{} ({})", previous.handler, previous.file.display()),
+                )
+            } else {
+                (r.handler.clone(), previous.handler.clone())
+            };
+            crate::diag::warn(format!(
+                "{} {}: {overriding} overrides {overridden}",
+                r.method.as_lower().to_uppercase(),
+                r.path,
+            ));
         }
         let entry = paths.entry(r.path.clone()).or_default();
         let mut op = Map::new();
@@ -1096,6 +1168,8 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         op.insert("responses".into(), Value::Object(responses));
         entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
+
+    warn_param_name_conflicts(paths.keys());
 
     // Sort paths, and the HTTP methods within each path, alphabetically. Routes
     // are collected in source/file order, so without this the output would drift
@@ -1735,6 +1809,68 @@ mod tests {
             "#,
         );
         assert_eq!(all_first, (json!("Catch-all"), json!("Catch-all")));
+        assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn two_explicit_handlers_on_one_route_warn() {
+        crate::diag::take_warnings();
+        let routes = extract_routes(
+            "duplicate",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                /** First */
+                @Get()
+                list() {}
+                /** Second */
+                @Get()
+                listAgain() {}
+            }
+            "#,
+        );
+        let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        assert_eq!(doc["paths"]["/items"]["get"]["summary"], json!("Second"));
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["GET /items: ItemsController.listAgain overrides ItemsController.list"]
+        );
+    }
+
+    #[test]
+    fn paths_differing_only_in_param_names_warn() {
+        crate::diag::take_warnings();
+        let routes = [
+            route(HttpMethod::Get, "/users/{id}"),
+            route(HttpMethod::Delete, "/users/{slug}"),
+            route(HttpMethod::Get, "/users/{id}/posts"),
+        ];
+        to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        assert_eq!(
+            crate::diag::take_warnings(),
+            [
+                "paths /users/{id} and /users/{slug} differ only in parameter names, which OpenAPI forbids"
+            ]
+        );
+    }
+
+    #[test]
+    fn same_named_handlers_from_two_files_warn() {
+        crate::diag::take_warnings();
+        let first = route(HttpMethod::Get, "/ping");
+        let second = Route {
+            file: PathBuf::from("other.ts"),
+            ..first.clone()
+        };
+        to_openapi(
+            &Config::default(),
+            &[first, second],
+            ComponentSchemas::default(),
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["GET /ping: Test.get (other.ts) overrides Test.get (test.ts)"]
+        );
     }
 
     #[test]
@@ -1846,6 +1982,8 @@ mod tests {
             tags: vec![],
             errors: BTreeMap::new(),
             catch_all: false,
+            handler: format!("Test.{}", method.as_lower()),
+            file: PathBuf::from("test.ts"),
         }
     }
 

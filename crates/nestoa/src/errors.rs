@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::config::ErrorResponses;
+use crate::config::{ErrorResponses, GlobalError, RouteErrors};
 
 /// Component-schema name for the shared error body.
 pub const ERROR_SCHEMA_NAME: &str = "Error";
@@ -102,9 +102,7 @@ pub fn compute(sig: &RouteSignals, cfg: &ErrorResponses) -> BTreeMap<u16, String
 
     // Filter-level codes (e.g. 413), optionally gated on a path suffix.
     for g in &cfg.global {
-        if let Some(suffix) = &g.when_path_ends_with
-            && !path_ends_with(sig.path, suffix)
-        {
+        if !global_matches(g, sig.path) {
             continue;
         }
         let desc = g
@@ -128,16 +126,7 @@ pub fn compute(sig: &RouteSignals, cfg: &ErrorResponses) -> BTreeMap<u16, String
         insert(*code, desc.as_deref().unwrap_or_else(|| status_text(*code)));
     }
     for ro in &cfg.routes {
-        let path_matches = match (&ro.when_path_ends_with, &ro.path) {
-            (Some(suffix), _) => path_ends_with(sig.path, suffix),
-            (None, Some(p)) => sig.path == p,
-            (None, None) => false,
-        };
-        let method_matches = ro
-            .method
-            .as_ref()
-            .is_none_or(|m| m.eq_ignore_ascii_case(sig.method));
-        if path_matches && method_matches {
+        if route_matches(ro, sig.method, sig.path) {
             for &code in &ro.add {
                 insert(code, status_text(code));
             }
@@ -145,6 +134,61 @@ pub fn compute(sig: &RouteSignals, cfg: &ErrorResponses) -> BTreeMap<u16, String
     }
 
     errors
+}
+
+fn global_matches(g: &GlobalError, path: &str) -> bool {
+    g.when_path_ends_with
+        .as_ref()
+        .is_none_or(|suffix| path_ends_with(path, suffix))
+}
+
+fn route_matches(ro: &RouteErrors, method: &str, path: &str) -> bool {
+    let path_matches = match (&ro.when_path_ends_with, &ro.path) {
+        (Some(suffix), _) => path_ends_with(path, suffix),
+        (None, Some(p)) => path == crate::routes::openapi_params(p),
+        (None, None) => false,
+    };
+    path_matches
+        && ro
+            .method
+            .as_ref()
+            .is_none_or(|m| m.eq_ignore_ascii_case(method))
+}
+
+/// Warn about each `errorResponses` rule that applies to none of `routes`
+/// (`(method, path)` pairs), which is usually a path written without the
+/// global prefix.
+pub fn warn_unmatched<'a>(
+    cfg: &ErrorResponses,
+    routes: impl Iterator<Item = (&'a str, &'a str)> + Clone,
+) {
+    if !cfg.enabled {
+        return;
+    }
+    for g in &cfg.global {
+        if !routes.clone().any(|(_, path)| global_matches(g, path)) {
+            crate::diag::warn(format!(
+                "errorResponses.global {} with whenPathEndsWith {:?} matches no route",
+                g.status,
+                g.when_path_ends_with.as_deref().unwrap_or_default()
+            ));
+        }
+    }
+    for ro in &cfg.routes {
+        if !routes
+            .clone()
+            .any(|(method, path)| route_matches(ro, method, path))
+        {
+            let target = match (&ro.when_path_ends_with, &ro.path) {
+                (Some(suffix), _) => format!("whenPathEndsWith {suffix:?}"),
+                (None, Some(p)) => format!("path {p:?} (full path, prefix included)"),
+                (None, None) => "with neither path nor whenPathEndsWith".to_string(),
+            };
+            crate::diag::warn(format!(
+                "errorResponses.routes entry {target} matches no route"
+            ));
+        }
+    }
 }
 
 /// Default human description for a status code, used when no source supplies a
@@ -260,6 +304,7 @@ pub fn nest_http_status(member: &str) -> Option<u16> {
 /// `@route-mapping` suffix rule in `routes.rs`). Leading/trailing slashes on
 /// the suffix are ignored; an empty suffix never matches.
 fn path_ends_with(path: &str, suffix: &str) -> bool {
+    let suffix = crate::routes::openapi_params(suffix);
     let suffix = suffix.trim_matches('/');
     if suffix.is_empty() {
         return false;
@@ -271,7 +316,6 @@ fn path_ends_with(path: &str, suffix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ErrorResponses, GlobalError, RouteErrors};
 
     fn signals<'a>(path: &'a str) -> RouteSignals<'a> {
         RouteSignals {
@@ -442,5 +486,65 @@ mod tests {
             ..signals("/x")
         };
         assert!(compute(&sig, &cfg).is_empty());
+    }
+
+    #[test]
+    fn configured_paths_accept_express_params() {
+        let ro = RouteErrors {
+            when_path_ends_with: None,
+            path: Some("/v2/customers/:id".into()),
+            method: None,
+            add: vec![409],
+        };
+        assert!(route_matches(&ro, "get", "/v2/customers/{id}"));
+        let suffix = RouteErrors {
+            when_path_ends_with: Some(":id/aggregate".into()),
+            path: None,
+            ..ro
+        };
+        assert!(route_matches(
+            &suffix,
+            "post",
+            "/v2/customers/{id}/aggregate"
+        ));
+        let in_segment = RouteErrors {
+            when_path_ends_with: None,
+            path: Some("/files/:name.:ext".into()),
+            ..suffix
+        };
+        assert!(route_matches(&in_segment, "get", "/files/{name}.{ext}"));
+    }
+
+    #[test]
+    fn rules_that_match_no_route_warn() {
+        crate::diag::take_warnings();
+        let cfg = ErrorResponses {
+            global: vec![GlobalError {
+                status: 413,
+                when_path_ends_with: Some("/logo".into()),
+                description: None,
+            }],
+            routes: vec![
+                RouteErrors {
+                    when_path_ends_with: None,
+                    path: Some("/customers".into()),
+                    method: Some("post".into()),
+                    add: vec![409],
+                },
+                RouteErrors {
+                    when_path_ends_with: None,
+                    path: Some("/v2/customers".into()),
+                    method: Some("post".into()),
+                    add: vec![409],
+                },
+            ],
+            ..ErrorResponses::default()
+        };
+        let routes = [("post", "/v2/customers"), ("get", "/v2/customers")];
+        warn_unmatched(&cfg, routes.iter().copied());
+        let warnings = crate::diag::take_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("413"), "{warnings:?}");
+        assert!(warnings[1].contains("\"/customers\""), "{warnings:?}");
     }
 }
