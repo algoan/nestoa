@@ -681,6 +681,7 @@ impl<'a> Extractor<'a> {
         // Find the first known decorator on the parameter.
         let mut location: Option<DecoratorKind> = None;
         let mut decorator_arg: Option<String> = None;
+        let mut pipes = PipeEffects::default();
         for d in &p.decorators {
             let name = decorator_name(d);
             let kind = match name.as_str() {
@@ -701,6 +702,7 @@ impl<'a> Extractor<'a> {
             };
             location = Some(kind);
             decorator_arg = string_arg(d);
+            pipes = pipe_effects(d);
             break;
         }
         let location = location?;
@@ -726,11 +728,22 @@ impl<'a> Extractor<'a> {
             instantiating: Vec::new(),
             passthrough_types: &self.config.passthrough_types,
         };
-        let schema = pat_info
-            .ts_type
-            .as_ref()
-            .map(|t| ctx.ts_type_to_schema(file, t))
-            .unwrap_or_else(|| json!({}));
+        let mut schema = pipes.schema.clone().unwrap_or_else(|| {
+            pat_info
+                .ts_type
+                .as_ref()
+                .map(|t| ctx.ts_type_to_schema(file, t))
+                .unwrap_or_else(|| json!({}))
+        });
+        if let Some(default) = &pipes.default
+            && let Some(o) = schema.as_object_mut()
+        {
+            o.insert("default".into(), default.clone());
+        }
+        let pat_info = PatInfo {
+            optional: pat_info.optional || pipes.optional,
+            ..pat_info
+        };
         let description = method_doc.params.get(&pat_info.name).cloned();
         match location {
             DecoratorKind::Body if body_field.is_some() => {
@@ -803,6 +816,69 @@ impl<'a> Extractor<'a> {
                 description,
             }])),
         }
+    }
+}
+
+/// What a parameter's pipes (`@Query('page', new DefaultValuePipe(1),
+/// ParseIntPipe)`) say about it.
+#[derive(Default)]
+struct PipeEffects {
+    /// The wire type a parse pipe accepts, replacing the declared type.
+    schema: Option<Value>,
+    /// `DefaultValuePipe`'s value.
+    default: Option<Value>,
+    /// The parameter may be omitted: it has a default, or a parse pipe was
+    /// given `{ optional: true }`.
+    optional: bool,
+}
+
+fn pipe_effects(d: &Decorator) -> PipeEffects {
+    let mut effects = PipeEffects::default();
+    let Expr::Call(call) = &*d.expr else {
+        return effects;
+    };
+    for arg in &call.args {
+        let (name, args) = match arg.expr.as_ref() {
+            Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
+            Expr::New(n) => match n.callee.as_ref() {
+                Expr::Ident(i) => (i.sym.as_ref(), n.args.as_deref().unwrap_or_default()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let schema = match name {
+            "DefaultValuePipe" => {
+                effects.default = args.first().and_then(|a| literal_json(&a.expr));
+                effects.optional |= effects.default.is_some();
+                continue;
+            }
+            "ParseIntPipe" => json!({ "type": "integer" }),
+            "ParseFloatPipe" => json!({ "type": "number" }),
+            "ParseBoolPipe" => json!({ "type": "boolean" }),
+            "ParseUUIDPipe" => json!({ "type": "string", "format": "uuid" }),
+            _ => continue,
+        };
+        effects.schema = Some(schema);
+        if let Some(Expr::Object(options)) = args.first().map(|a| a.expr.as_ref())
+            && let Some(Expr::Lit(Lit::Bool(b))) = object_value(options, "optional")
+        {
+            effects.optional |= b.value;
+        }
+    }
+    effects
+}
+
+/// A literal's JSON value.
+fn literal_json(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => Some(Value::String(s.value.to_string_lossy().into_owned())),
+        Expr::Lit(Lit::Num(n)) => Some(crate::schema::number_json(n.value)),
+        Expr::Lit(Lit::Bool(b)) => Some(Value::Bool(b.value)),
+        Expr::Unary(u) if u.op == swc_ecma_ast::UnaryOp::Minus => match literal_json(&u.arg)? {
+            Value::Number(n) => Some(crate::schema::number_json(-n.as_f64()?)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2068,6 +2144,41 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn pipes_shape_the_parameter() {
+        let routes = extract_routes(
+            "pipes",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                @Get(':id')
+                list(
+                    @Param('id', ParseUUIDPipe) id: string,
+                    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+                    @Query('ratio', new ParseFloatPipe({ optional: true })) ratio: number,
+                    @Query('all', ParseBoolPipe) all: string,
+                    @Query('sort', new DefaultValuePipe('asc')) sort: string,
+                ) {}
+            }
+            "#,
+        );
+        let params: Vec<String> = find(&routes, HttpMethod::Get, "/items/{id}")
+            .parameters
+            .iter()
+            .map(|p| format!("{} {} {}", p.name, p.required, p.schema))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                r#"id true {"type":"string","format":"uuid"}"#,
+                r#"page false {"type":"integer","default":1}"#,
+                r#"ratio false {"type":"number"}"#,
+                r#"all true {"type":"boolean"}"#,
+                r#"sort false {"type":"string","default":"asc"}"#,
+            ]
+        );
     }
 
     #[test]

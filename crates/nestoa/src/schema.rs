@@ -1132,10 +1132,16 @@ fn enum_value_type(v: &EnumValue) -> &'static str {
 fn enum_value_json(v: &EnumValue) -> Value {
     match v {
         EnumValue::Str(s) => Value::String(s.clone()),
-        EnumValue::Num(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 => {
-            Value::from(*n as i64)
-        }
-        EnumValue::Num(n) => Value::from(*n),
+        EnumValue::Num(n) => number_json(*n),
+    }
+}
+
+/// A number as JSON, written as an integer when it is a whole one.
+pub(crate) fn number_json(n: f64) -> Value {
+    if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
+        Value::from(n as i64)
+    } else {
+        Value::from(n)
     }
 }
 
