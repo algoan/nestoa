@@ -17,7 +17,7 @@ use crate::tsconfig::best_match;
 /// within the file.
 #[derive(Clone)]
 pub enum Symbol {
-    Interface(Shared<TsInterfaceDecl>),
+    Interface(Interface),
     TypeAlias(Shared<TsTypeAliasDecl>),
     Enum(Shared<TsEnumDecl>),
     Class(Shared<Class>),
@@ -34,6 +34,25 @@ impl Symbol {
                 class_of(c.item()).map_or_else(String::new, |(id, _)| id.sym.to_string())
             }
         }
+    }
+}
+
+/// Every declaration of one interface in a file, in source order, which
+/// TypeScript merges into one. Dereferences to the first.
+#[derive(Clone)]
+pub struct Interface(Vec<Shared<TsInterfaceDecl>>);
+
+impl Interface {
+    pub fn decls(&self) -> impl Iterator<Item = &TsInterfaceDecl> {
+        self.0.iter().map(|d| &**d)
+    }
+}
+
+impl std::ops::Deref for Interface {
+    type Target = TsInterfaceDecl;
+
+    fn deref(&self) -> &TsInterfaceDecl {
+        &self.0[0]
     }
 }
 
@@ -452,7 +471,14 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
     };
     for (index, item) in parsed.module.body.iter().enumerate() {
         if let Some((name, symbol)) = declared_symbol(&parsed.module, index) {
-            fs.declared.insert(name, symbol);
+            match (fs.declared.get_mut(&name), symbol) {
+                (Some(Symbol::Interface(merged)), Symbol::Interface(more)) => {
+                    merged.0.extend(more.0);
+                }
+                (_, symbol) => {
+                    fs.declared.insert(name, symbol);
+                }
+            }
         }
         if let Some(name) = default_export_name(item) {
             fs.local_exports.insert("default".to_string(), name);
@@ -603,7 +629,7 @@ fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol
         return Some((ident.sym.to_string(), symbol));
     }
     if let Some(i) = interface(item) {
-        let symbol = Symbol::Interface(share(module, index, interface));
+        let symbol = Symbol::Interface(Interface(vec![share(module, index, interface)]));
         return Some((i.id.sym.to_string(), symbol));
     }
     Some(match declaration(item)? {

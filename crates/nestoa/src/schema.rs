@@ -943,7 +943,7 @@ impl<'a> SchemaCtx<'a> {
                 let mut props: IndexMap<String, Value> = IndexMap::new();
                 let mut required: Vec<String> = Vec::new();
                 let mut all_of: Vec<Value> = Vec::new();
-                for parent in &i.extends {
+                for parent in i.decls().flat_map(|d| &d.extends) {
                     all_of.push(
                         self.heritage_schema(file, &parent.expr, parent.type_args.as_deref())
                             .unwrap_or_else(
@@ -951,7 +951,7 @@ impl<'a> SchemaCtx<'a> {
                             ),
                     );
                 }
-                for el in &i.body.body {
+                for el in i.decls().flat_map(|d| &d.body.body) {
                     if let TsTypeElement::TsPropertySignature(p) = el {
                         let name = match &*p.key {
                             Expr::Ident(i) => i.sym.to_string(),
@@ -972,7 +972,7 @@ impl<'a> SchemaCtx<'a> {
                             attach_doc(&mut schema, doc);
                         }
                         props.insert(name.clone(), schema);
-                        if !p.optional {
+                        if !p.optional && !required.contains(&name) {
                             required.push(name);
                         }
                     }
@@ -1802,6 +1802,23 @@ mod tests {
             .as_object()
             .map(|p| p.keys().map(String::as_str).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn interface_declarations_merge() {
+        let [merged] = lower_all(
+            "",
+            "interface Base { id: string; }\n\
+             interface Merged { a: string; }\n\
+             interface Merged extends Base { b?: number; a: string; }",
+            &["Merged"],
+        )
+        .try_into()
+        .unwrap();
+        let object = &merged["allOf"][1];
+        assert_eq!(prop_names(object), ["a", "b"]);
+        assert_eq!(object["required"], json!(["a"]));
+        assert_eq!(merged["allOf"][0]["$ref"], "#/components/schemas/Base");
     }
 
     fn required_names(schema: &Value) -> Vec<&str> {
