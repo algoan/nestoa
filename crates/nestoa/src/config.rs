@@ -308,7 +308,7 @@ impl OpenApiVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Info {
     #[serde(default = "default_title")]
     pub title: String,
@@ -662,6 +662,13 @@ mod tests {
         assert!(msg.contains("\"extends\" cycle"), "{msg}");
         assert!(msg.contains("b.json -> "), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_info_key_is_rejected() {
+        let err = serde_json::from_str::<Config>(r#"{ "info": { "titel": "X" } }"#)
+            .expect_err("a misspelt info key should error");
+        assert!(err.to_string().contains("titel"), "{err}");
     }
 
     #[test]
