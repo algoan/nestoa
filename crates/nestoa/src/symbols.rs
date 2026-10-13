@@ -139,10 +139,21 @@ impl Project {
     /// Resolve a module specifier (relative, tsconfig-aliased, or node_modules
     /// package) to a file in the symbol table.
     fn resolve_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
-        self.resolver
-            .relative(file, specifier)
-            .or_else(|| self.resolve_alias(specifier))
+        if specifier.starts_with('.') {
+            return self.resolver.relative(file, specifier);
+        }
+        self.resolve_alias(specifier)
             .or_else(|| self.resolver.package_types(file, specifier))
+    }
+
+    /// The in-repo file a specifier names: relative, or through tsconfig
+    /// `paths`, which TypeScript never applies to a relative specifier.
+    fn local_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
+        if specifier.starts_with('.') {
+            self.resolver.relative(file, specifier)
+        } else {
+            self.resolve_alias(specifier)
+        }
     }
 
     /// Resolve a namespace-qualified type `Ns.Member` (where `Ns` is a TS
@@ -255,9 +266,7 @@ impl Project {
     /// The parsed in-repo module (relative or tsconfig-aliased) a specifier
     /// names. `None` for a package.
     fn in_repo_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
-        self.resolver
-            .relative(file, specifier)
-            .or_else(|| self.resolve_alias(specifier))
+        self.local_module(file, specifier)
             .filter(|t| self.symbols.contains_key(t))
     }
 
@@ -294,11 +303,7 @@ impl Project {
         name: &str,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<(String, String)> {
-        let in_repo = self
-            .resolver
-            .relative(file, specifier)
-            .or_else(|| self.resolve_alias(specifier));
-        match in_repo {
+        match self.local_module(file, specifier) {
             Some(target) if self.symbols.contains_key(&target) => {
                 self.import_origin_inner(&target, name, visited)
             }
@@ -1131,6 +1136,56 @@ mod tests {
         std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
         std::fs::write(&consumer, "").unwrap();
         consumer
+    }
+
+    /// Write `files` under a fresh temp dir and parse every `.ts` among them
+    /// into a project. Returns the (canonical) dir and the project.
+    fn project(name: &str, files: &[(&str, &str)]) -> (PathBuf, Project) {
+        let dir = std::env::temp_dir().join(format!("nestoa-sym-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, body) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        let parser = crate::parse::ParsingContext::default();
+        let mut project = Project::default();
+        for (rel, _) in files {
+            if rel.ends_with(".ts") {
+                project.add(parser.parse_file(&dir.join(rel)).unwrap());
+            }
+        }
+        (dir, project)
+    }
+
+    /// The name of the declaration `name` resolves to from `file`.
+    fn resolved_name(project: &Project, file: &Path, name: &str) -> Option<String> {
+        project.resolve(file, name).map(|(_, s)| s.name())
+    }
+
+    #[test]
+    fn tsconfig_paths_never_apply_to_relative_specifiers() {
+        let (dir, mut project) = project(
+            "relative-paths",
+            &[
+                ("src/app.ts", "import { Ghost } from './ghost';"),
+                (
+                    "src/types/ghost.ts",
+                    "export interface Ghost { a: string; }",
+                ),
+                (
+                    "tsconfig.json",
+                    r#"{ "compilerOptions": { "paths": { "*": ["src/types/*"] } } }"#,
+                ),
+            ],
+        );
+        project.tsconfig_paths = crate::tsconfig::load_tsconfig_paths(&dir, None);
+        assert!(project.resolve_alias("ghost").is_some());
+        assert_eq!(
+            resolved_name(&project, &dir.join("src/app.ts"), "Ghost"),
+            None
+        );
     }
 
     #[test]
