@@ -67,10 +67,11 @@ fn build_package_allowlist(patterns: &[String]) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
-/// Transitively parse the declaration files of allowlisted node_modules packages
-/// (and the relative files they re-export) into the symbol table, so their
-/// exported types resolve to real schemas. Only ever adds files under
-/// `node_modules`; the project's own sources come solely from discovery.
+/// Transitively parse the modules discovered files import from outside
+/// `include` — relative files, tsconfig-aliased libs, and the declaration files
+/// of allowlisted node_modules packages — into the symbol table, so their
+/// exported types resolve to real schemas. Routes still come only from the
+/// discovered files.
 fn expand_packages(project: &mut Project, parser: &ParsingContext, allow: &GlobSet) {
     let mut worklist: Vec<PathBuf> = project.files.keys().cloned().collect();
     while let Some(file) = worklist.pop() {
@@ -170,19 +171,15 @@ fn main() -> Result<()> {
         }
     }
 
-    // Pull in TypeScript declarations from allowlisted node_modules packages and
-    // tsconfig-aliased workspace libs so their exported types resolve to real
-    // schemas instead of `x-unresolved`.
-    let has_aliases = project
-        .tsconfig_paths
-        .as_ref()
-        .is_some_and(|p| p.has_entries());
-    if !cfg.resolve_packages.is_empty() || has_aliases {
-        match build_package_allowlist(&cfg.resolve_packages) {
-            Ok(allow) => expand_packages(&mut project, &parser, &allow),
-            Err(e) => diag::warn(format!("invalid resolvePackages pattern: {e}")),
-        }
-    }
+    // Pull in the modules the project imports from outside `include`:
+    // relative files, tsconfig-aliased workspace libs, and allowlisted
+    // node_modules packages, so their exported types resolve to real schemas
+    // instead of `x-unresolved`.
+    let allow = build_package_allowlist(&cfg.resolve_packages).unwrap_or_else(|e| {
+        diag::warn(format!("invalid resolvePackages pattern: {e}"));
+        GlobSet::empty()
+    });
+    expand_packages(&mut project, &parser, &allow);
 
     // Recover the NestJS global prefix from the bootstrap file (e.g.
     // `app.setGlobalPrefix(...)` in main.ts) unless the user pinned `basePath`
@@ -277,4 +274,36 @@ fn main() -> Result<()> {
 
 fn plural(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_imports_outside_include_are_parsed_without_any_allowlist() {
+        let dir = std::env::temp_dir().join(format!("nestoa-expand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("svc/src")).unwrap();
+        std::fs::create_dir_all(dir.join("libs/dto")).unwrap();
+        std::fs::write(
+            dir.join("svc/src/app.ts"),
+            "import { User } from '../../libs/dto';",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("libs/dto/index.ts"),
+            "export class User { id: string; }",
+        )
+        .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let app = dir.join("svc/src/app.ts");
+        let parser = ParsingContext::default();
+        let mut project = Project::default();
+        project.add(parser.parse_file(&app).unwrap());
+
+        expand_packages(&mut project, &parser, &GlobSet::empty());
+        let (file, _) = project.resolve(&app, "User").expect("User resolves");
+        assert_eq!(file, dir.join("libs/dto/index.ts"));
+    }
 }

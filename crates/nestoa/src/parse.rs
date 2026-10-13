@@ -19,6 +19,13 @@ pub struct ParsedFile {
     pub source: Lrc<SourceFile>,
 }
 
+pub fn is_declaration_file(path: &Path) -> bool {
+    let name = path.to_string_lossy();
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
 pub struct ParsingContext {
     pub source_map: Lrc<SourceMap>,
 }
@@ -42,10 +49,7 @@ impl ParsingContext {
             .source_map
             .load_file(path)
             .with_context(|| format!("loading {}", path.display()))?;
-        let name = path.to_string_lossy();
-        let is_dts = [".d.ts", ".d.mts", ".d.cts"]
-            .iter()
-            .any(|ext| name.ends_with(ext));
+        let is_dts = is_declaration_file(path);
         let comments = SingleThreadedComments::default();
         let lexer = Lexer::new(
             Syntax::Typescript(TsSyntax {
@@ -70,11 +74,7 @@ impl ParsingContext {
             ));
         }
         let mut docs = DocComments::new(&fm.src, fm.start_pos, comments);
-        for item in &module.body {
-            if let Some((decl, start)) = decl_doc_start(item) {
-                docs.add_decl_start(decl, start);
-            }
-        }
+        add_decl_starts(&module.body, &mut docs);
         Ok(ParsedFile {
             path: path.to_path_buf(),
             module: Arc::new(module),
@@ -86,6 +86,29 @@ impl ParsingContext {
 
 /// A top-level declaration's span start, and the start of the `export`
 /// keyword or decorators in front of it, where its JSDoc sits.
+/// Map each declaration's start back to its `export` keyword and decorators,
+/// in namespace blocks too.
+fn add_decl_starts(items: &[ModuleItem], docs: &mut DocComments) {
+    for item in items {
+        if let Some((decl, start)) = decl_doc_start(item) {
+            docs.add_decl_start(decl, start);
+        }
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl))
+            | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(swc_ecma_ast::ExportDecl {
+                decl,
+                ..
+            })) => decl,
+            _ => continue,
+        };
+        if let Decl::TsModule(m) = decl
+            && let Some(swc_ecma_ast::TsNamespaceBody::TsModuleBlock(block)) = &m.body
+        {
+            add_decl_starts(&block.body, docs);
+        }
+    }
+}
+
 fn decl_doc_start(item: &ModuleItem) -> Option<(BytePos, BytePos)> {
     let (decl, class, start) = match item {
         ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => match &e.decl {

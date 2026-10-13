@@ -17,7 +17,7 @@ use crate::tsconfig::best_match;
 /// within the file.
 #[derive(Clone)]
 pub enum Symbol {
-    Interface(Shared<TsInterfaceDecl>),
+    Interface(Interface),
     TypeAlias(Shared<TsTypeAliasDecl>),
     Enum(Shared<TsEnumDecl>),
     Class(Shared<Class>),
@@ -37,18 +37,59 @@ impl Symbol {
     }
 }
 
+/// Every declaration of one interface in a file, in source order, which
+/// TypeScript merges into one. Dereferences to the first.
+#[derive(Clone)]
+pub struct Interface(Vec<Shared<TsInterfaceDecl>>);
+
+impl Interface {
+    pub fn decls(&self) -> impl Iterator<Item = &TsInterfaceDecl> {
+        self.0.iter().map(|d| &**d)
+    }
+}
+
+impl std::ops::Deref for Interface {
+    type Target = TsInterfaceDecl;
+
+    fn deref(&self) -> &TsInterfaceDecl {
+        &self.0[0]
+    }
+}
+
 /// A top-level declaration of a parsed module, shared with the module rather
 /// than copied out of it. Dereferences to the declaration.
 #[derive(Clone)]
 pub struct Shared<T: 'static> {
     module: Arc<Module>,
-    index: usize,
+    /// The item's index in the module body, then in each enclosing namespace.
+    path: Arc<[usize]>,
     get: fn(&ModuleItem) -> Option<&T>,
 }
 
 impl<T> Shared<T> {
     fn item(&self) -> &ModuleItem {
-        &self.module.body[self.index]
+        item_at(&self.module.body, &self.path).expect("a symbol's path names a module item")
+    }
+}
+
+fn item_at<'a>(items: &'a [ModuleItem], path: &[usize]) -> Option<&'a ModuleItem> {
+    let (first, rest) = path.split_first()?;
+    let item = items.get(*first)?;
+    if rest.is_empty() {
+        Some(item)
+    } else {
+        item_at(namespace_block(item)?.1, rest)
+    }
+}
+
+/// `namespace Name { … }` (exported or `declare`d): its name and items.
+fn namespace_block(item: &ModuleItem) -> Option<(&swc_ecma_ast::TsModuleDecl, &[ModuleItem])> {
+    let Decl::TsModule(m) = declaration(item)? else {
+        return None;
+    };
+    match m.body.as_ref()? {
+        swc_ecma_ast::TsNamespaceBody::TsModuleBlock(b) if m.id.is_ident() => Some((m, &b.body)),
+        _ => None,
     }
 }
 
@@ -85,7 +126,8 @@ fn class_of(item: &ModuleItem) -> Option<(&Ident, &Class)> {
 
 #[derive(Clone)]
 pub struct ImportBinding {
-    /// The exported name on the other side. None for default imports / namespace imports.
+    /// The exported name on the other side (`default` for a default import).
+    /// None for a namespace import.
     pub imported: Option<String>,
     /// Raw module specifier (e.g. "./foo", "@nestjs/common").
     pub specifier: String,
@@ -109,6 +151,28 @@ pub struct FileSymbols {
     /// `export { Local as Exported }` without `from`: exported name -> the
     /// local declaration or import it names.
     pub local_exports: HashMap<String, String>,
+    /// Declarations and imports exported under their own name (`export class
+    /// X`, `export { X }`). Unused for a declaration file, which exports all.
+    pub exported: std::collections::HashSet<String>,
+    pub is_declaration_file: bool,
+    /// `namespace Name { … }` blocks, merged by name: their own declarations.
+    pub namespaces: HashMap<String, FileSymbols>,
+}
+
+impl FileSymbols {
+    /// Whether another module importing `name` from this one sees this
+    /// module's own declaration or import of it.
+    fn exports(&self, name: &str) -> bool {
+        self.is_declaration_file || self.exported.contains(name)
+    }
+}
+
+/// What a namespace name stands for.
+enum Namespace {
+    /// A whole module (`import * as Ns`, `export * as Ns`).
+    Module(PathBuf),
+    /// A `namespace` block in a file, by its names, outermost first.
+    Block(PathBuf, Vec<String>),
 }
 
 /// All files indexed by path.
@@ -139,58 +203,113 @@ impl Project {
     /// Resolve a module specifier (relative, tsconfig-aliased, or node_modules
     /// package) to a file in the symbol table.
     fn resolve_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
-        self.resolver
-            .relative(file, specifier)
-            .or_else(|| self.resolve_alias(specifier))
+        if specifier.starts_with('.') {
+            return self.resolver.relative(file, specifier);
+        }
+        self.resolve_alias(specifier)
             .or_else(|| self.resolver.package_types(file, specifier))
     }
 
-    /// Resolve a namespace-qualified type `Ns.Member` (where `Ns` is a TS
-    /// namespace introduced by `import * as Ns`, `import { Ns }` of an
-    /// `export * as Ns`, or a local `export * as Ns`) to the declaring symbol.
+    /// The in-repo file a specifier names: relative, or through tsconfig
+    /// `paths`, which TypeScript never applies to a relative specifier.
+    fn local_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
+        if specifier.starts_with('.') {
+            self.resolver.relative(file, specifier)
+        } else {
+            self.resolve_alias(specifier)
+        }
+    }
+
+    /// Resolve a namespace-qualified type `Ns.Member` to the declaring
+    /// symbol. `Ns` is a module namespace (`import * as Ns`, `export * as Ns`,
+    /// or an import of one) or a TypeScript `namespace Ns { … }`, possibly
+    /// nested (`Outer.Inner`).
     pub fn resolve_namespace_member(
         &self,
         file: &Path,
         ns: &str,
         member: &str,
     ) -> Option<(PathBuf, Symbol)> {
+        let mut parts = ns.split('.');
         let mut visited = std::collections::HashSet::new();
-        let module = self.resolve_namespace_module(file, ns, &mut visited)?;
-        self.resolve(&module, member)
+        let mut namespace = self.resolve_namespace(file, parts.next()?, false, &mut visited)?;
+        for part in parts {
+            namespace = match namespace {
+                Namespace::Module(module) => {
+                    self.resolve_namespace(&module, part, true, &mut visited)?
+                }
+                Namespace::Block(file, mut path) => {
+                    let parent = self.namespace_symbols(&file, &path)?;
+                    if !parent.namespaces.contains_key(part) || !parent.exports(part) {
+                        return None;
+                    }
+                    path.push(part.to_string());
+                    Namespace::Block(file, path)
+                }
+            };
+        }
+        match namespace {
+            Namespace::Module(module) => {
+                self.resolve_inner(&module, member, true, &mut std::collections::HashSet::new())
+            }
+            Namespace::Block(file, path) => {
+                let block = self.namespace_symbols(&file, &path)?;
+                let symbol = block
+                    .declared
+                    .get(member)
+                    .filter(|_| block.exports(member))?;
+                Some((file, symbol.clone()))
+            }
+        }
     }
 
-    /// Find the module file that namespace `ns` aliases, following imports and
-    /// `export * as` re-exports.
-    fn resolve_namespace_module(
+    /// The symbols of the `namespace` block at `path` (outermost name first)
+    /// in `file`.
+    fn namespace_symbols(&self, file: &Path, path: &[String]) -> Option<&FileSymbols> {
+        path.iter()
+            .try_fold(self.symbols.get(file)?, |fs, name| fs.namespaces.get(name))
+    }
+
+    /// What namespace `ns` names from `file`, following imports and `export *
+    /// as` re-exports. `from_importer` as in `resolve_inner`.
+    fn resolve_namespace(
         &self,
         file: &Path,
         ns: &str,
+        from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
-    ) -> Option<PathBuf> {
+    ) -> Option<Namespace> {
         if !visited.insert((file.to_path_buf(), ns.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
+        let visible = !from_importer || fs.exports(ns);
+        if visible && fs.namespaces.contains_key(ns) {
+            return Some(Namespace::Block(file.to_path_buf(), vec![ns.to_string()]));
+        }
         // Local `export * as Ns from "./mod"`.
         if let Some(spec) = fs.namespace_re_exports.get(ns) {
-            return self.resolve_module(file, spec);
+            return self.resolve_module(file, spec).map(Namespace::Module);
         }
         if let Some(local) = fs.local_exports.get(ns) {
-            return self.resolve_namespace_module(file, local, visited);
+            return self.resolve_namespace(file, local, false, visited);
         }
-        if let Some(binding) = fs.imports.get(ns).or_else(|| fs.re_exports.get(ns)) {
+        if let Some(binding) = fs
+            .re_exports
+            .get(ns)
+            .or_else(|| fs.imports.get(ns).filter(|_| visible))
+        {
             let target = self.resolve_module(file, &binding.specifier)?;
             return match &binding.imported {
                 // `import * as Ns from "spec"` — the target module is the namespace.
-                None if binding.is_namespace => Some(target),
-                None => None, // default import — not a namespace
+                None => Some(Namespace::Module(target)),
                 // `import { Ns } from "spec"` — find namespace `Ns` in the target.
-                Some(imported) => self.resolve_namespace_module(&target, imported, visited),
+                Some(imported) => self.resolve_namespace(&target, imported, true, visited),
             };
         }
         fs.star_re_exports.iter().find_map(|spec| {
             let target = self.resolve_module(file, spec)?;
-            self.resolve_namespace_module(&target, ns, visited)
+            self.resolve_namespace(&target, ns, true, visited)
         })
     }
 
@@ -255,9 +374,7 @@ impl Project {
     /// The parsed in-repo module (relative or tsconfig-aliased) a specifier
     /// names. `None` for a package.
     fn in_repo_module(&self, file: &Path, specifier: &str) -> Option<PathBuf> {
-        self.resolver
-            .relative(file, specifier)
-            .or_else(|| self.resolve_alias(specifier))
+        self.local_module(file, specifier)
             .filter(|t| self.symbols.contains_key(t))
     }
 
@@ -294,11 +411,7 @@ impl Project {
         name: &str,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<(String, String)> {
-        let in_repo = self
-            .resolver
-            .relative(file, specifier)
-            .or_else(|| self.resolve_alias(specifier));
-        match in_repo {
+        match self.local_module(file, specifier) {
             Some(target) if self.symbols.contains_key(&target) => {
                 self.import_origin_inner(&target, name, visited)
             }
@@ -308,10 +421,14 @@ impl Project {
     }
 
     /// Resolve a name referenced inside `file` to the (declaring file, symbol).
+    /// A dotted name (`Types.Status`) is a member of a namespace.
     pub fn resolve(&self, file: &Path, name: &str) -> Option<(PathBuf, Symbol)> {
+        if let Some((ns, member)) = name.rsplit_once('.') {
+            return self.resolve_namespace_member(file, ns, member);
+        }
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
-        self.resolve_inner(file, name, &mut visited)
+        self.resolve_inner(file, name, false, &mut visited)
     }
 
     /// Resolve a numeric `const` by name, following imports and re-exports the
@@ -321,7 +438,7 @@ impl Project {
     pub fn resolve_const_number(&self, file: &Path, name: &str) -> Option<f64> {
         let mut visited: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
-        self.resolve_const_inner(file, name, &mut visited)
+        self.resolve_const_inner(file, name, false, &mut visited)
     }
 
     /// Resolve the numeric value of `enum_name.member`, following imports the
@@ -345,33 +462,40 @@ impl Project {
         }
     }
 
+    /// `from_importer`: `name` is looked up as an export of `file`, so a
+    /// declaration or import it doesn't export is skipped.
     fn resolve_const_inner(
         &self,
         file: &Path,
         name: &str,
+        from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<f64> {
         if !visited.insert((file.to_path_buf(), name.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
-        if let Some(v) = fs.const_numbers.get(name) {
+        let visible = !from_importer || fs.exports(name);
+        if visible && let Some(v) = fs.const_numbers.get(name) {
             return Some(*v);
         }
         if let Some(local) = fs.local_exports.get(name) {
-            return self.resolve_const_inner(file, local, visited);
+            return self.resolve_const_inner(file, local, false, visited);
         }
-        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
+        if let Some(binding) = fs
+            .re_exports
+            .get(name)
+            .or_else(|| fs.imports.get(name).filter(|_| visible))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
             let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
-            if let Some(found) = self.resolve_const_inner(&target, &next_name, visited) {
+            if let Some(found) = self.resolve_const_inner(&target, &next_name, true, visited) {
                 return Some(found);
             }
         }
         for spec in &fs.star_re_exports {
             if let Some(target) = self.resolve_module(file, spec)
-                && let Some(found) = self.resolve_const_inner(&target, name, visited)
+                && let Some(found) = self.resolve_const_inner(&target, name, true, visited)
             {
                 return Some(found);
             }
@@ -379,34 +503,40 @@ impl Project {
         None
     }
 
+    /// `from_importer` as in `resolve_const_inner`.
     fn resolve_inner(
         &self,
         file: &Path,
         name: &str,
+        from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<(PathBuf, Symbol)> {
         if !visited.insert((file.to_path_buf(), name.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
-        if let Some(sym) = fs.declared.get(name) {
+        let visible = !from_importer || fs.exports(name);
+        if visible && let Some(sym) = fs.declared.get(name) {
             return Some((file.to_path_buf(), sym.clone()));
         }
         if let Some(local) = fs.local_exports.get(name) {
-            return self.resolve_inner(file, local, visited);
+            return self.resolve_inner(file, local, false, visited);
         }
-        if let Some(binding) = fs.re_exports.get(name).or_else(|| fs.imports.get(name))
+        if let Some(binding) = fs
+            .re_exports
+            .get(name)
+            .or_else(|| fs.imports.get(name).filter(|_| visible))
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
             let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
-            if let Some(found) = self.resolve_inner(&target, &next_name, visited) {
+            if let Some(found) = self.resolve_inner(&target, &next_name, true, visited) {
                 return Some(found);
             }
         }
         // `export * from './other'` — search each one.
         for spec in &fs.star_re_exports {
             if let Some(target) = self.resolve_module(file, spec)
-                && let Some(found) = self.resolve_inner(&target, name, visited)
+                && let Some(found) = self.resolve_inner(&target, name, true, visited)
             {
                 return Some(found);
             }
@@ -416,16 +546,60 @@ impl Project {
 }
 
 pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
-    let mut fs = FileSymbols::default();
-    for (index, item) in parsed.module.body.iter().enumerate() {
-        if let Some((name, symbol)) = declared_symbol(&parsed.module, index) {
-            fs.declared.insert(name, symbol);
+    let mut fs = FileSymbols {
+        is_declaration_file: crate::parse::is_declaration_file(&parsed.path),
+        ..FileSymbols::default()
+    };
+    collect_items(&parsed.module, &parsed.module.body, &[], &mut fs);
+    fs
+}
+
+/// Index `items`, found at `prefix` in `module` (empty for the module body,
+/// else the path to the enclosing namespace), into `fs`.
+fn collect_items(
+    module: &Arc<Module>,
+    items: &[ModuleItem],
+    prefix: &[usize],
+    fs: &mut FileSymbols,
+) {
+    for (index, item) in items.iter().enumerate() {
+        let path: Arc<[usize]> = prefix.iter().copied().chain([index]).collect();
+        if let Some((name, symbol)) = declared_symbol(module, &path) {
+            match (fs.declared.get_mut(&name), symbol) {
+                (Some(Symbol::Interface(merged)), Symbol::Interface(more)) => {
+                    merged.0.extend(more.0);
+                }
+                // `class Foo` merged with `interface Foo`: keep the class.
+                (Some(Symbol::Class(_)), Symbol::Interface(_)) => {}
+                (_, symbol) => {
+                    fs.declared.insert(name, symbol);
+                }
+            }
+        }
+        if let Some((ns, block)) = namespace_block(item) {
+            let name = ns
+                .id
+                .as_ident()
+                .map(|i| i.sym.to_string())
+                .unwrap_or_default();
+            let ambient = fs.is_declaration_file || ns.declare;
+            let nested = fs.namespaces.entry(name).or_insert_with(|| FileSymbols {
+                is_declaration_file: ambient,
+                ..FileSymbols::default()
+            });
+            collect_items(module, block, &path, nested);
+        }
+        if let Some(name) = default_export_name(item) {
+            fs.local_exports.insert("default".to_string(), name);
         }
         match item {
-            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, &mut fs),
+            ModuleItem::Stmt(Stmt::Decl(decl)) => collect_consts(decl, fs),
             ModuleItem::ModuleDecl(md) => match md {
-                ModuleDecl::Import(i) => collect_import(i, &mut fs),
-                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => collect_consts(decl, &mut fs),
+                ModuleDecl::Import(i) => collect_import(i, fs),
+                ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => {
+                    collect_consts(decl, fs);
+                    fs.exported.extend(declared_names(decl));
+                }
                 ModuleDecl::ExportAll(ea) => {
                     fs.star_re_exports
                         .push(ea.src.value.to_string_lossy().into_owned());
@@ -454,8 +628,9 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
                                     );
                                 } else if exported_local != orig_name {
                                     fs.local_exports.insert(exported_local, orig_name);
+                                } else {
+                                    fs.exported.insert(orig_name);
                                 }
-                                // Bare `export { X }` — X is already in declared/imports.
                             }
                             ExportSpecifier::Namespace(ns) => {
                                 // `export * as Ns from "./other"`.
@@ -473,20 +648,64 @@ pub fn collect_file_symbols(parsed: &ParsedFile) -> FileSymbols {
             _ => {}
         }
     }
-    fs
 }
 
-/// The named class, interface, type alias or enum `module.body[index]`
+/// The names a declaration introduces.
+fn declared_names(decl: &Decl) -> Vec<String> {
+    match decl {
+        Decl::Class(c) => vec![c.ident.sym.to_string()],
+        Decl::TsInterface(i) => vec![i.id.sym.to_string()],
+        Decl::TsTypeAlias(t) => vec![t.id.sym.to_string()],
+        Decl::TsEnum(e) => vec![e.id.sym.to_string()],
+        Decl::TsModule(m) => {
+            m.id.as_ident()
+                .map(|i| i.sym.to_string())
+                .into_iter()
+                .collect()
+        }
+        Decl::Var(v) => v
+            .decls
+            .iter()
+            .filter_map(|d| d.name.as_ident().map(|i| i.id.sym.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The local name `export default …` exports: a named class or interface
+/// declaration, or an identifier (`export default Account;`, or a CommonJS
+/// declaration file's `export = Account;`).
+fn default_export_name(item: &ModuleItem) -> Option<String> {
+    match item {
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
+            DefaultDecl::Class(c) => c.ident.as_ref().map(|i| i.sym.to_string()),
+            DefaultDecl::TsInterfaceDecl(i) => Some(i.id.sym.to_string()),
+            DefaultDecl::Fn(_) => None,
+        },
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(
+            swc_ecma_ast::ExportDefaultExpr { expr, .. },
+        ))
+        | ModuleItem::ModuleDecl(ModuleDecl::TsExportAssignment(
+            swc_ecma_ast::TsExportAssignment { expr, .. },
+        )) => match &**expr {
+            swc_ecma_ast::Expr::Ident(i) => Some(i.sym.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The named class, interface, type alias or enum the item at `path`
 /// declares, if any.
-fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol)> {
+fn declared_symbol(module: &Arc<Module>, path: &Arc<[usize]>) -> Option<(String, Symbol)> {
     fn share<T>(
         module: &Arc<Module>,
-        index: usize,
+        path: &Arc<[usize]>,
         get: fn(&ModuleItem) -> Option<&T>,
     ) -> Shared<T> {
         Shared {
             module: module.clone(),
-            index,
+            path: path.clone(),
             get,
         }
     }
@@ -494,8 +713,15 @@ fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol
         class_of(item).map(|(_, c)| c)
     }
     fn interface(item: &ModuleItem) -> Option<&TsInterfaceDecl> {
-        match declaration(item)? {
-            Decl::TsInterface(i) => Some(i),
+        match (declaration(item), item) {
+            (Some(Decl::TsInterface(i)), _) => Some(i),
+            (
+                None,
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(ExportDefaultDecl {
+                    decl: DefaultDecl::TsInterfaceDecl(i),
+                    ..
+                })),
+            ) => Some(i),
             _ => None,
         }
     }
@@ -511,23 +737,23 @@ fn declared_symbol(module: &Arc<Module>, index: usize) -> Option<(String, Symbol
             _ => None,
         }
     }
-    let item = &module.body[index];
+    let item = item_at(&module.body, path)?;
     if let Some((ident, _)) = class_of(item) {
-        let symbol = Symbol::Class(share(module, index, class));
+        let symbol = Symbol::Class(share(module, path, class));
         return Some((ident.sym.to_string(), symbol));
     }
+    if let Some(i) = interface(item) {
+        let symbol = Symbol::Interface(Interface(vec![share(module, path, interface)]));
+        return Some((i.id.sym.to_string(), symbol));
+    }
     Some(match declaration(item)? {
-        Decl::TsInterface(i) => (
-            i.id.sym.to_string(),
-            Symbol::Interface(share(module, index, interface)),
-        ),
         Decl::TsTypeAlias(t) => (
             t.id.sym.to_string(),
-            Symbol::TypeAlias(share(module, index, alias)),
+            Symbol::TypeAlias(share(module, path, alias)),
         ),
         Decl::TsEnum(e) => (
             e.id.sym.to_string(),
-            Symbol::Enum(share(module, index, enumeration)),
+            Symbol::Enum(share(module, path, enumeration)),
         ),
         _ => return None,
     })
@@ -622,7 +848,7 @@ fn collect_import(i: &ImportDecl, fs: &mut FileSymbols) {
                 fs.imports.insert(
                     d.local.sym.to_string(),
                     ImportBinding {
-                        imported: None,
+                        imported: Some("default".to_string()),
                         specifier: specifier.clone(),
                         is_namespace: false,
                     },
@@ -1131,6 +1357,192 @@ mod tests {
         std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
         std::fs::write(&consumer, "").unwrap();
         consumer
+    }
+
+    /// Write `files` under a fresh temp dir and parse every `.ts` among them
+    /// into a project. Returns the (canonical) dir and the project.
+    fn project(name: &str, files: &[(&str, &str)]) -> (PathBuf, Project) {
+        let dir = std::env::temp_dir().join(format!("nestoa-sym-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, body) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        let parser = crate::parse::ParsingContext::default();
+        let mut project = Project::default();
+        for (rel, _) in files {
+            if rel.ends_with(".ts") {
+                project.add(parser.parse_file(&dir.join(rel)).unwrap());
+            }
+        }
+        (dir, project)
+    }
+
+    /// The name of the declaration `name` resolves to from `file`.
+    fn resolved_name(project: &Project, file: &Path, name: &str) -> Option<String> {
+        project.resolve(file, name).map(|(_, s)| s.name())
+    }
+
+    #[test]
+    fn tsconfig_paths_never_apply_to_relative_specifiers() {
+        let (dir, mut project) = project(
+            "relative-paths",
+            &[
+                ("src/app.ts", "import { Ghost } from './ghost';"),
+                (
+                    "src/types/ghost.ts",
+                    "export interface Ghost { a: string; }",
+                ),
+                (
+                    "tsconfig.json",
+                    r#"{ "compilerOptions": { "paths": { "*": ["src/types/*"] } } }"#,
+                ),
+            ],
+        );
+        project.tsconfig_paths = crate::tsconfig::load_tsconfig_paths(&dir, None);
+        assert!(project.resolve_alias("ghost").is_some());
+        assert_eq!(
+            resolved_name(&project, &dir.join("src/app.ts"), "Ghost"),
+            None
+        );
+    }
+
+    #[test]
+    fn default_imports_and_exports_resolve() {
+        let (dir, project) = project(
+            "default",
+            &[
+                ("a.dto.ts", "export default class Account { id: string; }"),
+                (
+                    "card.ts",
+                    "export default interface Card { last4: string; }",
+                ),
+                (
+                    "plain.ts",
+                    "class Plain { p: string; }\nexport default Plain;",
+                ),
+                (
+                    "legacy.d.ts",
+                    "declare class Legacy { l: string; }\nexport = Legacy;",
+                ),
+                (
+                    "barrel.ts",
+                    "export { default as Owner } from './a.dto';\nexport { default } from './card';",
+                ),
+                (
+                    "app.ts",
+                    "import Acc from './a.dto';\nimport C from './card';\nimport P from './plain';\n\
+                     import L from './legacy';\nimport Def, { Owner } from './barrel';",
+                ),
+            ],
+        );
+        let app = dir.join("app.ts");
+        let names: Vec<_> = ["Acc", "C", "P", "L", "Owner", "Def"]
+            .iter()
+            .map(|n| resolved_name(&project, &app, n))
+            .collect();
+        assert_eq!(
+            names,
+            ["Account", "Card", "Plain", "Legacy", "Account", "Card"].map(|n| Some(n.to_string()))
+        );
+    }
+
+    #[test]
+    fn importers_see_only_what_a_module_exports() {
+        let (dir, project) = project(
+            "exported",
+            &[
+                ("real.ts", "export interface Hidden { real: string; }"),
+                (
+                    "barrel.ts",
+                    "interface Hidden { wrong: string; }\nexport * from './real';\n\
+                     const LIMIT = 1;\nexport * from './limits';",
+                ),
+                ("limits.ts", "export const LIMIT = 2;"),
+                ("app.ts", "import { Hidden, LIMIT } from './barrel';"),
+                ("ambient.d.ts", "declare class Ambient { a: string; }"),
+                ("uses-ambient.ts", "import { Ambient } from './ambient';"),
+            ],
+        );
+        let app = dir.join("app.ts");
+        let (file, _) = project.resolve(&app, "Hidden").expect("Hidden resolves");
+        assert_eq!(file, dir.join("real.ts"));
+        assert_eq!(project.resolve_const_number(&app, "LIMIT"), Some(2.0));
+        assert_eq!(
+            resolved_name(&project, &dir.join("uses-ambient.ts"), "Ambient"),
+            Some("Ambient".to_string())
+        );
+        // Inside its own module, the local declaration still wins.
+        let (file, _) = project.resolve(&dir.join("barrel.ts"), "Hidden").unwrap();
+        assert_eq!(file, dir.join("barrel.ts"));
+    }
+
+    #[test]
+    fn an_interface_merged_into_a_class_keeps_the_class() {
+        let (dir, project) = project(
+            "class-merge",
+            &[(
+                "dto.ts",
+                "export class Foo { a: string; }\nexport interface Foo { b: string; }",
+            )],
+        );
+        assert!(matches!(
+            project.resolve(&dir.join("dto.ts"), "Foo"),
+            Some((_, Symbol::Class(_)))
+        ));
+    }
+
+    #[test]
+    fn namespace_members_resolve() {
+        let (dir, project) = project(
+            "namespace",
+            &[
+                (
+                    "types.ts",
+                    "export namespace Types {\n\
+                       export interface Result { ok: boolean; }\n\
+                       interface Hidden { h: string; }\n\
+                       export namespace Inner { export enum Status { A = 'a' } }\n\
+                     }\n\
+                     export namespace Types { export type Extra = string; }",
+                ),
+                (
+                    "ambient.d.ts",
+                    "export declare namespace Api { interface Page { n: number; } }",
+                ),
+                (
+                    "app.ts",
+                    "import { Types } from './types';\nimport * as T from './types';\n\
+                     import { Api } from './ambient';",
+                ),
+            ],
+        );
+        let app = dir.join("app.ts");
+        let names: Vec<_> = [
+            "Types.Result",
+            "Types.Extra",
+            "Types.Inner.Status",
+            "T.Types.Result",
+            "Api.Page",
+            "Types.Hidden",
+        ]
+        .iter()
+        .map(|n| resolved_name(&project, &app, n))
+        .collect();
+        assert_eq!(
+            names,
+            [
+                Some("Result"),
+                Some("Extra"),
+                Some("Status"),
+                Some("Result"),
+                Some("Page"),
+                None
+            ]
+            .map(|n| n.map(String::from))
+        );
     }
 
     #[test]

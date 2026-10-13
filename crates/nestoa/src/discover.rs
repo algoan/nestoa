@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
 
 pub fn discover_files(
@@ -21,6 +21,9 @@ pub fn discover_files(
     let exclude = exclude.build()?;
     let excluded_dirs = excluded_dirs.build()?;
 
+    let root = &root
+        .canonicalize()
+        .with_context(|| format!("resolving {}", root.display()))?;
     let mut out = Vec::new();
     for inc in includes {
         let start = root.join(inc);
@@ -34,11 +37,17 @@ pub fn discover_files(
             }
             continue;
         }
+        // Globs match the path as written, relative to the project, so a
+        // `dist` or `node_modules` above the project never excludes it, and
+        // a symlinked or `..` include is matched where it appears in the
+        // project (`src/linked/…`, `../libs/dto/…`). Only kept files are
+        // canonicalized.
         if start.is_file() {
             push_if_ts(&start, root, &exclude, &mut out);
             continue;
         }
         for entry in walkdir::WalkDir::new(&start)
+            .follow_links(true)
             .into_iter()
             .filter_entry(|e| !(e.file_type().is_dir() && is_match(&excluded_dirs, e.path(), root)))
             .filter_map(|e| e.inspect_err(|e| crate::diag::warn(e)).ok())
@@ -62,13 +71,15 @@ fn push_if_ts(path: &Path, root: &Path, exclude: &globset::GlobSet, out: &mut Ve
         return;
     }
     if !is_match(exclude, path, root) {
-        out.push(path.to_path_buf());
+        // The resolver keys modules by canonical path; a symlinked file is
+        // kept under its target.
+        out.push(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     }
 }
 
-/// Whether `path`, relative to `root` or as is, matches `globs`.
-fn is_match(globs: &globset::GlobSet, path: &Path, root: &Path) -> bool {
-    path.strip_prefix(root).is_ok_and(|rel| globs.is_match(rel)) || globs.is_match(path)
+/// Whether `path`, relative to `base`, matches `globs`.
+fn is_match(globs: &globset::GlobSet, path: &Path, base: &Path) -> bool {
+    globs.is_match(path.strip_prefix(base).unwrap_or(path))
 }
 
 #[cfg(test)]
@@ -90,6 +101,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
         }
+        let root = root.canonicalize().unwrap();
         let excludes = ["**/node_modules/**", "**/dist/**", "**/*.spec.ts"].map(String::from);
         let found = discover_files(&root, &["src".to_string()], &excludes).unwrap();
         let rel: Vec<_> = found
@@ -103,6 +115,43 @@ mod tests {
                 Path::new("src/feature/distance.ts")
             ]
         );
+    }
+
+    #[test]
+    fn paths_are_canonical_and_matched_below_the_project() {
+        let top = std::env::temp_dir().join(format!("nestoa-discover-dist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        for rel in [
+            "dist/svc/src/app.ts",
+            "dist/svc/src/app.spec.ts",
+            "dist/libs/dto/user.ts",
+            "dist/shared/linked.ts",
+            "dist/outside/keep.ts",
+            "dist/outside/generated/gen.ts",
+        ] {
+            let path = top.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let top = top.canonicalize().unwrap();
+        let mut includes = vec!["src".to_string(), "../libs/dto".to_string()];
+        let mut expected = vec![
+            top.join("dist/libs/dto/user.ts"),
+            top.join("dist/svc/src/app.ts"),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(top.join("dist/shared"), top.join("dist/svc/src/shared")).unwrap();
+            symlink(top.join("dist/outside"), top.join("dist/svc/linked")).unwrap();
+            includes.push("linked".into());
+            expected.push(top.join("dist/shared/linked.ts"));
+            expected.push(top.join("dist/outside/keep.ts"));
+            expected.sort();
+        }
+        let excludes = ["**/dist/**", "**/*.spec.ts", "linked/generated/**"].map(String::from);
+        let found = discover_files(&top.join("dist/svc"), &includes, &excludes).unwrap();
+        assert_eq!(found, expected);
     }
 
     #[test]
