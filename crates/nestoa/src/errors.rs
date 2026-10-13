@@ -145,7 +145,7 @@ fn global_matches(g: &GlobalError, path: &str) -> bool {
 fn route_matches(ro: &RouteErrors, method: &str, path: &str) -> bool {
     let path_matches = match (&ro.when_path_ends_with, &ro.path) {
         (Some(suffix), _) => path_ends_with(path, suffix),
-        (None, Some(p)) => path == openapi_path(p),
+        (None, Some(p)) => path == crate::routes::openapi_params(p),
         (None, None) => false,
     };
     path_matches
@@ -189,17 +189,6 @@ pub fn warn_unmatched<'a>(
             ));
         }
     }
-}
-
-/// A configured path in OpenAPI form: Express-style `:id` segments become `{id}`.
-fn openapi_path(p: &str) -> String {
-    p.split('/')
-        .map(|seg| match seg.strip_prefix(':') {
-            Some(name) => format!("{{{name}}}"),
-            None => seg.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// Default human description for a status code, used when no source supplies a
@@ -315,7 +304,7 @@ pub fn nest_http_status(member: &str) -> Option<u16> {
 /// `@route-mapping` suffix rule in `routes.rs`). Leading/trailing slashes on
 /// the suffix are ignored; an empty suffix never matches.
 fn path_ends_with(path: &str, suffix: &str) -> bool {
-    let suffix = openapi_path(suffix);
+    let suffix = crate::routes::openapi_params(suffix);
     let suffix = suffix.trim_matches('/');
     if suffix.is_empty() {
         return false;
@@ -518,6 +507,12 @@ mod tests {
             "post",
             "/v2/customers/{id}/aggregate"
         ));
+        let in_segment = RouteErrors {
+            when_path_ends_with: None,
+            path: Some("/files/:name.:ext".into()),
+            ..suffix
+        };
+        assert!(route_matches(&in_segment, "get", "/files/{name}.{ext}"));
     }
 
     #[test]

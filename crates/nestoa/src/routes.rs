@@ -928,9 +928,14 @@ fn join_paths(prefix: Option<&str>, base: &str, sub: Option<&str>) -> String {
     if out.is_empty() {
         return "/".to_string();
     }
-    // Convert :param to {param} for OpenAPI.
-    let mut formatted = String::with_capacity(out.len());
-    let mut chars = out.chars().peekable();
+    openapi_params(&out)
+}
+
+/// Convert Express-style `:param` placeholders to OpenAPI `{param}`, wherever
+/// they appear in a segment (`/files/:name.:ext` → `/files/{name}.{ext}`).
+pub(crate) fn openapi_params(path: &str) -> String {
+    let mut formatted = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
         if c == ':' {
             let mut name = String::new();
