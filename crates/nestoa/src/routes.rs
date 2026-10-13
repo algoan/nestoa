@@ -410,7 +410,18 @@ impl<'a> Extractor<'a> {
         for p in &m.function.params {
             if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                 match parsed {
-                    ParsedParam::Routed(rps) => params.extend(rps),
+                    ParsedParam::Routed(rps) => {
+                        // `@Query('a')` twice reads one parameter; OpenAPI
+                        // allows each name once per location.
+                        for rp in rps {
+                            if !params
+                                .iter()
+                                .any(|p| p.location == rp.location && p.name == rp.name)
+                            {
+                                params.push(rp);
+                            }
+                        }
+                    }
                     ParsedParam::Body(b) => request_body = Some(b),
                     ParsedParam::BodyField(f) => body_fields.push(f),
                     ParsedParam::Ignored => {}
@@ -2057,6 +2068,26 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn a_parameter_read_twice_is_declared_once() {
+        let routes = extract_routes(
+            "repeated",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                @Get()
+                list(@Query('a') a: string, @Query('a') again: string, @Query('b') b: string) {}
+            }
+            "#,
+        );
+        let names: Vec<&str> = find(&routes, HttpMethod::Get, "/items")
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b"]);
     }
 
     #[test]
