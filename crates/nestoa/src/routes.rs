@@ -1290,10 +1290,7 @@ fn concrete_paths(express: &str) -> Vec<ConcretePath> {
 
 /// Express 5 optional groups: `/users{/:id}` is `/users/:id` and `/users`.
 fn expand_groups(path: &str) -> Vec<String> {
-    let Some(open) = path.find('{') else {
-        return vec![path.to_string()];
-    };
-    let Some(close) = path[open..].find('}').map(|i| open + i) else {
+    let Some((open, close)) = optional_group(path) else {
         return vec![path.to_string()];
     };
     let (head, inner) = (&path[..open], &path[open + 1..close]);
@@ -1301,6 +1298,31 @@ fn expand_groups(path: &str) -> Vec<String> {
         .into_iter()
         .flat_map(|rest| [format!("{head}{inner}{rest}"), format!("{head}{rest}")])
         .collect()
+}
+
+/// The byte positions of the first `{` and its `}` that delimit an optional
+/// group: braces inside a parameter's `(regex)`, or escaped, are part of it.
+fn optional_group(path: &str) -> Option<(usize, usize)> {
+    let (mut depth, mut escaped, mut open) = (0usize, false, None);
+    for (i, c) in path.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '{' if depth == 0 && open.is_none() => open = Some(i),
+            '}' if depth == 0 => {
+                if let Some(open) = open {
+                    return Some((open, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Express 4 parameters: `:id?` is optional, `:id(\\d+)` constrained. Every
@@ -1781,6 +1803,12 @@ mod tests {
         assert_eq!(
             concrete(None, "users", Some("{/:id}/posts")),
             ["/users/{id}/posts", "/users/posts"]
+        );
+        let braced = concrete_paths(&join_paths(None, "re", Some(":id(\\d{2})")));
+        assert_eq!(braced.len(), 1);
+        assert_eq!(
+            braced[0].patterns,
+            [("id".to_string(), "^(?:\\d{2})$".to_string())]
         );
         let constrained = concrete_paths(&join_paths(None, "re", Some(":id(\\d+)/x")));
         assert_eq!(constrained.len(), 1);
