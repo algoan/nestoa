@@ -123,16 +123,29 @@ fn uri_versioning(project: &Project, file: &Path) -> Option<UriVersioning> {
         prefix: "v".to_string(),
         default_versions: vec![None],
     };
-    let Some(Expr::Object(options)) = args.first() else {
-        return Some(versioning);
+    // Options passed through a variable are read from its initializer; any
+    // other expression, or a `type` that isn't plainly `VersioningType.URI`,
+    // can't be told apart from header versioning, which leaves paths alone.
+    let resolved;
+    let options = match args.first() {
+        None => return Some(versioning),
+        Some(Expr::Object(o)) => o,
+        Some(Expr::Ident(i)) => {
+            resolved = project.resolve_const(file, &i.sym)?.1;
+            match resolved.init() {
+                Expr::Object(o) => o,
+                _ => return None,
+            }
+        }
+        Some(_) => return None,
     };
-    if let Some(Expr::Member(MemberExpr {
-        prop: MemberProp::Ident(kind),
-        ..
-    })) = object_value(options, "type")
-        && kind.sym != "URI"
-    {
-        return None;
+    match object_value(options, "type") {
+        None => {}
+        Some(Expr::Member(MemberExpr {
+            prop: MemberProp::Ident(kind),
+            ..
+        })) if kind.sym == "URI" => {}
+        Some(_) => return None,
     }
     match object_value(options, "prefix") {
         Some(Expr::Lit(Lit::Bool(b))) if !b.value => versioning.prefix.clear(),
