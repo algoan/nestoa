@@ -279,10 +279,15 @@ impl<'a> Extractor<'a> {
             } else {
                 sub_paths.iter().map(|s| Some(s.as_str())).collect()
             };
-            let mut full_paths: Vec<String> = Vec::with_capacity(base_paths.len() * sub_opts.len());
+            let mut full_paths: Vec<ConcretePath> = Vec::new();
             for base in base_paths {
                 for sub in &sub_opts {
-                    full_paths.push(join_paths(self.config.base_path.as_deref(), base, *sub));
+                    let joined = join_paths(self.config.base_path.as_deref(), base, *sub);
+                    for path in concrete_paths(&joined) {
+                        if !full_paths.contains(&path) {
+                            full_paths.push(path);
+                        }
+                    }
                 }
             }
 
@@ -435,11 +440,12 @@ impl<'a> Extractor<'a> {
                 file: file.to_path_buf(),
             };
             let has_body = template.request_body.is_some();
-            for (&method, full_path) in verb
+            for (&method, concrete) in verb
                 .methods()
                 .iter()
-                .flat_map(|m| full_paths.iter().map(move |p| (m, p.clone())))
+                .flat_map(|m| full_paths.iter().map(move |p| (m, p)))
             {
+                let full_path = concrete.path.clone();
                 // A `@route-mapping` match is the most specific author intent, so
                 // it wins over an interceptor override or the declared return type.
                 let response = route_mapping
@@ -462,7 +468,10 @@ impl<'a> Extractor<'a> {
                 let route_errors = errors::compute(&signals, er);
                 out.push(Route {
                     method,
-                    parameters: params_for_path(&template.parameters, &full_path),
+                    parameters: with_patterns(
+                        params_for_path(&template.parameters, &full_path),
+                        &concrete.patterns,
+                    ),
                     path: full_path,
                     response,
                     errors: route_errors,
@@ -929,6 +938,8 @@ fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
     }
 }
 
+/// The Express-style route path a prefix, controller path and method path
+/// join into.
 fn join_paths(prefix: Option<&str>, base: &str, sub: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(p) = prefix {
@@ -938,10 +949,131 @@ fn join_paths(prefix: Option<&str>, base: &str, sub: Option<&str>) -> String {
     if let Some(s) = sub {
         out.push_str(&normalize_segment(s));
     }
-    if out.is_empty() {
-        return "/".to_string();
+    out
+}
+
+/// One OpenAPI path an Express route path stands for, with the `pattern` of
+/// each constrained parameter.
+#[derive(Clone, PartialEq)]
+struct ConcretePath {
+    path: String,
+    patterns: Vec<(String, String)>,
+}
+
+/// The OpenAPI paths an Express route path matches. An optional parameter
+/// (`:id?`, or Express 5's `{/:id}`) gives the path with and without it, and
+/// a constraint (`:id(\\d+)`) becomes the parameter's `pattern`.
+fn concrete_paths(express: &str) -> Vec<ConcretePath> {
+    expand_groups(express)
+        .iter()
+        .flat_map(|p| expand_optional_params(p))
+        .map(|(path, patterns)| {
+            // Joining `/users` and `{/:id}` leaves `/users//:id` once expanded.
+            let mut path = path;
+            while path.contains("//") {
+                path = path.replace("//", "/");
+            }
+            ConcretePath {
+                path: if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    openapi_params(&path)
+                },
+                patterns,
+            }
+        })
+        .fold(Vec::new(), |mut out, p| {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+            out
+        })
+}
+
+/// Express 5 optional groups: `/users{/:id}` is `/users/:id` and `/users`.
+fn expand_groups(path: &str) -> Vec<String> {
+    let Some(open) = path.find('{') else {
+        return vec![path.to_string()];
+    };
+    let Some(close) = path[open..].find('}').map(|i| open + i) else {
+        return vec![path.to_string()];
+    };
+    let (head, inner) = (&path[..open], &path[open + 1..close]);
+    expand_groups(&path[close + 1..])
+        .into_iter()
+        .flat_map(|rest| [format!("{head}{inner}{rest}"), format!("{head}{rest}")])
+        .collect()
+}
+
+/// Express 4 parameters: `:id?` is optional, `:id(\\d+)` constrained. Every
+/// variant has plain `:name` parameters, paired with the patterns it binds.
+fn expand_optional_params(path: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut variants: Vec<(String, Vec<(String, String)>)> = vec![(String::new(), Vec::new())];
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ':' {
+            for (p, _) in &mut variants {
+                p.push(c);
+            }
+            continue;
+        }
+        let mut name = String::new();
+        while let Some(&next) = chars.peek()
+            && (next.is_ascii_alphanumeric() || next == '_')
+        {
+            name.push(next);
+            chars.next();
+        }
+        let mut pattern = None;
+        if chars.peek() == Some(&'(') {
+            chars.next();
+            let (mut regex, mut depth) = (String::new(), 1);
+            for next in chars.by_ref() {
+                match next {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                regex.push(next);
+            }
+            pattern = Some(format!("^(?:{regex})$"));
+        }
+        let optional = chars.peek() == Some(&'?') && chars.next().is_some();
+        let mut with: Vec<_> = variants.clone();
+        for (p, patterns) in &mut with {
+            p.push(':');
+            p.push_str(&name);
+            if let Some(pattern) = &pattern {
+                patterns.push((name.clone(), pattern.clone()));
+            }
+        }
+        if optional {
+            for (p, _) in &mut variants {
+                if p.ends_with('/') {
+                    p.pop();
+                }
+            }
+            with.extend(variants);
+        }
+        variants = with;
     }
-    openapi_params(&out)
+    variants
+}
+
+/// `params` with each constrained path parameter's `pattern` set.
+fn with_patterns(mut params: Vec<RouteParam>, patterns: &[(String, String)]) -> Vec<RouteParam> {
+    for p in &mut params {
+        if p.location == ParamLocation::Path
+            && let Some((_, pattern)) = patterns.iter().find(|(name, _)| *name == p.name)
+            && let Some(schema) = p.schema.as_object_mut()
+        {
+            schema.insert("pattern".into(), Value::String(pattern.clone()));
+        }
+    }
+    params
 }
 
 /// Convert Express-style `:param` placeholders to OpenAPI `{param}`, wherever
@@ -1321,17 +1453,43 @@ fn _silence_unused(_: &TsEntityName, _: &TsTypeRef) {}
 mod tests {
     use super::*;
 
+    fn concrete(prefix: Option<&str>, base: &str, sub: Option<&str>) -> Vec<String> {
+        concrete_paths(&join_paths(prefix, base, sub))
+            .into_iter()
+            .map(|p| p.path)
+            .collect()
+    }
+
     #[test]
     fn joins_paths_and_converts_params() {
-        assert_eq!(join_paths(None, "users", Some(":id")), "/users/{id}");
+        assert_eq!(concrete(None, "users", Some(":id")), ["/users/{id}"]);
         assert_eq!(
-            join_paths(Some("/api"), "v1/users", Some("")),
-            "/api/v1/users"
+            concrete(Some("/api"), "v1/users", Some("")),
+            ["/api/v1/users"]
         );
-        assert_eq!(join_paths(None, "", None), "/");
+        assert_eq!(concrete(None, "", None), ["/"]);
         assert_eq!(
-            join_paths(None, "files", Some(":fileId/raw")),
-            "/files/{fileId}/raw"
+            concrete(None, "files", Some(":fileId/raw")),
+            ["/files/{fileId}/raw"]
+        );
+    }
+
+    #[test]
+    fn optional_and_constrained_params_give_valid_paths() {
+        assert_eq!(
+            concrete(None, "items", Some(":id?")),
+            ["/items/{id}", "/items"]
+        );
+        assert_eq!(
+            concrete(None, "users", Some("{/:id}/posts")),
+            ["/users/{id}/posts", "/users/posts"]
+        );
+        let constrained = concrete_paths(&join_paths(None, "re", Some(":id(\\d+)/x")));
+        assert_eq!(constrained.len(), 1);
+        assert_eq!(constrained[0].path, "/re/{id}/x");
+        assert_eq!(
+            constrained[0].patterns,
+            [("id".to_string(), "^(?:\\d+)$".to_string())]
         );
     }
 
@@ -1675,6 +1833,29 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn a_constrained_param_carries_its_pattern() {
+        let routes = extract_routes(
+            "pattern",
+            r#"
+            @Controller('re')
+            export class ReController {
+                @Get(':id(\\d+)')
+                get(@Param('id') id: string) {}
+                @Get(':slug?')
+                maybe(@Param('slug') slug: string) {}
+            }
+            "#,
+        );
+        let get = find(&routes, HttpMethod::Get, "/re/{id}");
+        assert_eq!(
+            get.parameters[0].schema,
+            json!({"type": "string", "pattern": "^(?:\\d+)$"})
+        );
+        assert!(path_param_names(find(&routes, HttpMethod::Get, "/re")).is_empty());
+        find(&routes, HttpMethod::Get, "/re/{slug}");
     }
 
     #[test]
