@@ -193,31 +193,28 @@ impl<'a> Extractor<'a> {
             let parsed = &self.project.files[file];
             for item in &parsed.module.body {
                 use swc_ecma_ast::{Decl, DefaultDecl, ModuleDecl, ModuleItem, Stmt};
-                let (ident, class) = match item {
+                let (name, class) = match item {
                     ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => match &e.decl {
-                        Decl::Class(c) => (&c.ident, &*c.class),
+                        Decl::Class(c) => (c.ident.sym.to_string(), &*c.class),
                         _ => continue,
                     },
-                    ModuleItem::Stmt(Stmt::Decl(Decl::Class(c))) => (&c.ident, &*c.class),
+                    ModuleItem::Stmt(Stmt::Decl(Decl::Class(c))) => {
+                        (c.ident.sym.to_string(), &*c.class)
+                    }
                     ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
-                        DefaultDecl::Class(c) => match &c.ident {
-                            Some(ident) => (ident, &*c.class),
-                            None => continue,
-                        },
+                        DefaultDecl::Class(c) => (
+                            c.ident
+                                .as_ref()
+                                .map_or_else(|| anonymous_class_name(file), |i| i.sym.to_string()),
+                            &*c.class,
+                        ),
                         _ => continue,
                     },
                     _ => continue,
                 };
-                if let Some(base_paths) = self.controller_base_paths(file, &ident.sym, class) {
-                    let class_tag = strip_suffix_ci(&ident.sym, "Controller").to_string();
-                    self.extract_class(
-                        file,
-                        &ident.sym,
-                        class,
-                        &base_paths,
-                        &class_tag,
-                        &mut routes,
-                    );
+                if let Some(base_paths) = self.controller_base_paths(file, &name, class) {
+                    let class_tag = strip_suffix_ci(&name, "Controller").to_string();
+                    self.extract_class(file, &name, class, &base_paths, &class_tag, &mut routes);
                 }
             }
         }
@@ -1244,6 +1241,28 @@ fn params_for_path(params: &[RouteParam], path: &str) -> Vec<RouteParam> {
         }
     }
     out
+}
+
+/// The name an anonymous `export default class` controller goes by, from its
+/// file: `items.controller.ts` gives `ItemsController`.
+fn anonymous_class_name(file: &Path) -> String {
+    let stem = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split('.').next())
+        .unwrap_or("Default");
+    let pascal: String = stem
+        .split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            chars
+                .next()
+                .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect();
+    format!("{pascal}Controller")
 }
 
 fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
@@ -2594,6 +2613,17 @@ mod tests {
             "#,
         );
         assert_eq!(find(&routes, HttpMethod::Get, "/items").tags, ["Items"]);
+        let (anonymous, _) = extract_from(
+            "anonymous",
+            &[(
+                "bank-accounts.controller.ts",
+                "@Controller('accounts') export default class { @Get() list() {} }",
+            )],
+            "bank-accounts.controller.ts",
+        );
+        let route = find(&anonymous, HttpMethod::Get, "/accounts");
+        assert_eq!(route.tags, ["BankAccounts"]);
+        assert_eq!(route.handler, "BankAccountsController.list");
     }
 
     #[test]
