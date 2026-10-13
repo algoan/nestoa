@@ -29,6 +29,46 @@ pub struct Bootstrap {
     pub prefix: Option<String>,
     /// The routes `setGlobalPrefix`'s `exclude` option leaves unprefixed.
     pub exclude: Vec<PrefixExclude>,
+    /// `enableVersioning` with URI versioning, the only kind that shows in
+    /// the path.
+    pub versioning: Option<UriVersioning>,
+}
+
+/// URI versioning: a version `1` adds a `<prefix>1` segment (`v1`) after the
+/// global prefix.
+#[derive(Debug)]
+pub struct UriVersioning {
+    pub prefix: String,
+    /// The versions of a handler that declares none.
+    pub default_versions: Vec<Version>,
+}
+
+/// One version a handler answers: a number, or `VERSION_NEUTRAL` (`None`),
+/// which adds no segment.
+pub type Version = Option<String>;
+
+impl UriVersioning {
+    /// The path segment for `version` (`v1`), empty for a neutral one.
+    pub fn segment(&self, version: &Version) -> String {
+        version
+            .as_ref()
+            .map(|v| format!("{}{v}", self.prefix))
+            .unwrap_or_default()
+    }
+}
+
+/// The versions a `@Version(...)` argument, a controller's `version` option
+/// or `defaultVersion` names: a string, `VERSION_NEUTRAL`, or an array of
+/// them.
+pub fn versions(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<Version>> {
+    let one = |e: &Expr| match e {
+        Expr::Ident(i) if i.sym == "VERSION_NEUTRAL" => Some(None),
+        e => crate::constval::string(project, file, e).map(Some),
+    };
+    match expr {
+        Expr::Array(a) => a.elems.iter().map(|el| one(&el.as_ref()?.expr)).collect(),
+        e => one(e).map(|v| vec![v]),
+    }
 }
 
 /// One `exclude` entry: a route path (OpenAPI form, without surrounding
@@ -63,7 +103,56 @@ impl Bootstrap {
 pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Bootstrap {
     let mut files: Vec<&PathBuf> = files.iter().collect();
     files.sort_by_key(|f| (f.file_name().is_none_or(|n| n != "main.ts"), *f));
-    for file in files {
+    let versioning = files.iter().find_map(|f| uri_versioning(project, f));
+    let mut bootstrap = global_prefix(project, &files, project_root);
+    bootstrap.versioning = versioning;
+    bootstrap
+}
+
+/// `app.enableVersioning(...)` in `file`, if it enables URI versioning (the
+/// default type).
+fn uri_versioning(project: &Project, file: &Path) -> Option<UriVersioning> {
+    let parsed = project.files.get(file)?;
+    let mut finder = CallFinder {
+        method: "enableVersioning",
+        args: None,
+    };
+    parsed.module.visit_with(&mut finder);
+    let args = finder.args?;
+    let mut versioning = UriVersioning {
+        prefix: "v".to_string(),
+        default_versions: vec![None],
+    };
+    let Some(Expr::Object(options)) = args.first() else {
+        return Some(versioning);
+    };
+    if let Some(Expr::Member(MemberExpr {
+        prop: MemberProp::Ident(kind),
+        ..
+    })) = object_value(options, "type")
+        && kind.sym != "URI"
+    {
+        return None;
+    }
+    match object_value(options, "prefix") {
+        Some(Expr::Lit(Lit::Bool(b))) if !b.value => versioning.prefix.clear(),
+        Some(e) => {
+            if let Some(prefix) = crate::constval::string(project, file, e) {
+                versioning.prefix = prefix;
+            }
+        }
+        None => {}
+    }
+    if let Some(default) =
+        object_value(options, "defaultVersion").and_then(|e| versions(project, file, e))
+    {
+        versioning.default_versions = default;
+    }
+    Some(versioning)
+}
+
+fn global_prefix(project: &Project, files: &[&PathBuf], project_root: &Path) -> Bootstrap {
+    for &file in files {
         let Some(parsed) = project.files.get(file) else {
             continue;
         };
@@ -86,6 +175,7 @@ pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Boot
         return Bootstrap {
             prefix: Some(prefix),
             exclude,
+            versioning: None,
         };
     }
     Bootstrap::default()
@@ -393,6 +483,38 @@ mod tests {
         assert_eq!(
             detect(&project, &entry[..1], &root).prefix.as_deref(),
             Some("setup")
+        );
+    }
+
+    #[test]
+    fn detects_uri_versioning() {
+        let root = temp_root("versioning");
+        let project = project_from(
+            &root,
+            &[(
+                "src/main.ts",
+                "app.enableVersioning({ type: VersioningType.URI, prefix: 'ver', defaultVersion: ['1', VERSION_NEUTRAL] });",
+            )],
+        );
+        let versioning = detect(&project, &files(&project), &root)
+            .versioning
+            .expect("URI versioning");
+        assert_eq!(versioning.prefix, "ver");
+        assert_eq!(versioning.default_versions, [Some("1".to_string()), None]);
+        assert_eq!(versioning.segment(&Some("2".into())), "ver2");
+
+        let header = temp_root("versioning-header");
+        let project = project_from(
+            &header,
+            &[(
+                "src/main.ts",
+                "app.enableVersioning({ type: VersioningType.HEADER, header: 'X-Version' });",
+            )],
+        );
+        assert!(
+            detect(&project, &files(&project), &header)
+                .versioning
+                .is_none()
         );
     }
 }

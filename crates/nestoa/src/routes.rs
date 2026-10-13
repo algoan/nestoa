@@ -13,7 +13,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
 use crate::dialect;
 use crate::errors::{self, ERROR_SCHEMA_NAME};
-use crate::globalprefix::Bootstrap;
+use crate::globalprefix::{Bootstrap, Version, versions};
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
@@ -166,6 +166,8 @@ struct ClassCtx<'c> {
     /// `@UseInterceptors(...)` on the controller, which run before the
     /// method's own.
     interceptors: Vec<String>,
+    /// `@Controller({ version })`: the versions of handlers declaring none.
+    versions: Option<Vec<Version>>,
     opted_out: bool,
     has_roles: bool,
     guarded: bool,
@@ -244,6 +246,7 @@ impl<'a> Extractor<'a> {
             base_paths,
             tag,
             interceptors: collect_interceptors(&class.decorators),
+            versions: self.decorator_option(file, &class.decorators, "Controller", "version"),
             opted_out: has_any_decorator(&class.decorators, &er.auth_opt_out),
             has_roles: has_any_decorator(&class.decorators, &er.role_decorators),
             guarded: has_use_guards(&class.decorators, &er.auth_guards),
@@ -341,20 +344,45 @@ impl<'a> Extractor<'a> {
         } else {
             sub_paths.iter().map(|s| Some(s.as_str())).collect()
         };
+        // With URI versioning, each version the handler answers adds a
+        // segment after the global prefix (`/api/v2/items`).
+        let segments: Vec<String> = match &self.bootstrap.versioning {
+            Some(versioning) => m
+                .function
+                .decorators
+                .iter()
+                .find(|d| decorator_name(d) == "Version")
+                .and_then(|d| first_arg(d))
+                .and_then(|e| versions(self.project, file, e))
+                .or_else(|| class.versions.clone())
+                .unwrap_or_else(|| versioning.default_versions.clone())
+                .iter()
+                .map(|v| versioning.segment(v))
+                .collect(),
+            None => vec![String::new()],
+        };
         let mut full_paths: Vec<(HttpMethod, ConcretePath)> = Vec::new();
         for &method in verb.methods() {
-            for base in base_paths {
-                for sub in &sub_opts {
-                    let route = join_paths(None, base, *sub);
-                    let prefix = self
-                        .config
-                        .base_path
-                        .as_deref()
-                        .filter(|_| !self.bootstrap.excludes(method.as_lower(), &route));
-                    for path in concrete_paths(&join_paths(prefix, base, *sub)) {
-                        let entry = (method, path);
-                        if !full_paths.contains(&entry) {
-                            full_paths.push(entry);
+            for segment in &segments {
+                for base in base_paths {
+                    for sub in &sub_opts {
+                        let route = join_paths(None, base, *sub);
+                        let prefix = self
+                            .config
+                            .base_path
+                            .as_deref()
+                            .filter(|_| !self.bootstrap.excludes(method.as_lower(), &route))
+                            .unwrap_or_default();
+                        let lead = format!(
+                            "{}{}",
+                            normalize_segment(prefix),
+                            normalize_segment(segment)
+                        );
+                        for path in concrete_paths(&join_paths(Some(&lead), base, *sub)) {
+                            let entry = (method, path);
+                            if !full_paths.contains(&entry) {
+                                full_paths.push(entry);
+                            }
                         }
                     }
                 }
@@ -562,6 +590,21 @@ impl<'a> Extractor<'a> {
         } else {
             paths
         })
+    }
+
+    /// The versions the `key` option of a `@<decorator>({ ... })` names.
+    fn decorator_option(
+        &self,
+        file: &Path,
+        decorators: &[Decorator],
+        decorator: &str,
+        key: &str,
+    ) -> Option<Vec<Version>> {
+        let d = decorators.iter().find(|d| decorator_name(d) == decorator)?;
+        let Expr::Object(o) = first_arg(d)? else {
+            return None;
+        };
+        versions(self.project, file, object_value(o, key)?)
     }
 
     /// The path(s) a `@Controller`/verb decorator's first argument names: a
@@ -802,6 +845,14 @@ fn collect_interceptors(decorators: &[swc_ecma_ast::Decorator]) -> Vec<String> {
         }
     }
     names
+}
+
+/// A decorator call's first argument.
+fn first_arg(d: &Decorator) -> Option<&Expr> {
+    let Expr::Call(call) = &*d.expr else {
+        return None;
+    };
+    Some(&call.args.first()?.expr)
 }
 
 /// The value of the `key` property of an object literal.
@@ -1914,6 +1965,51 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn uri_versioning_adds_a_version_segment() {
+        crate::diag::take_warnings();
+        let (routes, _) = extract_with(
+            "versioning",
+            &[
+                (
+                    "main.ts",
+                    "app.setGlobalPrefix('api');\n\
+                     app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });",
+                ),
+                (
+                    "ctrl.ts",
+                    r#"
+                    @Controller({ path: 'items', version: ['2', '3'] })
+                    export class ItemsController {
+                        @Get() list() {}
+                        @Get() @Version('4') listV4() {}
+                        @Get('ping') @Version(VERSION_NEUTRAL) ping() {}
+                    }
+                    @Controller('plain')
+                    export class PlainController {
+                        @Get() get() {}
+                    }
+                    "#,
+                ),
+            ],
+            &["main.ts", "ctrl.ts"],
+            crate::config::Config::default(),
+        );
+        let mut found: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "/api/items/ping",
+                "/api/v1/plain",
+                "/api/v2/items",
+                "/api/v3/items",
+                "/api/v4/items"
+            ]
+        );
+        assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
     }
 
     #[test]
