@@ -1805,6 +1805,33 @@ mod tests {
     }
 
     #[test]
+    fn namespace_members_lower_like_top_level_ones() {
+        let [holder] = lower_with(
+            &[(
+                "types.ts",
+                "export namespace Types {\n\
+                   /** The outcome. */\n\
+                   export interface Result { ok: boolean; }\n\
+                   export namespace Inner { export enum Status { A = 'a', B = 'b' } }\n\
+                 }",
+            )],
+            "import { Types } from './types';\n\
+             export interface Holder { result: Types.Result; status: Types.Inner.Status.B; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["result"]["$ref"],
+            "#/components/schemas/Result"
+        );
+        assert_eq!(
+            holder["properties"]["status"],
+            json!({"type": "string", "enum": ["b"]})
+        );
+    }
+
+    #[test]
     fn interface_declarations_merge() {
         let [merged] = lower_all(
             "",
