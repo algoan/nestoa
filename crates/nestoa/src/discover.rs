@@ -37,35 +37,25 @@ pub fn discover_files(
             }
             continue;
         }
-        let start = start
-            .canonicalize()
-            .with_context(|| format!("resolving {}", start.display()))?;
-        // Globs match paths relative to the project, so a `dist` or
-        // `node_modules` above it never excludes it; an include outside the
-        // project (`../libs/dto`) is matched relative to itself.
-        let base = if start.starts_with(root) {
-            root.to_path_buf()
-        } else if start.is_file() {
-            start.parent().unwrap_or(&start).to_path_buf()
-        } else {
-            start.clone()
-        };
+        // Globs match the path as written, relative to the project, so a
+        // `dist` or `node_modules` above the project never excludes it, and
+        // a symlinked or `..` include is matched where it appears in the
+        // project (`src/linked/…`, `../libs/dto/…`). Only kept files are
+        // canonicalized.
         if start.is_file() {
-            push_if_ts(&start, &base, &exclude, &mut out);
+            push_if_ts(&start, root, &exclude, &mut out);
             continue;
         }
         for entry in walkdir::WalkDir::new(&start)
             .follow_links(true)
             .into_iter()
-            .filter_entry(|e| {
-                !(e.file_type().is_dir() && is_match(&excluded_dirs, e.path(), &base))
-            })
+            .filter_entry(|e| !(e.file_type().is_dir() && is_match(&excluded_dirs, e.path(), root)))
             .filter_map(|e| e.inspect_err(|e| crate::diag::warn(e)).ok())
         {
             if !entry.file_type().is_file() {
                 continue;
             }
-            push_if_ts(entry.path(), &base, &exclude, &mut out);
+            push_if_ts(entry.path(), root, &exclude, &mut out);
         }
     }
     out.sort();
@@ -136,29 +126,31 @@ mod tests {
             "dist/svc/src/app.spec.ts",
             "dist/libs/dto/user.ts",
             "dist/shared/linked.ts",
+            "dist/outside/keep.ts",
+            "dist/outside/generated/gen.ts",
         ] {
             let path = top.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
         }
         let top = top.canonicalize().unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(top.join("dist/shared"), top.join("dist/svc/src/shared"))
-            .unwrap();
-        let excludes = ["**/dist/**", "**/*.spec.ts"].map(String::from);
-        let found = discover_files(
-            &top.join("dist/svc"),
-            &["src".into(), "../libs/dto".into()],
-            &excludes,
-        )
-        .unwrap();
+        let mut includes = vec!["src".to_string(), "../libs/dto".to_string()];
         let mut expected = vec![
             top.join("dist/libs/dto/user.ts"),
             top.join("dist/svc/src/app.ts"),
         ];
-        if cfg!(unix) {
-            expected.insert(1, top.join("dist/shared/linked.ts"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(top.join("dist/shared"), top.join("dist/svc/src/shared")).unwrap();
+            symlink(top.join("dist/outside"), top.join("dist/svc/linked")).unwrap();
+            includes.push("linked".into());
+            expected.push(top.join("dist/shared/linked.ts"));
+            expected.push(top.join("dist/outside/keep.ts"));
+            expected.sort();
         }
+        let excludes = ["**/dist/**", "**/*.spec.ts", "linked/generated/**"].map(String::from);
+        let found = discover_files(&top.join("dist/svc"), &includes, &excludes).unwrap();
         assert_eq!(found, expected);
     }
 
