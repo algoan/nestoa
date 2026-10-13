@@ -410,7 +410,7 @@ impl<'a> Extractor<'a> {
         for p in &m.function.params {
             if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                 match parsed {
-                    ParsedParam::Routed(rp) => params.push(rp),
+                    ParsedParam::Routed(rps) => params.extend(rps),
                     ParsedParam::Body(b) => request_body = Some(b),
                     ParsedParam::BodyField(f) => body_fields.push(f),
                     ParsedParam::Ignored => {}
@@ -693,6 +693,16 @@ impl<'a> Extractor<'a> {
             break;
         }
         let location = location?;
+        // The whole header map, or a header OpenAPI ignores as a parameter.
+        if let DecoratorKind::Header = location {
+            match &decorator_arg {
+                None => return Some(ParsedParam::Ignored),
+                Some(h) if IGNORED_HEADERS.iter().any(|i| h.eq_ignore_ascii_case(i)) => {
+                    return Some(ParsedParam::Ignored);
+                }
+                Some(_) => {}
+            }
+        }
 
         let pat_info = extract_pat(&p.pat);
         let body_field = decorator_arg.clone();
@@ -725,33 +735,115 @@ impl<'a> Extractor<'a> {
                 required: !pat_info.optional,
                 description,
             })),
-            DecoratorKind::Param => Some(ParsedParam::Routed(RouteParam {
+            DecoratorKind::Param | DecoratorKind::Query if body_field.is_none() => {
+                let location = match location {
+                    DecoratorKind::Param => ParamLocation::Path,
+                    _ => ParamLocation::Query,
+                };
+                // `@Query() q: ListQuery`: one parameter per property.
+                if let Some((properties, required)) = object_members(&schema, self.components) {
+                    return Some(ParsedParam::Routed(
+                        properties
+                            .into_iter()
+                            .map(|(name, mut schema)| {
+                                let description = schema
+                                    .as_object_mut()
+                                    .and_then(|o| o.remove("description"))
+                                    .and_then(|d| d.as_str().map(String::from));
+                                RouteParam {
+                                    required: location == ParamLocation::Path
+                                        || required.contains(&name),
+                                    name,
+                                    location,
+                                    schema,
+                                    description,
+                                }
+                            })
+                            .collect(),
+                    ));
+                }
+                Some(ParsedParam::Routed(vec![RouteParam {
+                    name,
+                    location,
+                    required: location == ParamLocation::Path || !pat_info.optional,
+                    schema,
+                    description,
+                }]))
+            }
+            DecoratorKind::Param => Some(ParsedParam::Routed(vec![RouteParam {
                 name,
                 location: ParamLocation::Path,
                 required: true, // path params are always required
                 schema,
                 description,
-            })),
-            DecoratorKind::Query => Some(ParsedParam::Routed(RouteParam {
+            }])),
+            DecoratorKind::Query => Some(ParsedParam::Routed(vec![RouteParam {
                 name,
                 location: ParamLocation::Query,
                 required: !pat_info.optional,
                 schema,
                 description,
-            })),
-            DecoratorKind::Header => Some(ParsedParam::Routed(RouteParam {
+            }])),
+            DecoratorKind::Header => Some(ParsedParam::Routed(vec![RouteParam {
                 name,
                 location: ParamLocation::Header,
                 required: !pat_info.optional,
                 schema,
                 description,
-            })),
+            }])),
         }
     }
 }
 
+/// Headers OpenAPI ignores when declared as parameters: they are described
+/// by the operation's security and media types instead.
+const IGNORED_HEADERS: [&str; 3] = ["Accept", "Content-Type", "Authorization"];
+
+/// An object schema's properties, and the names of the required ones.
+type ObjectMembers = (Vec<(String, Value)>, Vec<String>);
+
+/// The properties of an object schema, following `$ref`s into `components`
+/// and merging `allOf` branches, with the names of the required ones.
+/// `None` when the schema isn't such an object.
+fn object_members(schema: &Value, components: &ComponentSchemas) -> Option<ObjectMembers> {
+    if let Some(name) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        return object_members(components.schemas.get(name)?, components);
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        let (mut properties, mut required) = (Vec::new(), Vec::new());
+        for branch in branches {
+            let (p, r) = object_members(branch, components)?;
+            properties.extend(p);
+            required.extend(r);
+        }
+        return Some((properties, required));
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| {
+            r.iter()
+                .filter_map(|n| n.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((
+        properties
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        required,
+    ))
+}
+
 enum ParsedParam {
-    Routed(RouteParam),
+    /// One parameter, or one per property of a `@Query()`/`@Param()` object.
+    Routed(Vec<RouteParam>),
     Body(RequestBody),
     BodyField(BodyField),
     Ignored,
@@ -1965,6 +2057,74 @@ mod tests {
             .filter(|p| p.location == ParamLocation::Path)
             .map(|p| p.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn object_query_and_param_become_one_parameter_per_property() {
+        let (routes, _) = extract_from(
+            "object-params",
+            &[
+                (
+                    "dto.ts",
+                    "export class Paging { limit?: number; }\n\
+                     export class ListQuery extends Paging {\n\
+                       /** Free text. */\n\
+                       q: string;\n\
+                       page?: number;\n\
+                     }",
+                ),
+                (
+                    "ctrl.ts",
+                    r#"
+                    import { ListQuery } from './dto';
+                    @Controller('orgs')
+                    export class OrgsController {
+                        @Get()
+                        list(@Query() query: ListQuery) {}
+                        @Get(':org/items/:id')
+                        get(
+                            @Param() p: { org: string; id: number },
+                            @Headers() all: Record<string, string>,
+                            @Headers('authorization') auth: string,
+                            @Headers('x-request-id') requestId: string,
+                        ) {}
+                    }
+                    "#,
+                ),
+            ],
+            "ctrl.ts",
+        );
+        let summary = |r: &Route| -> Vec<String> {
+            r.parameters
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{:?} {} {} {} {}",
+                        p.location,
+                        p.name,
+                        p.required,
+                        p.schema,
+                        p.description.as_deref().unwrap_or("-")
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            summary(find(&routes, HttpMethod::Get, "/orgs")),
+            [
+                r#"Query limit false {"type":"number"} -"#,
+                r#"Query q true {"type":"string"} Free text."#,
+                r#"Query page false {"type":"number"} -"#,
+            ]
+        );
+        assert_eq!(
+            summary(find(&routes, HttpMethod::Get, "/orgs/{org}/items/{id}")),
+            [
+                r#"Path org true {"type":"string"} -"#,
+                r#"Path id true {"type":"number"} -"#,
+                r#"Header x-request-id true {"type":"string"} -"#,
+            ]
+        );
     }
 
     #[test]
