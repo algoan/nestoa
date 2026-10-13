@@ -569,6 +569,8 @@ fn collect_items(
                 (Some(Symbol::Interface(merged)), Symbol::Interface(more)) => {
                     merged.0.extend(more.0);
                 }
+                // `class Foo` merged with `interface Foo`: keep the class.
+                (Some(Symbol::Class(_)), Symbol::Interface(_)) => {}
                 (_, symbol) => {
                     fs.declared.insert(name, symbol);
                 }
@@ -1475,6 +1477,21 @@ mod tests {
         // Inside its own module, the local declaration still wins.
         let (file, _) = project.resolve(&dir.join("barrel.ts"), "Hidden").unwrap();
         assert_eq!(file, dir.join("barrel.ts"));
+    }
+
+    #[test]
+    fn an_interface_merged_into_a_class_keeps_the_class() {
+        let (dir, project) = project(
+            "class-merge",
+            &[(
+                "dto.ts",
+                "export class Foo { a: string; }\nexport interface Foo { b: string; }",
+            )],
+        );
+        assert!(matches!(
+            project.resolve(&dir.join("dto.ts"), "Foo"),
+            Some((_, Symbol::Class(_)))
+        ));
     }
 
     #[test]
