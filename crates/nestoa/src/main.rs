@@ -204,6 +204,12 @@ fn main() -> Result<()> {
         extractor.extract_all()
     };
 
+    errors::warn_unmatched(
+        &cfg.error_responses,
+        routes
+            .iter()
+            .map(|r| (r.method.as_lower(), r.path.as_str())),
+    );
     if routes.is_empty() {
         diag::warn("no @Controller-decorated classes with HTTP routes were found");
     }
