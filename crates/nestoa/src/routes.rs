@@ -123,6 +123,8 @@ pub struct Route {
     /// Registered by `@All` rather than an explicit verb decorator. Between
     /// the two, whichever was registered first serves the method.
     pub catch_all: bool,
+    /// `Controller.method`, for diagnostics.
+    pub handler: String,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +186,14 @@ impl<'a> Extractor<'a> {
                     && let Some(base_paths) = controller_base_paths(&cd.class)
                 {
                     let class_tag = strip_suffix_ci(&cd.ident.sym, "Controller").to_string();
-                    self.extract_class(file, &cd.class, &base_paths, &class_tag, &mut routes);
+                    self.extract_class(
+                        file,
+                        &cd.ident.sym,
+                        &cd.class,
+                        &base_paths,
+                        &class_tag,
+                        &mut routes,
+                    );
                 }
             }
         }
@@ -194,6 +203,7 @@ impl<'a> Extractor<'a> {
     fn extract_class(
         &mut self,
         file: &Path,
+        class_name: &str,
         class: &Class,
         base_paths: &[String],
         tag: &str,
@@ -409,6 +419,7 @@ impl<'a> Extractor<'a> {
                 tags: vec![tag.to_string()],
                 errors: BTreeMap::new(),
                 catch_all: matches!(verb, VerbDecorator::All),
+                handler: format!("{class_name}.{}", prop_name_text(&m.key)),
             };
             let has_body = template.request_body.is_some();
             for (&method, full_path) in verb
@@ -705,15 +716,9 @@ fn expr_to_paths(expr: &Expr) -> Vec<String> {
             for prop in &o.props {
                 if let swc_ecma_ast::PropOrSpread::Prop(p) = prop
                     && let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref()
+                    && prop_name_text(&kv.key) == "path"
                 {
-                    let k = match &kv.key {
-                        PropName::Ident(i) => i.sym.to_string(),
-                        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
-                        _ => continue,
-                    };
-                    if k == "path" {
-                        return expr_to_paths(kv.value.as_ref());
-                    }
+                    return expr_to_paths(kv.value.as_ref());
                 }
             }
             Vec::new()
@@ -960,6 +965,14 @@ fn path_matches_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
 }
 
+fn prop_name_text(key: &PropName) -> String {
+    match key {
+        PropName::Ident(i) => i.sym.to_string(),
+        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        _ => String::new(),
+    }
+}
+
 fn normalize_segment(s: &str) -> String {
     let s = s.trim().trim_matches('/');
     if s.is_empty() {
@@ -984,9 +997,12 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
     // NestJS registers handlers in declaration order and the router serves the
     // first match, so an `@All` and an explicit verb on the same method and path
-    // resolve to whichever came first. Two explicit handlers keep last-wins.
+    // resolve to whichever came first. Two explicit handlers keep last-wins, with
+    // a warning naming both.
     let mut catch_all_slots: std::collections::HashSet<(&str, HttpMethod)> =
         std::collections::HashSet::new();
+    let mut handlers: std::collections::HashMap<(&str, HttpMethod), &str> =
+        std::collections::HashMap::new();
     for r in routes {
         let slot = (r.path.as_str(), r.method);
         let taken = paths
@@ -997,6 +1013,17 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         }
         if r.catch_all {
             catch_all_slots.insert(slot);
+        }
+        if let Some(previous) = handlers.insert(slot, &r.handler)
+            && previous != r.handler
+        {
+            crate::diag::warn(format!(
+                "{} {}: {} overrides {}",
+                r.method.as_lower().to_uppercase(),
+                r.path,
+                r.handler,
+                previous
+            ));
         }
         let entry = paths.entry(r.path.clone()).or_default();
         let mut op = Map::new();
@@ -1735,6 +1762,32 @@ mod tests {
             "#,
         );
         assert_eq!(all_first, (json!("Catch-all"), json!("Catch-all")));
+        assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn two_explicit_handlers_on_one_route_warn() {
+        crate::diag::take_warnings();
+        let routes = extract_routes(
+            "duplicate",
+            r#"
+            @Controller('items')
+            export class ItemsController {
+                /** First */
+                @Get()
+                list() {}
+                /** Second */
+                @Get()
+                listAgain() {}
+            }
+            "#,
+        );
+        let doc = to_openapi(&Config::default(), &routes, ComponentSchemas::default());
+        assert_eq!(doc["paths"]["/items"]["get"]["summary"], json!("Second"));
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["GET /items: ItemsController.listAgain overrides ItemsController.list"]
+        );
     }
 
     #[test]
@@ -1846,6 +1899,7 @@ mod tests {
             tags: vec![],
             errors: BTreeMap::new(),
             catch_all: false,
+            handler: format!("Test.{}", method.as_lower()),
         }
     }
 

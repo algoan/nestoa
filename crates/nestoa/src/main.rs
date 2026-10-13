@@ -1,4 +1,5 @@
 mod config;
+mod diag;
 mod dialect;
 mod discover;
 mod errors;
@@ -102,7 +103,7 @@ fn expand_packages(project: &mut Project, parser: &ParsingContext, allow: &GlobS
                     project.add(parsed);
                     worklist.push(target);
                 }
-                Err(e) => eprintln!("warning: {}", e),
+                Err(e) => diag::warn(format!("{e:#}")),
             }
         }
     }
@@ -143,7 +144,7 @@ fn main() -> Result<()> {
         let parsed = match parser.parse_file(file) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: {}", e);
+                diag::warn(format!("{e:#}"));
                 continue;
             }
         };
@@ -170,7 +171,7 @@ fn main() -> Result<()> {
     if !cfg.resolve_packages.is_empty() || has_aliases {
         match build_package_allowlist(&cfg.resolve_packages) {
             Ok(allow) => expand_packages(&mut project, &parser, &allow),
-            Err(e) => eprintln!("warning: invalid resolvePackages pattern: {}", e),
+            Err(e) => diag::warn(format!("invalid resolvePackages pattern: {e}")),
         }
     }
 
@@ -200,7 +201,7 @@ fn main() -> Result<()> {
     };
 
     if routes.is_empty() {
-        eprintln!("warning: no @Controller-decorated classes with HTTP routes were found");
+        diag::warn("no @Controller-decorated classes with HTTP routes were found");
     }
 
     let doc = to_openapi(&cfg, &routes, components);
