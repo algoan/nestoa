@@ -383,6 +383,7 @@ mod tests {
         let routes = {
             let mut ex = Extractor {
                 config,
+                bootstrap: &crate::globalprefix::Bootstrap::default(),
                 project,
                 entry_files: entry,
                 components: &mut components,

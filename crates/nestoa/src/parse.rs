@@ -19,6 +19,17 @@ pub struct ParsedFile {
     pub source: Lrc<SourceFile>,
 }
 
+impl ParsedFile {
+    /// The source text `span` covers, on one line.
+    pub fn text(&self, span: swc_common::Span) -> Option<String> {
+        let start = self.source.start_pos.0;
+        let lo = span.lo.0.checked_sub(start)? as usize;
+        let hi = span.hi.0.checked_sub(start)? as usize;
+        let text = self.source.src.get(lo..hi)?;
+        Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+}
+
 pub fn is_declaration_file(path: &Path) -> bool {
     let name = path.to_string_lossy();
     [".d.ts", ".d.mts", ".d.cts"]

@@ -313,17 +313,7 @@ impl<'a> SchemaCtx<'a> {
     /// `kind` when the source is not at hand) so the gap stays visible.
     fn unsupported(&self, file: &Path, ty: &TsType, kind: &str) -> Value {
         let span = ty.span();
-        let text = self
-            .project
-            .files
-            .get(file)
-            .and_then(|f| {
-                let start = f.source.start_pos.0;
-                let lo = span.lo.0.checked_sub(start)? as usize;
-                let hi = span.hi.0.checked_sub(start)? as usize;
-                f.source.src.get(lo..hi)
-            })
-            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
+        let text = self.project.files.get(file).and_then(|f| f.text(span));
         json!({ "x-unresolved": text.unwrap_or_else(|| kind.to_string()) })
     }
 
@@ -1142,10 +1132,16 @@ fn enum_value_type(v: &EnumValue) -> &'static str {
 fn enum_value_json(v: &EnumValue) -> Value {
     match v {
         EnumValue::Str(s) => Value::String(s.clone()),
-        EnumValue::Num(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 => {
-            Value::from(*n as i64)
-        }
-        EnumValue::Num(n) => Value::from(*n),
+        EnumValue::Num(n) => number_json(*n),
+    }
+}
+
+/// A number as JSON, written as an integer when it is a whole one.
+pub(crate) fn number_json(n: f64) -> Value {
+    if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
+        Value::from(n as i64)
+    } else {
+        Value::from(n)
     }
 }
 
