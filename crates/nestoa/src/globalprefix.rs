@@ -197,7 +197,7 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
         return Some(versioning);
     };
     let mut holder = None;
-    let (file, options) = options_object(project, file, arg, &mut holder)?;
+    let (file, options) = unreadable(options_object(project, file, arg, &mut holder))?;
     let file = file.as_path();
     match object_value(options, "type") {
         None => {}
@@ -205,7 +205,12 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
             prop: MemberProp::Ident(kind),
             ..
         })) if kind.sym == "URI" => {}
-        Some(_) => return None,
+        // Another versioning type: paths are left alone.
+        Some(Expr::Member(MemberExpr {
+            prop: MemberProp::Ident(_),
+            ..
+        })) => return None,
+        Some(_) => return unreadable(None),
     }
     // A `prefix` or `defaultVersion` that can't be read would put routes on
     // a path the app doesn't serve: leave paths unversioned instead.
@@ -338,7 +343,7 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
 /// An options argument as an object literal, written inline or held in a
 /// constant (`as const` and `satisfies` included), with the file its values
 /// are evaluated in. `holder` keeps a constant's declaration alive.
-fn options_object<'a>(
+pub(crate) fn options_object<'a>(
     project: &Project,
     file: &Path,
     arg: &'a Expr,
@@ -387,13 +392,15 @@ fn resolve_prefix_expr(
     project: &Project,
     project_root: &Path,
 ) -> Option<String> {
-    match expr {
+    let known = match expr {
         Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
         Expr::Tpl(_) => static_tpl(expr),
         Expr::Ident(i) => resolve_local_const(i.sym.as_ref(), parsed),
         Expr::Member(_) => resolve_config_member(expr, parsed, project, project_root),
         _ => None,
-    }
+    };
+    // Imported constants, templates with expressions, enum members, ...
+    known.or_else(|| crate::constval::string(project, &parsed.path, expr))
 }
 
 /// A template literal with no interpolations is just a string, e.g. `` `v2` ``.
@@ -821,5 +828,32 @@ mod tests {
         assert_eq!(bootstrap.prefix, None);
         assert!(bootstrap.versioning.is_some());
         assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn imported_prefixes_and_unreadable_versioning() {
+        crate::diag::take_warnings();
+        let root = temp_root("prefix-imported");
+        let project = project_from(
+            &root,
+            &[
+                (
+                    "src/prefix.ts",
+                    "const BASE = 'api';\nexport const PREFIX = `${BASE}/v2`;",
+                ),
+                (
+                    "src/main.ts",
+                    "import { PREFIX } from './prefix';\napp.setGlobalPrefix(PREFIX);\n\
+                     app.enableVersioning({ type: VERSIONING_TYPE });",
+                ),
+            ],
+        );
+        let bootstrap = detect(&project, &files(&project), &root, true);
+        assert_eq!(bootstrap.prefix.as_deref(), Some("api/v2"));
+        assert!(bootstrap.versioning.is_none());
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["cannot evaluate enableVersioning's options; paths are left unversioned"]
+        );
     }
 }

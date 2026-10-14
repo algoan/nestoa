@@ -658,10 +658,10 @@ impl<'a> Extractor<'a> {
         key: &str,
     ) -> Option<Option<Vec<Version>>> {
         let d = decorators.iter().find(|d| decorator_name(d) == decorator)?;
-        let Expr::Object(o) = crate::constval::unwrap(first_arg(d)?) else {
-            return None;
-        };
-        Some(versions(self.project, file, &object_value(o, key)?))
+        let mut holder = None;
+        let (decl_file, o) =
+            crate::globalprefix::options_object(self.project, file, first_arg(d)?, &mut holder)?;
+        Some(versions(self.project, &decl_file, &object_value(o, key)?))
     }
 
     /// The path(s) a `@Controller`/verb decorator's first argument names: a
@@ -676,23 +676,30 @@ impl<'a> Extractor<'a> {
         let Some(arg) = call.args.first() else {
             return Some(Vec::new());
         };
-        let path_option: Expr;
-        let expr = match crate::constval::unwrap(&arg.expr) {
-            Expr::Object(o) => match object_value(o, "path") {
-                Some(path) => {
-                    path_option = path;
-                    &path_option
+        // The object form, inline or held in a constant (`@Controller(OPTIONS)`),
+        // has its `path` evaluated where the object is written.
+        let mut holder = None;
+        let (eval_file, path_option): (PathBuf, Expr);
+        let expr =
+            match crate::globalprefix::options_object(self.project, file, &arg.expr, &mut holder) {
+                Some((decl_file, o)) => match object_value(o, "path") {
+                    Some(path) => {
+                        (eval_file, path_option) = (decl_file, path);
+                        &path_option
+                    }
+                    None => return Some(Vec::new()),
+                },
+                None => {
+                    eval_file = file.to_path_buf();
+                    crate::constval::unwrap(&arg.expr)
                 }
-                None => return Some(Vec::new()),
-            },
-            expr => expr,
-        };
-        let paths = crate::constval::strings(self.project, file, expr);
+            };
+        let paths = crate::constval::strings(self.project, &eval_file, expr);
         if paths.is_none() {
             let text = self
                 .project
                 .files
-                .get(file)
+                .get(&eval_file)
                 .and_then(|f| f.text(expr.span()));
             crate::diag::warn(format!(
                 "{owner}: cannot evaluate the path {}; its routes are left out",
@@ -2734,6 +2741,11 @@ mod tests {
                     export class ShortController {
                         @Get() list() {}
                     }
+                    const OPTIONS = { path: 'held', version: '9' };
+                    @Controller(OPTIONS)
+                    export class HeldController {
+                        @Get() list() {}
+                    }
                     @Controller({ path: 'wrapped', version: '8' } as const)
                     export class WrappedController {
                         @Get() list() {}
@@ -2748,7 +2760,8 @@ mod tests {
             &["main.ts", "ctrl.ts"],
             crate::config::Config::default(),
         );
-        assert_eq!(routes.len(), 3);
+        assert_eq!(routes.len(), 4);
+        find(&routes, HttpMethod::Get, "/v9/held");
         find(&routes, HttpMethod::Get, "/v7/short");
         find(&routes, HttpMethod::Get, "/v8/wrapped");
         let route = find(&routes, HttpMethod::Get, "/v1/items/{code}");
