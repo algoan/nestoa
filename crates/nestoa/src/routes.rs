@@ -720,6 +720,10 @@ impl<'a> Extractor<'a> {
         let Some(arg) = first_arg(d) else {
             return Ok(None);
         };
+        // `@Body(undefined, ValidationPipe)`: pipes without a name.
+        if matches!(crate::constval::unwrap(arg), Expr::Ident(i) if i.sym == "undefined") {
+            return Ok(None);
+        }
         if let Some(name) = crate::constval::string(self.project, file, arg) {
             return Ok(Some(name));
         }
@@ -2559,6 +2563,7 @@ mod tests {
                     @Headers(HEADER) id: string,
                     @Query(KEYS.PAGE) page: string,
                     @Query(new ValidationPipe()) all: { q: string },
+                    @Query(undefined, ValidationPipe) skipped: { r: string },
                     @Query(UNKNOWN) lost: string,
                     @Query(getKey()) computed: string,
                 ) {}
@@ -2570,7 +2575,7 @@ mod tests {
             .iter()
             .map(|p| p.name.as_str())
             .collect();
-        assert_eq!(names, ["x-request-id", "page", "q"]);
+        assert_eq!(names, ["x-request-id", "page", "q", "r"]);
         assert_eq!(
             crate::diag::take_warnings(),
             [

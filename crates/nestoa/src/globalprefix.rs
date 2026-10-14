@@ -62,14 +62,22 @@ impl UriVersioning {
 /// or `defaultVersion` names: a string, `VERSION_NEUTRAL`, or an array of
 /// them.
 pub fn versions(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<Version>> {
-    let one = |e: &Expr| match e {
-        Expr::Ident(i) if i.sym == "VERSION_NEUTRAL" => Some(None),
-        e => crate::constval::string(project, file, e).map(Some),
+    // `VERSION_NEUTRAL`, or through a namespace (`Nest.VERSION_NEUTRAL`).
+    let neutral = |e: &Expr| {
+        crate::constval::dotted_name(e)
+            .is_some_and(|n| n.rsplit('.').next() == Some("VERSION_NEUTRAL"))
+    };
+    let one = |e: &Expr| {
+        if neutral(e) {
+            Some(None)
+        } else {
+            crate::constval::string(project, file, e).map(Some)
+        }
     };
     match crate::constval::unwrap(expr) {
         Expr::Array(a) => a.elems.iter().map(|el| one(&el.as_ref()?.expr)).collect(),
         // `const VERSIONS = ['1', '2']`, evaluated where it is declared.
-        Expr::Ident(i) if i.sym != "VERSION_NEUTRAL" => {
+        e @ Expr::Ident(i) if !neutral(e) => {
             let (decl_file, c) = project.resolve_const(file, &i.sym)?;
             match crate::constval::unwrap(c.init()) {
                 init @ Expr::Array(_) => versions(project, &decl_file, init),
@@ -168,6 +176,17 @@ pub fn detect(
     bootstrap
 }
 
+/// Whether `expr` is `false`, written inline or held in a constant.
+fn is_false(project: &Project, file: &Path, expr: &Expr) -> bool {
+    match crate::constval::unwrap(expr) {
+        Expr::Lit(Lit::Bool(b)) => !b.value,
+        Expr::Ident(i) => project
+            .resolve_const(file, &i.sym)
+            .is_some_and(|(decl_file, c)| is_false(project, &decl_file, c.init())),
+        _ => false,
+    }
+}
+
 /// `value`, or a warning that `enableVersioning`'s options can't be read.
 fn unreadable<T>(value: Option<T>) -> Option<T> {
     if value.is_none() {
@@ -218,7 +237,7 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
     // A `prefix` or `defaultVersion` that can't be read would put routes on
     // a path the app doesn't serve: leave paths unversioned instead.
     match object_value(options, "prefix") {
-        Some(Expr::Lit(Lit::Bool(b))) if !b.value => versioning.prefix.clear(),
+        Some(e) if is_false(project, file, &e) => versioning.prefix.clear(),
         Some(e) => versioning.prefix = unreadable(crate::constval::string(project, file, &e))?,
         None => {}
     }
@@ -638,13 +657,15 @@ mod tests {
             &consts,
             &[(
                 "src/main.ts",
-                "const VERSIONS = ['1', VERSION_NEUTRAL] satisfies VersionValue[];\napp.enableVersioning({ defaultVersion: VERSIONS });",
+                "const VERSIONS = ['1', Nest.VERSION_NEUTRAL] satisfies VersionValue[];\nconst NO_PREFIX = false;\n\
+                 app.enableVersioning({ prefix: NO_PREFIX, defaultVersion: VERSIONS });",
             )],
         );
         let versioning = detect(&project, &files(&project), &consts, true)
             .versioning
             .unwrap();
         assert_eq!(versioning.default_versions, [Some("1".to_string()), None]);
+        assert_eq!(versioning.prefix, "");
 
         let header = temp_root("versioning-header");
         let project = project_from(
