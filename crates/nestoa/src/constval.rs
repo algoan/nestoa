@@ -96,6 +96,26 @@ pub fn string(project: &Project, file: &Path, expr: &Expr) -> Option<String> {
     eval(project, file, expr, 0).map(text)
 }
 
+/// The boolean `expr` evaluates to: a literal, or a constant holding one,
+/// followed through aliases (`const ON = TRUE`).
+pub fn boolean(project: &Project, file: &Path, expr: &Expr) -> Option<bool> {
+    boolean_at(project, file, expr, 0)
+}
+
+fn boolean_at(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<bool> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    match unwrap(expr) {
+        Expr::Lit(Lit::Bool(b)) => Some(b.value),
+        Expr::Ident(i) => {
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            boolean_at(project, &decl_file, c.init(), depth + 1)
+        }
+        _ => None,
+    }
+}
+
 /// A value as JavaScript turns it into a string.
 fn text(value: EnumValue) -> String {
     match value {

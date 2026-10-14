@@ -830,13 +830,7 @@ impl<'a> Extractor<'a> {
                 |e| {
                     literal_json(crate::constval::unwrap(e))
                         .or_else(|| {
-                            // `const DEFAULT = true`, which constval doesn't hold.
-                            let Expr::Ident(i) = crate::constval::unwrap(e) else {
-                                return None;
-                            };
-                            let (_, c) = self.project.resolve_const(file, &i.sym)?;
-                            literal_json(crate::constval::unwrap(c.init()))
-                                .filter(Value::is_boolean)
+                            crate::constval::boolean(self.project, file, e).map(Value::Bool)
                         })
                         .or_else(|| {
                             Some(match crate::constval::value(self.project, file, e)? {
@@ -849,10 +843,14 @@ impl<'a> Extractor<'a> {
                 |e| {
                     let mut holder = None;
                     crate::globalprefix::options_object(self.project, file, e, &mut holder)
-                        .and_then(|(_, o)| object_value(o, "optional"))
-                        .is_some_and(|v| {
-                            matches!(crate::constval::unwrap(&v), Expr::Lit(Lit::Bool(b)) if b.value)
+                        .and_then(|(decl_file, o)| {
+                            crate::constval::boolean(
+                                self.project,
+                                &decl_file,
+                                &object_value(o, "optional")?,
+                            )
                         })
+                        .unwrap_or(false)
                 },
             );
             break;
@@ -2511,8 +2509,10 @@ mod tests {
             r#"
             import { ParseIntPipe as IntPipe, DefaultValuePipe as Default } from '@nestjs/common';
             const BAD = 'x';
-            const ON = true;
+            const TRUE = true;
+            const ON = TRUE;
             const PIPE_OPTIONS = { optional: true };
+            const ON_OPTIONS = { optional: ON };
             export type Count = number;
             @Controller('items')
             export class ItemsController {
@@ -2541,6 +2541,7 @@ mod tests {
                     @Query('wrapped', new ParseIntPipe({ optional: true } as const)) wrapped: number,
                     @Query('aliased', new Default(5), IntPipe) aliased: number,
                     @Query('held', new ParseIntPipe(PIPE_OPTIONS)) held: number,
+                    @Query('held_flag', new ParseIntPipe(ON_OPTIONS)) heldFlag: number,
                 ) {}
             }
             "#,
@@ -2576,6 +2577,7 @@ mod tests {
                 r#"wrapped false {"type":"integer"}"#,
                 r#"aliased false {"type":"integer","default":5}"#,
                 r#"held false {"type":"integer"}"#,
+                r#"held_flag false {"type":"integer"}"#,
             ]
         );
     }
