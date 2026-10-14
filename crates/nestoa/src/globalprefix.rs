@@ -136,24 +136,14 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
         prefix: "v".to_string(),
         default_versions: vec![None],
     };
-    // Options passed through a variable are read from its initializer; any
-    // other expression, or a `type` that isn't plainly `VersioningType.URI`,
-    // can't be told apart from header versioning, which leaves paths alone.
-    // Their values are evaluated in the file declaring them.
-    let resolved;
-    let (file, options) = match args.first() {
-        None => return Some(versioning),
-        Some(Expr::Object(o)) => (file.to_path_buf(), o),
-        Some(Expr::Ident(i)) => {
-            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
-            resolved = c;
-            match resolved.init() {
-                Expr::Object(o) => (decl_file, o),
-                _ => return None,
-            }
-        }
-        Some(_) => return None,
+    // Options that can't be read, or a `type` that isn't plainly
+    // `VersioningType.URI`, can't be told apart from header versioning,
+    // which leaves paths alone.
+    let Some(arg) = args.first() else {
+        return Some(versioning);
     };
+    let mut holder = None;
+    let (file, options) = options_object(project, file, arg, &mut holder)?;
     let file = file.as_path();
     match object_value(options, "type") {
         None => {}
@@ -213,9 +203,11 @@ fn global_prefix(project: &Project, files: &[&PathBuf], project_root: &Path) -> 
 /// The `exclude` entries of `setGlobalPrefix`'s options: `'health'`, or
 /// `{ path: 'health', method: RequestMethod.GET }`.
 fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<PrefixExclude> {
-    let Expr::Object(options) = options else {
+    let mut holder = None;
+    let Some((file, options)) = options_object(project, file, options, &mut holder) else {
         return Vec::new();
     };
+    let file = file.as_path();
     let Some(Expr::Array(entries)) = object_value(options, "exclude") else {
         return Vec::new();
     };
@@ -255,6 +247,28 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
             })
         })
         .collect()
+}
+
+/// An options argument as an object literal, written inline or held in a
+/// constant (`as const` and `satisfies` included), with the file its values
+/// are evaluated in. `holder` keeps a constant's declaration alive.
+fn options_object<'a>(
+    project: &Project,
+    file: &Path,
+    arg: &'a Expr,
+    holder: &'a mut Option<crate::symbols::ConstInit>,
+) -> Option<(PathBuf, &'a swc_ecma_ast::ObjectLit)> {
+    match crate::constval::unwrap(arg) {
+        Expr::Object(o) => Some((file.to_path_buf(), o)),
+        Expr::Ident(i) => {
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            match crate::constval::unwrap(holder.insert(c).init()) {
+                Expr::Object(o) => Some((decl_file, o)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn object_value<'a>(o: &'a swc_ecma_ast::ObjectLit, key: &str) -> Option<&'a Expr> {
@@ -557,6 +571,44 @@ mod tests {
                 .versioning
                 .is_none()
         );
+
+        let through_variable = temp_root("versioning-variable");
+        let project = project_from(
+            &through_variable,
+            &[(
+                "src/main.ts",
+                "const uri = { type: VersioningType.URI, prefix: 'ver' } as const satisfies VersioningOptions;\n\
+                 app.enableVersioning(uri);",
+            )],
+        );
+        let detected = detect(&project, &files(&project), &through_variable);
+        assert_eq!(
+            detected.versioning.map(|v| v.prefix).as_deref(),
+            Some("ver")
+        );
+        let unreadable = temp_root("versioning-unreadable");
+        let project = project_from(
+            &unreadable,
+            &[(
+                "src/main.ts",
+                "const header = { type: VersioningType.HEADER, header: 'X-Version' };\n\
+                 app.enableVersioning(header);",
+            )],
+        );
+        assert!(
+            detect(&project, &files(&project), &unreadable)
+                .versioning
+                .is_none()
+        );
+        let project = project_from(
+            &unreadable,
+            &[("src/main.ts", "function f(o) { app.enableVersioning(o); }")],
+        );
+        assert!(
+            detect(&project, &files(&project), &unreadable)
+                .versioning
+                .is_none()
+        );
     }
 
     #[test]
@@ -598,5 +650,20 @@ mod tests {
             .expect("URI versioning");
         assert_eq!(versioning.prefix, "ver");
         assert_eq!(versioning.default_versions, [Some("3".to_string())]);
+    }
+
+    #[test]
+    fn prefix_options_held_in_a_constant() {
+        let root = temp_root("prefix-options");
+        let project = project_from(
+            &root,
+            &[(
+                "src/main.ts",
+                "const options = { exclude: ['health'] } as const;\napp.setGlobalPrefix('api', options);",
+            )],
+        );
+        let bootstrap = detect(&project, &files(&project), &root);
+        assert!(bootstrap.excludes("get", "/health"));
+        assert!(!bootstrap.excludes("get", "/other"));
     }
 }
