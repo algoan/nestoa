@@ -810,7 +810,20 @@ impl<'a> Extractor<'a> {
                     return Some(ParsedParam::Ignored);
                 }
             };
-            pipes = pipe_effects(d, decorator_arg.is_some(), |e| {
+            // A pipe imported under another name (`ParseIntPipe as IntPipe`)
+            // is matched by the name it is exported as.
+            let pipe_name = |e: &Expr| {
+                let name = class_name(e)?;
+                match e {
+                    Expr::Ident(_) => self
+                        .project
+                        .import_origin(file, &name)
+                        .map(|(_, exported)| exported)
+                        .or(Some(name)),
+                    _ => Some(name),
+                }
+            };
+            pipes = pipe_effects(d, decorator_arg.is_some(), pipe_name, |e| {
                 literal_json(crate::constval::unwrap(e))
                     .or_else(|| {
                         // `const DEFAULT = true`, which constval doesn't hold.
@@ -969,6 +982,7 @@ struct PipeEffects {
 fn pipe_effects(
     d: &Decorator,
     named: bool,
+    pipe_name: impl Fn(&Expr) -> Option<String>,
     default_value: impl Fn(&Expr) -> Option<Value>,
 ) -> PipeEffects {
     let mut effects = PipeEffects::default();
@@ -986,7 +1000,7 @@ fn pipe_effects(
             Expr::New(n) => (&*n.callee, n.args.as_deref().unwrap_or_default()),
             e => (e, &[][..]),
         };
-        let Some(name) = class_name(class) else {
+        let Some(name) = pipe_name(class) else {
             continue;
         };
         let name = name.as_str();
@@ -2483,6 +2497,7 @@ mod tests {
         let routes = extract_routes(
             "pipes",
             r#"
+            import { ParseIntPipe as IntPipe, DefaultValuePipe as Default } from '@nestjs/common';
             const BAD = 'x';
             const ON = true;
             export type Count = number;
@@ -2511,6 +2526,7 @@ mod tests {
                     @Query('nan', new DefaultValuePipe('NaN'), ParseFloatPipe) nan: number,
                     @Query('asserted', new DefaultValuePipe(true as const), ParseBoolPipe) asserted: boolean,
                     @Query('wrapped', new ParseIntPipe({ optional: true } as const)) wrapped: number,
+                    @Query('aliased', new Default(5), IntPipe) aliased: number,
                 ) {}
             }
             "#,
@@ -2544,6 +2560,7 @@ mod tests {
                 r#"nan true {"type":"number"}"#,
                 r#"asserted false {"type":"boolean","default":true}"#,
                 r#"wrapped false {"type":"integer"}"#,
+                r#"aliased false {"type":"integer","default":5}"#,
             ]
         );
     }
