@@ -1713,14 +1713,17 @@ fn warn_param_name_conflicts<'a>(paths: impl Iterator<Item = &'a String>) {
     }
 }
 
-/// A property's static name; a computed key counts when it is a string
-/// literal (`['list']`). Empty otherwise.
+/// A property's static name, numbers spelled as JavaScript keys them; a
+/// computed key counts when it is a literal (`['list']`, `[1]`). Empty
+/// otherwise.
 fn prop_name_text(key: &PropName) -> String {
     match key {
         PropName::Ident(i) => i.sym.to_string(),
         PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        PropName::Num(n) => n.value.to_string(),
         PropName::Computed(c) => match crate::constval::unwrap(&c.expr) {
             Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
+            Expr::Lit(Lit::Num(n)) => n.value.to_string(),
             _ => String::new(),
         },
         _ => String::new(),
@@ -2837,8 +2840,8 @@ mod tests {
                      @Controller('qualified') export class QualifiedController extends Base.L0 {}\n\
                      export class Computed { @Get('list') ['list']() {} }\n\
                      @Controller('computed') export class ComputedController extends Computed { ['local']() {} }\n\
-                     export class Shadowed { @Get('old') ['same']() {} }\n\
-                     @Controller('shadow') export class ShadowController extends Shadowed { @Get('new') ['same']() {} }",
+                     export class Shadowed { @Get('old') ['same']() {} @Get('old1') [1]() {} }\n\
+                     @Controller('shadow') export class ShadowController extends Shadowed { @Get('new') ['same']() {} 1() {} }",
                 ),
             ],
             "ctrl.ts",
@@ -2848,7 +2851,11 @@ mod tests {
         find(&routes, HttpMethod::Get, "/qualified/deepest");
         find(&routes, HttpMethod::Get, "/computed/list");
         find(&routes, HttpMethod::Get, "/shadow/new");
-        assert!(!routes.iter().any(|r| r.path == "/shadow/old"));
+        assert!(
+            !routes
+                .iter()
+                .any(|r| r.path == "/shadow/old" || r.path == "/shadow/old1")
+        );
     }
 
     #[test]
