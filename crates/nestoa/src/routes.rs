@@ -456,7 +456,7 @@ impl<'a> Extractor<'a> {
                         for rp in rps {
                             match params
                                 .iter_mut()
-                                .find(|p| p.location == rp.location && p.name == rp.name)
+                                .find(|p| p.location == rp.location && same_name(p, &rp))
                             {
                                 Some(p) => {
                                     p.required |= rp.required;
@@ -1082,6 +1082,15 @@ fn literal_json(expr: &Expr) -> Option<Value> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether two parameters of one location have the same name; header names
+/// are case-insensitive.
+fn same_name(a: &RouteParam, b: &RouteParam) -> bool {
+    match a.location {
+        ParamLocation::Header => a.name.eq_ignore_ascii_case(&b.name),
+        _ => a.name == b.name,
     }
 }
 
@@ -2631,6 +2640,7 @@ mod tests {
                             @Headers() all: Record<string, string>,
                             @Headers('authorization') auth: string,
                             @Headers('x-request-id') requestId: string,
+                    @Headers('X-Request-ID') sameHeader: string,
                         ) {}
                     }
                     "#,
