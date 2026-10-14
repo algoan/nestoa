@@ -743,13 +743,13 @@ impl<'a> Extractor<'a> {
                 .unwrap_or_else(|| json!({}))
         });
         if let Some(default) = &pipes.default
-            && pipes.optional
+            && pipes.required == Some(false)
             && let Some(o) = schema.as_object_mut()
         {
             o.insert("default".into(), default.clone());
         }
         let pat_info = PatInfo {
-            optional: pat_info.optional || pipes.optional,
+            optional: pipes.required.map_or(pat_info.optional, |r| !r),
             ..pat_info
         };
         let description = method_doc.params.get(&pat_info.name).cloned();
@@ -835,9 +835,11 @@ struct PipeEffects {
     schema: Option<Value>,
     /// `DefaultValuePipe`'s value.
     default: Option<Value>,
-    /// The parameter may be omitted: it has a default, or a parse pipe was
-    /// given `{ optional: true }`.
-    optional: bool,
+    /// Whether the pipes decide that the parameter must be sent: `false`
+    /// when a missing value reaches a default (or only optional parse
+    /// pipes), `true` when a parse pipe rejects it first. `None` leaves it
+    /// to the parameter's `?`.
+    required: Option<bool>,
 }
 
 /// Pipes run in order, so a missing value is only safe if it reaches a
@@ -847,7 +849,7 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
     let Expr::Call(call) = &*d.expr else {
         return effects;
     };
-    let mut rejects_missing = false;
+    let mut optional_parser = false;
     for arg in &call.args {
         let (name, args) = match arg.expr.as_ref() {
             Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
@@ -859,8 +861,10 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
         };
         let schema = match name {
             "DefaultValuePipe" => {
-                effects.default = args.first().and_then(|a| literal_json(&a.expr));
-                effects.optional |= effects.default.is_some() && !rejects_missing;
+                if effects.required.is_none() {
+                    effects.default = args.first().and_then(|a| literal_json(&a.expr));
+                    effects.required = effects.default.is_some().then_some(false);
+                }
                 continue;
             }
             "ParseIntPipe" => json!({ "type": "integer" }),
@@ -876,10 +880,13 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
                 if matches!(object_value(options, "optional"), Some(Expr::Lit(Lit::Bool(b))) if b.value)
         );
         if optional {
-            effects.optional |= !rejects_missing;
-        } else if effects.default.is_none() {
-            rejects_missing = true;
+            optional_parser = true;
+        } else if effects.required.is_none() {
+            effects.required = Some(true);
         }
+    }
+    if optional_parser && effects.required.is_none() {
+        effects.required = Some(false);
     }
     effects
 }
@@ -2227,6 +2234,8 @@ mod tests {
                     @Query('all', ParseBoolPipe) all: string,
                     @Query('sort', new DefaultValuePipe('asc')) sort: string,
                     @Query('late', ParseIntPipe, new DefaultValuePipe(1)) late: number,
+                    @Query('marked', ParseIntPipe) marked?: number,
+                    @Query('chain', new ParseIntPipe({ optional: true }), ParseIntPipe) chain: number,
                 ) {}
             }
             "#,
@@ -2245,6 +2254,8 @@ mod tests {
                 r#"all true {"type":"boolean"}"#,
                 r#"sort false {"type":"string","default":"asc"}"#,
                 r#"late true {"type":"integer"}"#,
+                r#"marked true {"type":"integer"}"#,
+                r#"chain true {"type":"integer"}"#,
             ]
         );
     }
