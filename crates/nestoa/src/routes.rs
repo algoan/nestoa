@@ -281,11 +281,14 @@ impl<'a> Extractor<'a> {
                 }
                 if matches!(m.kind, MethodKind::Method)
                     && m.function.body.is_some()
-                    && !seen.contains(&name)
+                    && (name.is_empty() || !seen.contains(&name))
                 {
                     self.extract_method(&owner.0, m, &class_ctx, out);
                 }
-                declared.push(name);
+                // A computed key (`['list']()`) has no static name to shadow by.
+                if !name.is_empty() {
+                    declared.push(name);
+                }
             }
             seen.extend(declared);
             let Some(base) = self.base_class(&owner.0, class) else {
@@ -2776,7 +2779,9 @@ mod tests {
                     "import { L20, A } from './base';\nimport * as Base from './base';\n\
                      @Controller('deep') export class DeepController extends L20 {}\n\
                      @Controller('cycle') export class CycleController extends A { @Get() own() {} }\n\
-                     @Controller('qualified') export class QualifiedController extends Base.L0 {}",
+                     @Controller('qualified') export class QualifiedController extends Base.L0 {}\n\
+                     export class Computed { @Get('list') ['list']() {} }\n\
+                     @Controller('computed') export class ComputedController extends Computed { ['local']() {} }",
                 ),
             ],
             "ctrl.ts",
@@ -2784,6 +2789,7 @@ mod tests {
         find(&routes, HttpMethod::Get, "/deep/deepest");
         find(&routes, HttpMethod::Get, "/cycle");
         find(&routes, HttpMethod::Get, "/qualified/deepest");
+        find(&routes, HttpMethod::Get, "/computed/list");
     }
 
     #[test]

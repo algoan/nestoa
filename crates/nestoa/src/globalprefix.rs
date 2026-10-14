@@ -257,6 +257,11 @@ fn global_prefix(project: &Project, files: &[&PathBuf], project_root: &Path) -> 
 
 /// The `exclude` entries of `setGlobalPrefix`'s options: `'health'`, or
 /// `{ path: 'health', method: RequestMethod.GET }`.
+fn unreadable_exclude() -> Vec<PrefixExclude> {
+    crate::diag::warn("cannot evaluate setGlobalPrefix's exclude; every route keeps the prefix");
+    Vec::new()
+}
+
 fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<PrefixExclude> {
     let mut holder = None;
     let Some((file, options)) = options_object(project, file, options, &mut holder) else {
@@ -271,18 +276,18 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
         Expr::Ident(i) => match project.resolve_const(&file, &i.sym) {
             Some((decl_file, c)) => match crate::constval::unwrap(c.init()) {
                 Expr::Array(a) => (decl_file, a.clone()),
-                _ => return Vec::new(),
+                _ => return unreadable_exclude(),
             },
-            None => return Vec::new(),
+            None => return unreadable_exclude(),
         },
-        _ => return Vec::new(),
+        _ => return unreadable_exclude(),
     };
     let file = file.as_path();
     entries
         .elems
         .iter()
         .flatten()
-        .filter_map(|entry| {
+        .map(|entry| {
             let (path, method) = match entry.expr.as_ref() {
                 Expr::Object(o) => {
                     // A method that can't be read drops the exclusion rather
@@ -315,6 +320,16 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
                 wildcard,
                 method,
             })
+        })
+        // An entry that can't be read may name a route the prefix is left
+        // off: say so, since its route is then documented prefixed.
+        .filter_map(|exclude| {
+            if exclude.is_none() {
+                crate::diag::warn(
+                    "cannot evaluate an entry of setGlobalPrefix's exclude; its route keeps the prefix",
+                );
+            }
+            exclude
         })
         .collect()
 }
@@ -737,7 +752,7 @@ mod tests {
             &root,
             &[(
                 "src/main.ts",
-                "app.setGlobalPrefix('api', { exclude: [{ path: 'health', method: METHOD }, 'ping'] });\n\
+                "app.setGlobalPrefix('api', { exclude: [{ path: 'health', method: METHOD }, 'ping', DYNAMIC] });\n\
                  app.enableVersioning({ prefix: getPrefix() });",
             )],
         );
@@ -747,7 +762,11 @@ mod tests {
         assert!(bootstrap.versioning.is_none());
         assert_eq!(
             crate::diag::take_warnings(),
-            ["cannot evaluate enableVersioning's options; paths are left unversioned"]
+            [
+                "cannot evaluate enableVersioning's options; paths are left unversioned",
+                "cannot evaluate an entry of setGlobalPrefix's exclude; its route keeps the prefix",
+                "cannot evaluate an entry of setGlobalPrefix's exclude; its route keeps the prefix"
+            ]
         );
     }
 
