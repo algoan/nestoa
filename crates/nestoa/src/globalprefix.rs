@@ -251,10 +251,22 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
     let Some((file, options)) = options_object(project, file, options, &mut holder) else {
         return Vec::new();
     };
-    let file = file.as_path();
-    let Some(Expr::Array(entries)) = object_value(options, "exclude") else {
+    let Some(exclude) = object_value(options, "exclude") else {
         return Vec::new();
     };
+    // `exclude: EXCLUDES`, evaluated where the array is declared.
+    let (file, entries) = match crate::constval::unwrap(&exclude) {
+        Expr::Array(a) => (file, a.clone()),
+        Expr::Ident(i) => match project.resolve_const(&file, &i.sym) {
+            Some((decl_file, c)) => match crate::constval::unwrap(c.init()) {
+                Expr::Array(a) => (decl_file, a.clone()),
+                _ => return Vec::new(),
+            },
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let file = file.as_path();
     entries
         .elems
         .iter()
@@ -735,5 +747,24 @@ mod tests {
         );
         assert_eq!(detect(&project, &files(&project), &root).prefix, None);
         assert_eq!(crate::diag::take_warnings().len(), 1);
+    }
+
+    #[test]
+    fn an_exclude_array_held_in_a_constant() {
+        let root = temp_root("exclude-const");
+        let project = project_from(
+            &root,
+            &[
+                (
+                    "src/excludes.ts",
+                    "const HEALTH = 'health';\nexport const EXCLUDES = [HEALTH];",
+                ),
+                (
+                    "src/main.ts",
+                    "import { EXCLUDES } from './excludes';\napp.setGlobalPrefix('api', { exclude: EXCLUDES });",
+                ),
+            ],
+        );
+        assert!(detect(&project, &files(&project), &root).excludes("get", "/health"));
     }
 }

@@ -2744,6 +2744,7 @@ mod tests {
                     "ctrl.ts",
                     r#"
                     import { BASE, ROUTES, Alias, BOTH, ALIAS, GROUPS } from './routes';
+                    import * as Routes from './routes';
                     const LOCAL = 'local';
                     let MUTABLE = 'old';
                     MUTABLE = 'new';
@@ -2758,6 +2759,7 @@ mod tests {
                         @Get(`v${1 + 1}`) sum() {}
                         @Get(BOTH) both() {}
                         @Get(ALIAS) alias() {}
+                        @Get(Routes.ROUTES.SHORT + '/ns') namespaced() {}
                         @Get(GROUPS.PAIR) pair() {}
                         @Get(UNKNOWN) unknown() {}
                         @Get(MUTABLE) mutable() {}
@@ -2783,6 +2785,7 @@ mod tests {
                 "/things/local/x",
                 "/things/redirect/linxo",
                 "/things/short",
+                "/things/short/ns",
                 "/things/v2",
                 "/things/{id}"
             ]

@@ -43,8 +43,14 @@ fn array(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<Ve
         }
         Expr::Member(_) => {
             let (root, props) = member_chain(expr)?;
-            let (decl_file, c) = project.resolve_const(file, &root)?;
-            array_at(project, &decl_file, c.init(), &props, depth + 1)
+            (0..=props.len()).rev().find_map(|split| {
+                let name = std::iter::once(root.as_str())
+                    .chain(props[..split].iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let (decl_file, c) = project.resolve_const(file, &name)?;
+                array_at(project, &decl_file, c.init(), &props[split..], depth + 1)
+            })
         }
         _ => None,
     }
@@ -143,8 +149,16 @@ fn member(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<E
             .find(|(n, _)| n == last)?
             .1;
     }
-    let (decl_file, c) = project.resolve_const(file, &root)?;
-    walk(project, &decl_file, c.init(), &props, depth + 1)
+    // `CONST.a.b`, or a constant reached through a namespace
+    // (`Routes.LIST.a`): the longest prefix that names a constant wins.
+    (0..=props.len()).rev().find_map(|split| {
+        let name = std::iter::once(root.as_str())
+            .chain(props[..split].iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(".");
+        let (decl_file, c) = project.resolve_const(file, &name)?;
+        walk(project, &decl_file, c.init(), &props[split..], depth + 1)
+    })
 }
 
 /// The value at `props` inside `value`, written in `file`: object literals,

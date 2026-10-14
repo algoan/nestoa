@@ -252,6 +252,46 @@ impl Project {
         ns: &str,
         member: &str,
     ) -> Option<(PathBuf, Symbol)> {
+        match self.namespace_at(file, ns)? {
+            Namespace::Module(module) => {
+                self.resolve_inner(&module, member, true, &mut std::collections::HashSet::new())
+            }
+            Namespace::Block(file, path) => {
+                let block = self.namespace_symbols(&file, &path)?;
+                let symbol = block
+                    .declared
+                    .get(member)
+                    .filter(|_| block.exports(member))?;
+                Some((file, symbol.clone()))
+            }
+        }
+    }
+
+    /// The constant `member` of namespace `ns` (`Routes.LIST`), as
+    /// `resolve_namespace_member` finds types.
+    fn resolve_namespace_const(
+        &self,
+        file: &Path,
+        ns: &str,
+        member: &str,
+    ) -> Option<(PathBuf, ConstInit)> {
+        match self.namespace_at(file, ns)? {
+            Namespace::Module(module) => self.resolve_const_inner(
+                &module,
+                member,
+                true,
+                &mut std::collections::HashSet::new(),
+            ),
+            Namespace::Block(file, path) => {
+                let block = self.namespace_symbols(&file, &path)?;
+                let c = block.consts.get(member).filter(|_| block.exports(member))?;
+                Some((file, c.clone()))
+            }
+        }
+    }
+
+    /// What the possibly dotted namespace name `ns` stands for from `file`.
+    fn namespace_at(&self, file: &Path, ns: &str) -> Option<Namespace> {
         let mut parts = ns.split('.');
         let mut visited = std::collections::HashSet::new();
         let mut namespace = self.resolve_namespace(file, parts.next()?, false, &mut visited)?;
@@ -270,19 +310,7 @@ impl Project {
                 }
             };
         }
-        match namespace {
-            Namespace::Module(module) => {
-                self.resolve_inner(&module, member, true, &mut std::collections::HashSet::new())
-            }
-            Namespace::Block(file, path) => {
-                let block = self.namespace_symbols(&file, &path)?;
-                let symbol = block
-                    .declared
-                    .get(member)
-                    .filter(|_| block.exports(member))?;
-                Some((file, symbol.clone()))
-            }
-        }
+        Some(namespace)
     }
 
     /// The symbols of the `namespace` block at `path` (outermost name first)
@@ -466,7 +494,11 @@ impl Project {
 
     /// The variable `name` refers to in `file`, following imports and
     /// re-exports, with the file declaring it.
+    /// A dotted name (`Routes.LIST`) is a constant of a namespace.
     pub fn resolve_const(&self, file: &Path, name: &str) -> Option<(PathBuf, ConstInit)> {
+        if let Some((ns, member)) = name.rsplit_once('.') {
+            return self.resolve_namespace_const(file, ns, member);
+        }
         let mut visited = std::collections::HashSet::new();
         self.resolve_const_inner(file, name, false, &mut visited)
     }
