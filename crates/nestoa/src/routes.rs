@@ -448,14 +448,21 @@ impl<'a> Extractor<'a> {
             if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                 match parsed {
                     ParsedParam::Routed(rps) => {
-                        // `@Query('a')` twice reads one parameter; OpenAPI
-                        // allows each name once per location.
+                        // `@Query('a')` twice reads one parameter, which OpenAPI
+                        // allows once per location: it must satisfy both.
                         for rp in rps {
-                            if !params
-                                .iter()
-                                .any(|p| p.location == rp.location && p.name == rp.name)
+                            match params
+                                .iter_mut()
+                                .find(|p| p.location == rp.location && p.name == rp.name)
                             {
-                                params.push(rp);
+                                Some(p) => {
+                                    p.required |= rp.required;
+                                    if p.schema != rp.schema {
+                                        p.schema = json!({ "allOf": [p.schema.take(), rp.schema] });
+                                    }
+                                    p.description = p.description.take().or(rp.description);
+                                }
+                                None => params.push(rp),
                             }
                         }
                     }
@@ -785,7 +792,7 @@ impl<'a> Extractor<'a> {
                     return Some(ParsedParam::Ignored);
                 }
             };
-            pipes = pipe_effects(d, |e| {
+            pipes = pipe_effects(d, decorator_arg.is_some(), |e| {
                 literal_json(e).or_else(|| {
                     Some(match crate::constval::value(self.project, file, e)? {
                         crate::symbols::EnumValue::Str(s) => Value::String(s),
@@ -931,7 +938,12 @@ struct PipeEffects {
 
 /// Pipes run in order, so a missing value is only safe if it reaches a
 /// `DefaultValuePipe` without first meeting a parse pipe that rejects it.
-fn pipe_effects(d: &Decorator, default_value: impl Fn(&Expr) -> Option<Value>) -> PipeEffects {
+/// `named`: the first argument is the parameter's name, not a pipe.
+fn pipe_effects(
+    d: &Decorator,
+    named: bool,
+    default_value: impl Fn(&Expr) -> Option<Value>,
+) -> PipeEffects {
     let mut effects = PipeEffects::default();
     let Expr::Call(call) = &*d.expr else {
         return effects;
@@ -940,7 +952,7 @@ fn pipe_effects(d: &Decorator, default_value: impl Fn(&Expr) -> Option<Value>) -
     // The parse pipes a missing value goes through after its default.
     let mut after_default: Vec<Value> = Vec::new();
     let mut default_seen = false;
-    for arg in &call.args {
+    for arg in call.args.iter().skip(usize::from(named)) {
         let (name, args) = match arg.expr.as_ref() {
             Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
             Expr::New(n) => match n.callee.as_ref() {
@@ -2463,6 +2475,37 @@ mod tests {
             [
                 "cannot evaluate the name UNKNOWN of @Query(…); the parameter is left out",
                 "cannot evaluate the name getKey() of @Query(…); the parameter is left out"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parameter_read_twice_satisfies_both_declarations() {
+        let routes = extract_routes(
+            "merged",
+            r#"
+            const ParseIntPipe = 'selector';
+            @Controller('items')
+            export class ItemsController {
+                @Get()
+                list(
+                    @Query() dto: { page?: string },
+                    @Query('page', ParseFloatPipe) page: number,
+                    @Query(ParseIntPipe) value: string,
+                ) {}
+            }
+            "#,
+        );
+        let params: Vec<String> = find(&routes, HttpMethod::Get, "/items")
+            .parameters
+            .iter()
+            .map(|p| format!("{} {} {}", p.name, p.required, p.schema))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                r#"page true {"allOf":[{"type":"string"},{"type":"number"}]}"#,
+                r#"selector true {"type":"string"}"#,
             ]
         );
     }
