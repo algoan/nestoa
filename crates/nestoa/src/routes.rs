@@ -880,6 +880,8 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
         return effects;
     };
     let mut optional_parser = false;
+    // The parse pipes a missing value goes through after its default.
+    let mut after_default: Vec<Value> = Vec::new();
     for arg in &call.args {
         let (name, args) = match arg.expr.as_ref() {
             Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
@@ -905,6 +907,9 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
             "ParseUUIDPipe" => json!({ "type": "string", "format": "uuid" }),
             _ => continue,
         };
+        if effects.required == Some(false) && effects.default.is_some() {
+            after_default.push(schema.clone());
+        }
         effects.schema = Some(schema);
         let optional = matches!(
             args.first().map(|a| a.expr.as_ref()),
@@ -920,11 +925,15 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
     if optional_parser && effects.required.is_none() {
         effects.required = Some(false);
     }
-    // The default goes through the parse pipes after it.
-    if let Some(schema) = &effects.schema
-        && let Some(default) = effects.default.take()
-    {
-        effects.default = parsed_default(default, schema);
+    // The default goes through the parse pipes after it; one inserted after
+    // every parse pipe is documented only if it already has the wire type.
+    if let Some(default) = effects.default.take() {
+        effects.default = match (&effects.schema, after_default.is_empty()) {
+            (Some(schema), true) => {
+                parsed_default(default.clone(), schema).filter(|parsed| *parsed == default)
+            }
+            _ => after_default.iter().try_fold(default, parsed_default),
+        };
     }
     effects
 }
@@ -2334,6 +2343,8 @@ mod tests {
                     @Query('text', new DefaultValuePipe('2'), ParseIntPipe) text: number,
                     @Query('bad', new DefaultValuePipe('x'), ParseIntPipe) bad: number,
                     @Query('dynamic', new DefaultValuePipe(DEFAULT_PAGE)) dynamic: number,
+                    @Query('before', new ParseIntPipe({ optional: true }), new DefaultValuePipe('1')) before: number,
+                    @Query('typed', new ParseIntPipe({ optional: true }), new DefaultValuePipe(1)) typed: number,
                 ) {}
             }
             "#,
@@ -2357,6 +2368,8 @@ mod tests {
                 r#"text false {"type":"integer","default":2}"#,
                 r#"bad false {"type":"integer"}"#,
                 r#"dynamic false {"type":"number"}"#,
+                r#"before false {"type":"integer"}"#,
+                r#"typed false {"type":"integer","default":1}"#,
             ]
         );
     }
@@ -2710,12 +2723,14 @@ mod tests {
                      const NESTED = { DEEP: 'deep' };\n\
                      export const ROUTES = { LIST: 'list', ITEM: { ONE: ':id' }, SHORT, NESTED } as const;\n\
                      export enum Alias { LINXO = 'linxo' }\n\
-                     export const BOTH = ['a', 'b'];",
+                     export const BOTH = ['a', 'b'];\n\
+                     export const ALIAS = BOTH;\n\
+                     export const GROUPS = { PAIR: ['c', 'd'] };",
                 ),
                 (
                     "ctrl.ts",
                     r#"
-                    import { BASE, ROUTES, Alias, BOTH } from './routes';
+                    import { BASE, ROUTES, Alias, BOTH, ALIAS, GROUPS } from './routes';
                     const LOCAL = 'local';
                     let MUTABLE = 'old';
                     MUTABLE = 'new';
@@ -2729,6 +2744,8 @@ mod tests {
                         @Get(LOCAL + '/x') local() {}
                         @Get(`v${1 + 1}`) sum() {}
                         @Get(BOTH) both() {}
+                        @Get(ALIAS) alias() {}
+                        @Get(GROUPS.PAIR) pair() {}
                         @Get(UNKNOWN) unknown() {}
                         @Get(MUTABLE) mutable() {}
                     }
@@ -2743,7 +2760,11 @@ mod tests {
             paths,
             [
                 "/things/a",
+                "/things/a",
                 "/things/b",
+                "/things/b",
+                "/things/c",
+                "/things/d",
                 "/things/deep",
                 "/things/list",
                 "/things/local/x",

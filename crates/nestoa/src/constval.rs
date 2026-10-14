@@ -15,6 +15,19 @@ const MAX_DEPTH: usize = 16;
 
 /// The strings `expr` evaluates to: one, or each element of an array.
 pub fn strings(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<String>> {
+    if let Some(found) = array(project, file, expr, 0) {
+        return Some(found);
+    }
+    string(project, file, expr).map(|s| vec![s])
+}
+
+/// The strings of the array `expr` evaluates to, followed through variables
+/// (`const PATHS = BOTH`) and properties (`ROUTES.BOTH`). `None` when it
+/// isn't an array.
+fn array(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<Vec<String>> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
     match unwrap(expr) {
         Expr::Array(a) => a
             .elems
@@ -26,12 +39,44 @@ pub fn strings(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<String
             .collect(),
         Expr::Ident(i) => {
             let (decl_file, c) = project.resolve_const(file, &i.sym)?;
-            match unwrap(c.init()) {
-                init @ Expr::Array(_) => strings(project, &decl_file, init),
-                _ => string(project, file, expr).map(|s| vec![s]),
-            }
+            array(project, &decl_file, c.init(), depth + 1)
         }
-        _ => string(project, file, expr).map(|s| vec![s]),
+        Expr::Member(_) => {
+            let (root, props) = member_chain(expr)?;
+            let (decl_file, c) = project.resolve_const(file, &root)?;
+            array_at(project, &decl_file, c.init(), &props, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// `array` of the value at `props` inside `value`, as `walk` finds it.
+fn array_at(
+    project: &Project,
+    file: &Path,
+    value: &Expr,
+    props: &[String],
+    depth: usize,
+) -> Option<Vec<String>> {
+    let Some((first, rest)) = props.split_first() else {
+        return array(project, file, value, depth);
+    };
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    match unwrap(value) {
+        Expr::Object(o) => match object_prop(o, first)? {
+            Property::Value(v) => array_at(project, file, v, rest, depth),
+            Property::Shorthand(name) => {
+                let (decl_file, c) = project.resolve_const(file, name)?;
+                array_at(project, &decl_file, c.init(), rest, depth + 1)
+            }
+        },
+        Expr::Ident(i) => {
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            array_at(project, &decl_file, c.init(), props, depth + 1)
+        }
+        _ => None,
     }
 }
 
