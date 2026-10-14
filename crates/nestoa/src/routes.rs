@@ -823,23 +823,38 @@ impl<'a> Extractor<'a> {
                     _ => Some(name),
                 }
             };
-            pipes = pipe_effects(d, decorator_arg.is_some(), pipe_name, |e| {
-                literal_json(crate::constval::unwrap(e))
-                    .or_else(|| {
-                        // `const DEFAULT = true`, which constval doesn't hold.
-                        let Expr::Ident(i) = crate::constval::unwrap(e) else {
-                            return None;
-                        };
-                        let (_, c) = self.project.resolve_const(file, &i.sym)?;
-                        literal_json(crate::constval::unwrap(c.init())).filter(Value::is_boolean)
-                    })
-                    .or_else(|| {
-                        Some(match crate::constval::value(self.project, file, e)? {
-                            crate::symbols::EnumValue::Str(s) => Value::String(s),
-                            crate::symbols::EnumValue::Num(n) => crate::schema::number_json(n),
+            pipes = pipe_effects(
+                d,
+                decorator_arg.is_some(),
+                pipe_name,
+                |e| {
+                    literal_json(crate::constval::unwrap(e))
+                        .or_else(|| {
+                            // `const DEFAULT = true`, which constval doesn't hold.
+                            let Expr::Ident(i) = crate::constval::unwrap(e) else {
+                                return None;
+                            };
+                            let (_, c) = self.project.resolve_const(file, &i.sym)?;
+                            literal_json(crate::constval::unwrap(c.init()))
+                                .filter(Value::is_boolean)
                         })
-                    })
-            });
+                        .or_else(|| {
+                            Some(match crate::constval::value(self.project, file, e)? {
+                                crate::symbols::EnumValue::Str(s) => Value::String(s),
+                                crate::symbols::EnumValue::Num(n) => crate::schema::number_json(n),
+                            })
+                        })
+                },
+                // A parse pipe's `{ optional: true }`, inline or held in a constant.
+                |e| {
+                    let mut holder = None;
+                    crate::globalprefix::options_object(self.project, file, e, &mut holder)
+                        .and_then(|(_, o)| object_value(o, "optional"))
+                        .is_some_and(|v| {
+                            matches!(crate::constval::unwrap(&v), Expr::Lit(Lit::Bool(b)) if b.value)
+                        })
+                },
+            );
             break;
         }
         let location = location?;
@@ -984,6 +999,7 @@ fn pipe_effects(
     named: bool,
     pipe_name: impl Fn(&Expr) -> Option<String>,
     default_value: impl Fn(&Expr) -> Option<Value>,
+    optional_option: impl Fn(&Expr) -> bool,
 ) -> PipeEffects {
     let mut effects = PipeEffects::default();
     let Expr::Call(call) = &*d.expr else {
@@ -1025,11 +1041,7 @@ fn pipe_effects(
             after_default.push(schema.clone());
         }
         effects.schema = Some(schema);
-        let optional = matches!(
-            args.first().map(|a| crate::constval::unwrap(&a.expr)),
-            Some(Expr::Object(options))
-                if matches!(object_value(options, "optional"), Some(Expr::Lit(Lit::Bool(b))) if b.value)
-        );
+        let optional = args.first().is_some_and(|a| optional_option(&a.expr));
         if optional {
             optional_parser = true;
         } else if effects.required.is_none() {
@@ -2500,6 +2512,7 @@ mod tests {
             import { ParseIntPipe as IntPipe, DefaultValuePipe as Default } from '@nestjs/common';
             const BAD = 'x';
             const ON = true;
+            const PIPE_OPTIONS = { optional: true };
             export type Count = number;
             @Controller('items')
             export class ItemsController {
@@ -2527,6 +2540,7 @@ mod tests {
                     @Query('asserted', new DefaultValuePipe(true as const), ParseBoolPipe) asserted: boolean,
                     @Query('wrapped', new ParseIntPipe({ optional: true } as const)) wrapped: number,
                     @Query('aliased', new Default(5), IntPipe) aliased: number,
+                    @Query('held', new ParseIntPipe(PIPE_OPTIONS)) held: number,
                 ) {}
             }
             "#,
@@ -2561,6 +2575,7 @@ mod tests {
                 r#"asserted false {"type":"boolean","default":true}"#,
                 r#"wrapped false {"type":"integer"}"#,
                 r#"aliased false {"type":"integer","default":5}"#,
+                r#"held false {"type":"integer"}"#,
             ]
         );
     }
