@@ -240,7 +240,17 @@ impl<'a> Extractor<'a> {
             base_paths,
             tag,
             interceptors: collect_interceptors(&class.decorators),
-            versions: self.decorator_option(file, &class.decorators, "Controller", "version"),
+            versions: match self.decorator_option(file, &class.decorators, "Controller", "version")
+            {
+                // Like `@Version`, it overrides the default version.
+                Some(None) if self.bootstrap.versioning.is_some() => {
+                    crate::diag::warn(format!(
+                        "{class_name}: cannot evaluate its controller version; its routes are left out"
+                    ));
+                    return;
+                }
+                versions => versions.flatten(),
+            },
             opted_out: has_any_decorator(&class.decorators, &er.auth_opt_out),
             has_roles: has_any_decorator(&class.decorators, &er.role_decorators),
             guarded: has_use_guards(&class.decorators, &er.auth_guards),
@@ -263,6 +273,11 @@ impl<'a> Extractor<'a> {
                     continue;
                 };
                 let name = prop_name_text(&m.key);
+                // NestJS reads handlers off the prototype: statics are neither
+                // routes nor shadow inherited ones.
+                if m.is_static {
+                    continue;
+                }
                 if matches!(m.kind, MethodKind::Method)
                     && m.function.body.is_some()
                     && !seen.contains(&name)
@@ -625,18 +640,19 @@ impl<'a> Extractor<'a> {
     }
 
     /// The versions the `key` option of a `@<decorator>({ ... })` names.
+    /// `None` when the option is absent, `Some(None)` when it can't be read.
     fn decorator_option(
         &self,
         file: &Path,
         decorators: &[Decorator],
         decorator: &str,
         key: &str,
-    ) -> Option<Vec<Version>> {
+    ) -> Option<Option<Vec<Version>>> {
         let d = decorators.iter().find(|d| decorator_name(d) == decorator)?;
         let Expr::Object(o) = first_arg(d)? else {
             return None;
         };
-        versions(self.project, file, object_value(o, key)?)
+        Some(versions(self.project, file, object_value(o, key)?))
     }
 
     /// The path(s) a `@Controller`/verb decorator's first argument names: a
@@ -874,10 +890,12 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
             _ => continue,
         };
         let schema = match name {
+            // A missing value gets the default from here on, whether or not
+            // it can be written down.
             "DefaultValuePipe" => {
                 if effects.required.is_none() {
                     effects.default = args.first().and_then(|a| literal_json(&a.expr));
-                    effects.required = effects.default.is_some().then_some(false);
+                    effects.required = Some(false);
                 }
                 continue;
             }
@@ -2315,6 +2333,7 @@ mod tests {
                     @Query('chain', new ParseIntPipe({ optional: true }), ParseIntPipe) chain: number,
                     @Query('text', new DefaultValuePipe('2'), ParseIntPipe) text: number,
                     @Query('bad', new DefaultValuePipe('x'), ParseIntPipe) bad: number,
+                    @Query('dynamic', new DefaultValuePipe(DEFAULT_PAGE)) dynamic: number,
                 ) {}
             }
             "#,
@@ -2337,6 +2356,7 @@ mod tests {
                 r#"chain true {"type":"integer"}"#,
                 r#"text false {"type":"integer","default":2}"#,
                 r#"bad false {"type":"integer"}"#,
+                r#"dynamic false {"type":"number"}"#,
             ]
         );
     }
@@ -2488,7 +2508,13 @@ mod tests {
                     @Controller('items')
                     export class ItemsController {
                         @Get() @Version(getVersion()) dynamic() {}
+                        static helper() {}
+                        @Get('static') static decorated() {}
                         @Get(':code(\\d+)') byCode(@Param('code') code: Code) {}
+                    }
+                    @Controller({ path: 'other', version: getVersion() })
+                    export class OtherController {
+                        @Get() list() {}
                     }
                     "#,
                 ),
@@ -2504,7 +2530,10 @@ mod tests {
         );
         assert_eq!(
             crate::diag::take_warnings(),
-            ["ItemsController.dynamic: cannot evaluate its @Version; its routes are left out"]
+            [
+                "ItemsController.dynamic: cannot evaluate its @Version; its routes are left out",
+                "OtherController: cannot evaluate its controller version; its routes are left out"
+            ]
         );
     }
 

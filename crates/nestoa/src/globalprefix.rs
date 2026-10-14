@@ -155,6 +155,14 @@ pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Boot
     bootstrap
 }
 
+/// `value`, or a warning that `enableVersioning`'s options can't be read.
+fn unreadable<T>(value: Option<T>) -> Option<T> {
+    if value.is_none() {
+        crate::diag::warn("cannot evaluate enableVersioning's options; paths are left unversioned");
+    }
+    value
+}
+
 /// The arguments of the first `*.<method>(...)` call in `file`.
 fn call_args(project: &Project, file: &Path, method: &'static str) -> Option<Vec<Expr>> {
     let mut finder = CallFinder { method, args: None };
@@ -186,19 +194,15 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
         })) if kind.sym == "URI" => {}
         Some(_) => return None,
     }
+    // A `prefix` or `defaultVersion` that can't be read would put routes on
+    // a path the app doesn't serve: leave paths unversioned instead.
     match object_value(options, "prefix") {
         Some(Expr::Lit(Lit::Bool(b))) if !b.value => versioning.prefix.clear(),
-        Some(e) => {
-            if let Some(prefix) = crate::constval::string(project, file, e) {
-                versioning.prefix = prefix;
-            }
-        }
+        Some(e) => versioning.prefix = unreadable(crate::constval::string(project, file, e))?,
         None => {}
     }
-    if let Some(default) =
-        object_value(options, "defaultVersion").and_then(|e| versions(project, file, e))
-    {
-        versioning.default_versions = default;
+    if let Some(e) = object_value(options, "defaultVersion") {
+        versioning.default_versions = unreadable(versions(project, file, e))?;
     }
     Some(versioning)
 }
@@ -251,12 +255,15 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
         .filter_map(|entry| {
             let (path, method) = match entry.expr.as_ref() {
                 Expr::Object(o) => {
+                    // A method that can't be read drops the exclusion rather
+                    // than widening it to every method.
                     let method = match object_value(o, "method") {
+                        None => None,
                         Some(Expr::Member(MemberExpr {
                             prop: MemberProp::Ident(m),
                             ..
-                        })) if m.sym != "ALL" => Some(m.sym.to_lowercase()),
-                        _ => None,
+                        })) => (m.sym != "ALL").then(|| m.sym.to_lowercase()),
+                        Some(_) => return None,
                     };
                     (
                         crate::constval::string(project, file, object_value(o, "path")?)?,
@@ -698,5 +705,27 @@ mod tests {
         let bootstrap = detect(&project, &files(&project), &root);
         assert!(bootstrap.excludes("get", "/health"));
         assert!(!bootstrap.excludes("get", "/other"));
+    }
+
+    #[test]
+    fn unreadable_options_never_widen_or_guess() {
+        crate::diag::take_warnings();
+        let root = temp_root("unreadable-options");
+        let project = project_from(
+            &root,
+            &[(
+                "src/main.ts",
+                "app.setGlobalPrefix('api', { exclude: [{ path: 'health', method: METHOD }, 'ping'] });\n\
+                 app.enableVersioning({ prefix: getPrefix() });",
+            )],
+        );
+        let bootstrap = detect(&project, &files(&project), &root);
+        assert!(!bootstrap.excludes("post", "/health"));
+        assert!(bootstrap.excludes("post", "/ping"));
+        assert!(bootstrap.versioning.is_none());
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["cannot evaluate enableVersioning's options; paths are left unversioned"]
+        );
     }
 }
