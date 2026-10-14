@@ -92,7 +92,7 @@ impl Bootstrap {
     /// Whether the global prefix is left off `route` (the controller and
     /// method paths, joined) for `method` (lowercase).
     pub fn excludes(&self, method: &str, route: &str) -> bool {
-        let route = crate::routes::openapi_params(route.trim_matches('/'));
+        let route = unnamed_params(route.trim_matches('/'));
         self.exclude.iter().any(|e| {
             let path_matches = if e.wildcard {
                 route == e.path || route.starts_with(&format!("{}/", e.path)) || e.path.is_empty()
@@ -102,6 +102,39 @@ impl Bootstrap {
             path_matches && e.method.as_deref().is_none_or(|m| m == method)
         })
     }
+}
+
+/// `path` with each parameter, whatever its name or constraint, as `:`:
+/// an exclusion of `items/:id` covers a route at `items/:itemId(\\d+)`.
+fn unnamed_params(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != ':' {
+            continue;
+        }
+        while chars
+            .next_if(|n| n.is_ascii_alphanumeric() || *n == '_')
+            .is_some()
+        {}
+        if chars.next_if_eq(&'(').is_some() {
+            let (mut depth, mut escaped) = (1, false);
+            for n in chars.by_ref() {
+                match n {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Scan the discovered `files` for `app.setGlobalPrefix(...)`. A `main.ts`
@@ -241,7 +274,7 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
                 None => (path, false),
             };
             Some(PrefixExclude {
-                path: crate::routes::openapi_params(path),
+                path: unnamed_params(path),
                 wildcard,
                 method,
             })

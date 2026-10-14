@@ -354,18 +354,32 @@ impl<'a> Extractor<'a> {
         // With URI versioning, each version the handler answers adds a
         // segment after the global prefix (`/api/v2/items`).
         let segments: Vec<String> = match &self.bootstrap.versioning {
-            Some(versioning) => m
-                .function
-                .decorators
-                .iter()
-                .find(|d| decorator_name(d) == "Version")
-                .and_then(|d| first_arg(d))
-                .and_then(|e| versions(self.project, file, e))
-                .or_else(|| class.versions.clone())
-                .unwrap_or_else(|| versioning.default_versions.clone())
-                .iter()
-                .map(|v| versioning.segment(v))
-                .collect(),
+            Some(versioning) => {
+                let declared = m
+                    .function
+                    .decorators
+                    .iter()
+                    .find(|d| decorator_name(d) == "Version");
+                // An explicit `@Version` overrides the controller's and the
+                // default, so one that can't be read leaves the routes out.
+                let own = match declared {
+                    Some(d) => match first_arg(d).and_then(|e| versions(self.project, file, e)) {
+                        Some(v) => Some(v),
+                        None => {
+                            crate::diag::warn(format!(
+                                "{handler}: cannot evaluate its @Version; its routes are left out"
+                            ));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                own.or_else(|| class.versions.clone())
+                    .unwrap_or_else(|| versioning.default_versions.clone())
+                    .iter()
+                    .map(|v| versioning.segment(v))
+                    .collect()
+            }
             None => vec![String::new()],
         };
         let mut full_paths: Vec<(HttpMethod, ConcretePath)> = Vec::new();
@@ -888,7 +902,31 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
     if optional_parser && effects.required.is_none() {
         effects.required = Some(false);
     }
+    // The default goes through the parse pipes after it.
+    if let Some(schema) = &effects.schema
+        && let Some(default) = effects.default.take()
+    {
+        effects.default = parsed_default(default, schema);
+    }
     effects
+}
+
+/// `default` as a value of the type a parse pipe produces, if it converts.
+fn parsed_default(default: Value, schema: &Value) -> Option<Value> {
+    let text = match &default {
+        Value::String(s) => s.trim().to_string(),
+        other => other.to_string(),
+    };
+    match schema["type"].as_str()? {
+        "integer" => text.parse::<i64>().ok().map(Value::from),
+        "number" => text.parse::<f64>().ok().map(crate::schema::number_json),
+        "boolean" => match text.as_str() {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => default.as_str().map(|s| Value::String(s.to_string())),
+    }
 }
 
 /// A literal's JSON value.
@@ -1459,9 +1497,13 @@ fn with_patterns(mut params: Vec<RouteParam>, patterns: &[(String, String)]) -> 
     for p in &mut params {
         if p.location == ParamLocation::Path
             && let Some((_, pattern)) = patterns.iter().find(|(name, _)| *name == p.name)
-            && let Some(schema) = p.schema.as_object_mut()
+            && p.schema.is_object()
         {
-            schema.insert("pattern".into(), Value::String(pattern.clone()));
+            // OpenAPI 3.0 ignores every sibling of a `$ref`.
+            if p.schema.get("$ref").is_some() {
+                p.schema = json!({ "allOf": [p.schema.take()] });
+            }
+            p.schema["pattern"] = Value::String(pattern.clone());
         }
     }
     params
@@ -2271,6 +2313,8 @@ mod tests {
                     @Query('late', ParseIntPipe, new DefaultValuePipe(1)) late: number,
                     @Query('marked', ParseIntPipe) marked?: number,
                     @Query('chain', new ParseIntPipe({ optional: true }), ParseIntPipe) chain: number,
+                    @Query('text', new DefaultValuePipe('2'), ParseIntPipe) text: number,
+                    @Query('bad', new DefaultValuePipe('x'), ParseIntPipe) bad: number,
                 ) {}
             }
             "#,
@@ -2291,6 +2335,8 @@ mod tests {
                 r#"late true {"type":"integer"}"#,
                 r#"marked true {"type":"integer"}"#,
                 r#"chain true {"type":"integer"}"#,
+                r#"text false {"type":"integer","default":2}"#,
+                r#"bad false {"type":"integer"}"#,
             ]
         );
     }
@@ -2429,6 +2475,40 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_version_leaves_the_route_out_and_a_ref_pattern_is_wrapped() {
+        crate::diag::take_warnings();
+        let (routes, _) = extract_with(
+            "version-unreadable",
+            &[
+                ("main.ts", "app.enableVersioning({ defaultVersion: '1' });"),
+                (
+                    "ctrl.ts",
+                    r#"
+                    export type Code = string;
+                    @Controller('items')
+                    export class ItemsController {
+                        @Get() @Version(getVersion()) dynamic() {}
+                        @Get(':code(\\d+)') byCode(@Param('code') code: Code) {}
+                    }
+                    "#,
+                ),
+            ],
+            &["main.ts", "ctrl.ts"],
+            crate::config::Config::default(),
+        );
+        assert_eq!(routes.len(), 1);
+        let route = find(&routes, HttpMethod::Get, "/v1/items/{code}");
+        assert_eq!(
+            route.parameters[0].schema,
+            json!({"allOf": [{"$ref": "#/components/schemas/Code"}], "pattern": "^(?:\\d+)$"})
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["ItemsController.dynamic: cannot evaluate its @Version; its routes are left out"]
+        );
+    }
+
+    #[test]
     fn global_prefix_exclude_leaves_routes_unprefixed() {
         let (routes, _) = extract_with(
             "prefix-exclude",
@@ -2444,8 +2524,8 @@ mod tests {
                     @Controller()
                     export class AppController {
                         @Get('health') health() {}
-                        @Get('items/:id') get() {}
-                        @Delete('items/:id') remove() {}
+                        @Get('items/:itemId(\\d+)') get() {}
+                        @Delete('items/:itemId(\\d+)') remove() {}
                         @Get('public/docs/x') docs() {}
                         @Get('other') other() {}
                     }
@@ -2463,10 +2543,10 @@ mod tests {
         assert_eq!(
             found,
             [
-                "delete /api/items/{id}",
+                "delete /api/items/{itemId}",
                 "get /api/other",
                 "get /health",
-                "get /items/{id}",
+                "get /items/{itemId}",
                 "get /public/docs/x",
             ]
         );
