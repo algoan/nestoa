@@ -11,6 +11,7 @@ use swc_ecma_ast::{
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
+use crate::constval::object_value;
 use crate::dialect;
 use crate::errors::{self, ERROR_SCHEMA_NAME};
 use crate::globalprefix::{Bootstrap, Version, versions};
@@ -652,7 +653,7 @@ impl<'a> Extractor<'a> {
         let Expr::Object(o) = first_arg(d)? else {
             return None;
         };
-        Some(versions(self.project, file, object_value(o, key)?))
+        Some(versions(self.project, file, &object_value(o, key)?))
     }
 
     /// The path(s) a `@Controller`/verb decorator's first argument names: a
@@ -667,9 +668,13 @@ impl<'a> Extractor<'a> {
         let Some(arg) = call.args.first() else {
             return Some(Vec::new());
         };
+        let path_option: Expr;
         let expr = match arg.expr.as_ref() {
             Expr::Object(o) => match object_value(o, "path") {
-                Some(path) => path,
+                Some(path) => {
+                    path_option = path;
+                    &path_option
+                }
                 None => return Some(Vec::new()),
             },
             expr => expr,
@@ -1146,17 +1151,6 @@ fn first_arg(d: &Decorator) -> Option<&Expr> {
         return None;
     };
     Some(&call.args.first()?.expr)
-}
-
-/// The value of the `key` property of an object literal.
-fn object_value<'a>(o: &'a swc_ecma_ast::ObjectLit, key: &str) -> Option<&'a Expr> {
-    o.props.iter().find_map(|prop| match prop {
-        swc_ecma_ast::PropOrSpread::Prop(p) => match p.as_ref() {
-            swc_ecma_ast::Prop::KeyValue(kv) if prop_name_text(&kv.key) == key => Some(&*kv.value),
-            _ => None,
-        },
-        _ => None,
-    })
 }
 
 fn numeric_arg(d: &swc_ecma_ast::Decorator) -> Option<u16> {
@@ -2525,6 +2519,12 @@ mod tests {
                         @Get('static') static decorated() {}
                         @Get(':code(\\d+)') byCode(@Param('code') code: Code) {}
                     }
+                    const path = 'short';
+                    const version = '7';
+                    @Controller({ path, version })
+                    export class ShortController {
+                        @Get() list() {}
+                    }
                     @Controller({ path: 'other', version: getVersion() })
                     export class OtherController {
                         @Get() list() {}
@@ -2535,7 +2535,8 @@ mod tests {
             &["main.ts", "ctrl.ts"],
             crate::config::Config::default(),
         );
-        assert_eq!(routes.len(), 1);
+        assert_eq!(routes.len(), 2);
+        find(&routes, HttpMethod::Get, "/v7/short");
         let route = find(&routes, HttpMethod::Get, "/v1/items/{code}");
         assert_eq!(
             route.parameters[0].schema,

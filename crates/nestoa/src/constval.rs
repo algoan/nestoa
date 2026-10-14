@@ -222,6 +222,18 @@ fn object_prop<'a>(o: &'a ObjectLit, name: &str) -> Option<Property<'a>> {
     })
 }
 
+/// The value of an object literal's `key` property: `{ key: value }`, or the
+/// variable a shorthand `{ key }` names.
+pub fn object_value(o: &ObjectLit, key: &str) -> Option<Expr> {
+    match object_prop(o, key)? {
+        Property::Value(v) => Some(v.clone()),
+        Property::Shorthand(name) => Some(Expr::Ident(swc_ecma_ast::Ident::new_no_ctxt(
+            name.into(),
+            swc_common::DUMMY_SP,
+        ))),
+    }
+}
+
 /// `a.b.c` for an identifier or a chain of property accesses.
 pub fn dotted_name(expr: &Expr) -> Option<String> {
     let (root, props) = member_chain(expr)?;

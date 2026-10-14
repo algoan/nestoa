@@ -19,6 +19,7 @@ use swc_ecma_ast::{
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::constval::object_value;
 use crate::parse::ParsedFile;
 use crate::symbols::Project;
 
@@ -65,12 +66,12 @@ pub fn versions(project: &Project, file: &Path, expr: &Expr) -> Option<Vec<Versi
         Expr::Ident(i) if i.sym == "VERSION_NEUTRAL" => Some(None),
         e => crate::constval::string(project, file, e).map(Some),
     };
-    match expr {
+    match crate::constval::unwrap(expr) {
         Expr::Array(a) => a.elems.iter().map(|el| one(&el.as_ref()?.expr)).collect(),
         // `const VERSIONS = ['1', '2']`, evaluated where it is declared.
         Expr::Ident(i) if i.sym != "VERSION_NEUTRAL" => {
             let (decl_file, c) = project.resolve_const(file, &i.sym)?;
-            match c.init() {
+            match crate::constval::unwrap(c.init()) {
                 init @ Expr::Array(_) => versions(project, &decl_file, init),
                 _ => one(expr).map(|v| vec![v]),
             }
@@ -198,11 +199,11 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
     // a path the app doesn't serve: leave paths unversioned instead.
     match object_value(options, "prefix") {
         Some(Expr::Lit(Lit::Bool(b))) if !b.value => versioning.prefix.clear(),
-        Some(e) => versioning.prefix = unreadable(crate::constval::string(project, file, e))?,
+        Some(e) => versioning.prefix = unreadable(crate::constval::string(project, file, &e))?,
         None => {}
     }
     if let Some(e) = object_value(options, "defaultVersion") {
-        versioning.default_versions = unreadable(versions(project, file, e))?;
+        versioning.default_versions = unreadable(versions(project, file, &e))?;
     }
     Some(versioning)
 }
@@ -266,7 +267,7 @@ fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<Prefix
                         Some(_) => return None,
                     };
                     (
-                        crate::constval::string(project, file, object_value(o, "path")?)?,
+                        crate::constval::string(project, file, &object_value(o, "path")?)?,
                         method,
                     )
                 }
@@ -309,20 +310,6 @@ fn options_object<'a>(
         }
         _ => None,
     }
-}
-
-fn object_value<'a>(o: &'a swc_ecma_ast::ObjectLit, key: &str) -> Option<&'a Expr> {
-    o.props.iter().find_map(|prop| match prop {
-        swc_ecma_ast::PropOrSpread::Prop(p) => match p.as_ref() {
-            swc_ecma_ast::Prop::KeyValue(kv) => match &kv.key {
-                swc_ecma_ast::PropName::Ident(i) if i.sym == key => Some(&*kv.value),
-                swc_ecma_ast::PropName::Str(s) if s.value == key => Some(&*kv.value),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    })
 }
 
 /// Visitor that captures the arguments of the first `*.<method>(...)` call
@@ -590,7 +577,7 @@ mod tests {
             &consts,
             &[(
                 "src/main.ts",
-                "const VERSIONS = ['1', VERSION_NEUTRAL];\napp.enableVersioning({ defaultVersion: VERSIONS });",
+                "const VERSIONS = ['1', VERSION_NEUTRAL] satisfies VersionValue[];\napp.enableVersioning({ defaultVersion: VERSIONS });",
             )],
         );
         let versioning = detect(&project, &files(&project), &consts)
