@@ -1085,21 +1085,16 @@ fn literal_json(expr: &Expr) -> Option<Value> {
     }
 }
 
-/// The schema of a parameter two declarations read. Both must hold, unless
-/// their types conflict: the wire value is a string either way, and a
-/// non-string type is what a parse pipe turns it into, so that one wins.
+/// The schema of a parameter two declarations read. Both must hold, except
+/// that a `string` gives way to another type: the wire value is a string
+/// either way, and the other type is what a parse pipe turns it into.
 fn merged_param_schema(first: Value, second: Value) -> Value {
     if first == second {
         return first;
     }
     match (first["type"].as_str(), second["type"].as_str()) {
-        (Some(a), Some(b)) if a != b => {
-            if a == "string" {
-                second
-            } else {
-                first
-            }
-        }
+        (Some("string"), Some(b)) if b != "string" => second,
+        (Some(a), Some("string")) if a != "string" => first,
         _ => json!({ "allOf": [first, second] }),
     }
 }
@@ -2565,6 +2560,7 @@ mod tests {
                 list(
                     @Query() dto: { page?: string },
                     @Query('page', ParseFloatPipe) page: number,
+                    @Query('page', ParseIntPipe) again: number,
                     @Query(ParseIntPipe) value: string,
                 ) {}
             }
@@ -2578,7 +2574,7 @@ mod tests {
         assert_eq!(
             params,
             [
-                r#"page true {"type":"number"}"#,
+                r#"page true {"allOf":[{"type":"number"},{"type":"integer"}]}"#,
                 r#"selector true {"type":"string"}"#,
             ]
         );
