@@ -374,7 +374,14 @@ pub(crate) fn options_object<'a>(
     match crate::constval::unwrap(arg) {
         Expr::Object(o) => Some((file.to_path_buf(), o)),
         Expr::Ident(i) => {
-            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            // Follow aliases (`const OPTIONS = BASE`) to the object.
+            let (mut decl_file, mut c) = project.resolve_const(file, &i.sym)?;
+            for _ in 0..16 {
+                let Expr::Ident(next) = crate::constval::unwrap(c.init()) else {
+                    break;
+                };
+                (decl_file, c) = project.resolve_const(&decl_file, &next.sym)?;
+            }
             match crate::constval::unwrap(holder.insert(c).init()) {
                 Expr::Object(o) => Some((decl_file, o)),
                 _ => None,
@@ -830,7 +837,8 @@ mod tests {
                 ),
                 (
                     "src/main.ts",
-                    "import { EXCLUDES } from './excludes';\napp.setGlobalPrefix('api', { exclude: EXCLUDES });",
+                    "import { EXCLUDES } from './excludes';\nconst BASE = { exclude: EXCLUDES };\n\
+                     const OPTIONS = BASE;\napp.setGlobalPrefix('api', OPTIONS);",
                 ),
             ],
         );
