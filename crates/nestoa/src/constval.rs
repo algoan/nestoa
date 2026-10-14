@@ -86,6 +86,11 @@ fn array_at(
     }
 }
 
+/// The string or number `expr` evaluates to.
+pub fn value(project: &Project, file: &Path, expr: &Expr) -> Option<EnumValue> {
+    eval(project, file, expr, 0)
+}
+
 /// The string `expr` evaluates to.
 pub fn string(project: &Project, file: &Path, expr: &Expr) -> Option<String> {
     eval(project, file, expr, 0).map(text)

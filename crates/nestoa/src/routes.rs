@@ -706,7 +706,7 @@ impl<'a> Extractor<'a> {
         }
         // A pipe given in place of the name: `@Query(new ValidationPipe())`.
         let pipe = match crate::constval::unwrap(arg) {
-            Expr::New(_) | Expr::Call(_) => true,
+            Expr::New(_) => true,
             Expr::Ident(i) => {
                 i.sym.ends_with("Pipe")
                     || matches!(
@@ -785,7 +785,14 @@ impl<'a> Extractor<'a> {
                     return Some(ParsedParam::Ignored);
                 }
             };
-            pipes = pipe_effects(d);
+            pipes = pipe_effects(d, |e| {
+                literal_json(e).or_else(|| {
+                    Some(match crate::constval::value(self.project, file, e)? {
+                        crate::symbols::EnumValue::Str(s) => Value::String(s),
+                        crate::symbols::EnumValue::Num(n) => crate::schema::number_json(n),
+                    })
+                })
+            });
             break;
         }
         let location = location?;
@@ -820,9 +827,13 @@ impl<'a> Extractor<'a> {
         });
         if let Some(default) = &pipes.default
             && pipes.required == Some(false)
-            && let Some(o) = schema.as_object_mut()
+            && schema.is_object()
         {
-            o.insert("default".into(), default.clone());
+            // OpenAPI 3.0 ignores every sibling of a `$ref`.
+            if schema.get("$ref").is_some() {
+                schema = json!({ "allOf": [schema.take()] });
+            }
+            schema["default"] = default.clone();
         }
         let pat_info = PatInfo {
             optional: pipes.required.map_or(pat_info.optional, |r| !r),
@@ -920,7 +931,7 @@ struct PipeEffects {
 
 /// Pipes run in order, so a missing value is only safe if it reaches a
 /// `DefaultValuePipe` without first meeting a parse pipe that rejects it.
-fn pipe_effects(d: &Decorator) -> PipeEffects {
+fn pipe_effects(d: &Decorator, default_value: impl Fn(&Expr) -> Option<Value>) -> PipeEffects {
     let mut effects = PipeEffects::default();
     let Expr::Call(call) = &*d.expr else {
         return effects;
@@ -928,6 +939,7 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
     let mut optional_parser = false;
     // The parse pipes a missing value goes through after its default.
     let mut after_default: Vec<Value> = Vec::new();
+    let mut default_seen = false;
     for arg in &call.args {
         let (name, args) = match arg.expr.as_ref() {
             Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
@@ -942,8 +954,9 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
             // it can be written down.
             "DefaultValuePipe" => {
                 if effects.required.is_none() {
-                    effects.default = args.first().and_then(|a| literal_json(&a.expr));
+                    effects.default = args.first().and_then(|a| default_value(&a.expr));
                     effects.required = Some(false);
+                    default_seen = true;
                 }
                 continue;
             }
@@ -953,7 +966,7 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
             "ParseUUIDPipe" => json!({ "type": "string", "format": "uuid" }),
             _ => continue,
         };
-        if effects.required == Some(false) && effects.default.is_some() {
+        if default_seen {
             after_default.push(schema.clone());
         }
         effects.schema = Some(schema);
@@ -970,6 +983,11 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
     }
     if optional_parser && effects.required.is_none() {
         effects.required = Some(false);
+    }
+    // A default that can't be read may be rejected by the parse pipes after
+    // it: then only the parameter's `?` can tell.
+    if default_seen && effects.default.is_none() && !after_default.is_empty() {
+        effects.required = None;
     }
     // The default goes through the parse pipes after it; one inserted after
     // every parse pipe is documented only if it already has the wire type.
@@ -2359,6 +2377,8 @@ mod tests {
         let routes = extract_routes(
             "pipes",
             r#"
+            const BAD = 'x';
+            export type Count = number;
             @Controller('items')
             export class ItemsController {
                 @Get(':id')
@@ -2374,6 +2394,9 @@ mod tests {
                     @Query('text', new DefaultValuePipe('2'), ParseIntPipe) text: number,
                     @Query('bad', new DefaultValuePipe('x'), ParseIntPipe) bad: number,
                     @Query('dynamic', new DefaultValuePipe(DEFAULT_PAGE)) dynamic: number,
+                    @Query('unknown', new DefaultValuePipe(DEFAULT_PAGE), ParseIntPipe) unknown: number,
+                    @Query('known', new DefaultValuePipe(BAD), ParseIntPipe) known: number,
+                    @Query('alias', new DefaultValuePipe(3)) alias: Count,
                     @Query('before', new ParseIntPipe({ optional: true }), new DefaultValuePipe('1')) before: number,
                     @Query('typed', new ParseIntPipe({ optional: true }), new DefaultValuePipe(1)) typed: number,
                 ) {}
@@ -2399,6 +2422,9 @@ mod tests {
                 r#"text false {"type":"integer","default":2}"#,
                 r#"bad true {"type":"integer"}"#,
                 r#"dynamic false {"type":"number"}"#,
+                r#"unknown true {"type":"integer"}"#,
+                r#"known true {"type":"integer"}"#,
+                r##"alias false {"allOf":[{"$ref":"#/components/schemas/Count"}],"default":3}"##,
                 r#"before false {"type":"integer"}"#,
                 r#"typed false {"type":"integer","default":1}"#,
             ]
@@ -2421,6 +2447,7 @@ mod tests {
                     @Query(KEYS.PAGE) page: string,
                     @Query(new ValidationPipe()) all: { q: string },
                     @Query(UNKNOWN) lost: string,
+                    @Query(getKey()) computed: string,
                 ) {}
             }
             "#,
@@ -2433,7 +2460,10 @@ mod tests {
         assert_eq!(names, ["x-request-id", "page", "q"]);
         assert_eq!(
             crate::diag::take_warnings(),
-            ["cannot evaluate the name UNKNOWN of @Query(…); the parameter is left out"]
+            [
+                "cannot evaluate the name UNKNOWN of @Query(…); the parameter is left out",
+                "cannot evaluate the name getKey() of @Query(…); the parameter is left out"
+            ]
         );
     }
 
