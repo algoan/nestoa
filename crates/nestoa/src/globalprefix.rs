@@ -134,6 +134,7 @@ fn unnamed_params(path: &str) -> String {
                 }
             }
         }
+        chars.next_if_eq(&'?');
     }
     out
 }
@@ -265,7 +266,7 @@ fn unreadable_exclude() -> Vec<PrefixExclude> {
 fn prefix_excludes(project: &Project, file: &Path, options: &Expr) -> Vec<PrefixExclude> {
     let mut holder = None;
     let Some((file, options)) = options_object(project, file, options, &mut holder) else {
-        return Vec::new();
+        return unreadable_exclude();
     };
     let Some(exclude) = object_value(options, "exclude") else {
         return Vec::new();
@@ -752,13 +753,14 @@ mod tests {
             &root,
             &[(
                 "src/main.ts",
-                "app.setGlobalPrefix('api', { exclude: [{ path: 'health', method: METHOD }, 'ping', DYNAMIC] });\n\
+                "app.setGlobalPrefix('api', { exclude: [{ path: 'health', method: METHOD }, 'ping', 'items/:id', DYNAMIC] });\n\
                  app.enableVersioning({ prefix: getPrefix() });",
             )],
         );
         let bootstrap = detect(&project, &files(&project), &root, true);
         assert!(!bootstrap.excludes("post", "/health"));
         assert!(bootstrap.excludes("post", "/ping"));
+        assert!(bootstrap.excludes("get", "/items/:itemId?"));
         assert!(bootstrap.versioning.is_none());
         assert_eq!(
             crate::diag::take_warnings(),

@@ -798,12 +798,21 @@ impl<'a> Extractor<'a> {
                 }
             };
             pipes = pipe_effects(d, decorator_arg.is_some(), |e| {
-                literal_json(e).or_else(|| {
-                    Some(match crate::constval::value(self.project, file, e)? {
-                        crate::symbols::EnumValue::Str(s) => Value::String(s),
-                        crate::symbols::EnumValue::Num(n) => crate::schema::number_json(n),
+                literal_json(e)
+                    .or_else(|| {
+                        // `const DEFAULT = true`, which constval doesn't hold.
+                        let Expr::Ident(i) = crate::constval::unwrap(e) else {
+                            return None;
+                        };
+                        let (_, c) = self.project.resolve_const(file, &i.sym)?;
+                        literal_json(crate::constval::unwrap(c.init())).filter(Value::is_boolean)
                     })
-                })
+                    .or_else(|| {
+                        Some(match crate::constval::value(self.project, file, e)? {
+                            crate::symbols::EnumValue::Str(s) => Value::String(s),
+                            crate::symbols::EnumValue::Num(n) => crate::schema::number_json(n),
+                        })
+                    })
             });
             break;
         }
@@ -1042,7 +1051,12 @@ fn parsed_default(default: Value, schema: &Value) -> Option<Value> {
     };
     match schema["type"].as_str()? {
         "integer" => text.parse::<i64>().ok().map(Value::from),
-        "number" => text.parse::<f64>().ok().map(crate::schema::number_json),
+        // `NaN` and `Infinity` parse, but the pipe rejects them.
+        "number" => text
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(crate::schema::number_json),
         "boolean" => match text.as_str() {
             "true" => Some(Value::Bool(true)),
             "false" => Some(Value::Bool(false)),
@@ -1680,10 +1694,16 @@ fn warn_param_name_conflicts<'a>(paths: impl Iterator<Item = &'a String>) {
     }
 }
 
+/// A property's static name; a computed key counts when it is a string
+/// literal (`['list']`). Empty otherwise.
 fn prop_name_text(key: &PropName) -> String {
     match key {
         PropName::Ident(i) => i.sym.to_string(),
         PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        PropName::Computed(c) => match crate::constval::unwrap(&c.expr) {
+            Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
+            _ => String::new(),
+        },
         _ => String::new(),
     }
 }
@@ -2409,6 +2429,7 @@ mod tests {
             "pipes",
             r#"
             const BAD = 'x';
+            const ON = true;
             export type Count = number;
             @Controller('items')
             export class ItemsController {
@@ -2431,6 +2452,8 @@ mod tests {
                     @Query('before', new ParseIntPipe({ optional: true }), new DefaultValuePipe('1')) before: number,
                     @Query('typed', new ParseIntPipe({ optional: true }), new DefaultValuePipe(1)) typed: number,
                     @Query('qualified', Common.ParseIntPipe) qualified: string,
+                    @Query('flag', new DefaultValuePipe(ON), ParseBoolPipe) flag: boolean,
+                    @Query('nan', new DefaultValuePipe('NaN'), ParseFloatPipe) nan: number,
                 ) {}
             }
             "#,
@@ -2460,6 +2483,8 @@ mod tests {
                 r#"before false {"type":"integer"}"#,
                 r#"typed false {"type":"integer","default":1}"#,
                 r#"qualified true {"type":"integer"}"#,
+                r#"flag false {"type":"boolean","default":true}"#,
+                r#"nan true {"type":"number"}"#,
             ]
         );
     }
@@ -2781,7 +2806,9 @@ mod tests {
                      @Controller('cycle') export class CycleController extends A { @Get() own() {} }\n\
                      @Controller('qualified') export class QualifiedController extends Base.L0 {}\n\
                      export class Computed { @Get('list') ['list']() {} }\n\
-                     @Controller('computed') export class ComputedController extends Computed { ['local']() {} }",
+                     @Controller('computed') export class ComputedController extends Computed { ['local']() {} }\n\
+                     export class Shadowed { @Get('old') ['same']() {} }\n\
+                     @Controller('shadow') export class ShadowController extends Shadowed { @Get('new') ['same']() {} }",
                 ),
             ],
             "ctrl.ts",
@@ -2790,6 +2817,8 @@ mod tests {
         find(&routes, HttpMethod::Get, "/cycle");
         find(&routes, HttpMethod::Get, "/qualified/deepest");
         find(&routes, HttpMethod::Get, "/computed/list");
+        find(&routes, HttpMethod::Get, "/shadow/new");
+        assert!(!routes.iter().any(|r| r.path == "/shadow/old"));
     }
 
     #[test]
