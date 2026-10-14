@@ -714,12 +714,14 @@ impl<'a> Extractor<'a> {
         // A pipe given in place of the name: `@Query(new ValidationPipe())`.
         let pipe = match crate::constval::unwrap(arg) {
             Expr::New(_) => true,
-            Expr::Ident(i) => {
-                i.sym.ends_with("Pipe")
-                    || matches!(
-                        self.project.resolve(file, &i.sym),
-                        Some((_, crate::symbols::Symbol::Class(_)))
-                    )
+            e @ (Expr::Ident(_) | Expr::Member(_)) => {
+                class_name(e).is_some_and(|n| n.ends_with("Pipe"))
+                    || crate::constval::dotted_name(e).is_some_and(|n| {
+                        matches!(
+                            self.project.resolve(file, &n),
+                            Some((_, crate::symbols::Symbol::Class(_)))
+                        )
+                    })
             }
             _ => false,
         };
@@ -953,14 +955,16 @@ fn pipe_effects(
     let mut after_default: Vec<Value> = Vec::new();
     let mut default_seen = false;
     for arg in call.args.iter().skip(usize::from(named)) {
-        let (name, args) = match arg.expr.as_ref() {
-            Expr::Ident(i) => (i.sym.as_ref(), &[][..]),
-            Expr::New(n) => match n.callee.as_ref() {
-                Expr::Ident(i) => (i.sym.as_ref(), n.args.as_deref().unwrap_or_default()),
-                _ => continue,
-            },
-            _ => continue,
+        // `ParseIntPipe`, `new ParseIntPipe(...)`, or through a namespace
+        // (`Common.ParseIntPipe`).
+        let (class, args) = match arg.expr.as_ref() {
+            Expr::New(n) => (&*n.callee, n.args.as_deref().unwrap_or_default()),
+            e => (e, &[][..]),
         };
+        let Some(name) = class_name(class) else {
+            continue;
+        };
+        let name = name.as_str();
         let schema = match name {
             // A missing value gets the default from here on, whether or not
             // it can be written down.
@@ -1019,6 +1023,12 @@ fn pipe_effects(
         };
     }
     effects
+}
+
+/// The class an expression names, by its last segment: `ParseIntPipe` for
+/// `ParseIntPipe` or `Common.ParseIntPipe`.
+fn class_name(expr: &Expr) -> Option<String> {
+    crate::constval::dotted_name(expr).map(|n| n.rsplit('.').next().unwrap_or_default().to_string())
 }
 
 /// `default` as a value of the type a parse pipe produces, if it converts.
@@ -1567,8 +1577,10 @@ fn expand_optional_params(path: &str) -> Vec<(String, Vec<(String, String)>)> {
             }
         }
         if optional {
+            // The separator before an omitted parameter goes with it:
+            // `/:id?` and `:file.:ext?`.
             for (p, _) in &mut variants {
-                if p.ends_with('/') {
+                if p.ends_with(['/', '.']) {
                     p.pop();
                 }
             }
@@ -2001,6 +2013,10 @@ mod tests {
             ["/items/{id}", "/items"]
         );
         assert_eq!(
+            concrete(None, "files", Some(":file.:ext?")),
+            ["/files/{file}.{ext}", "/files/{file}"]
+        );
+        assert_eq!(
             concrete(None, "users", Some("{/:id}/posts")),
             ["/users/{id}/posts", "/users/posts"]
         );
@@ -2411,6 +2427,7 @@ mod tests {
                     @Query('alias', new DefaultValuePipe(3)) alias: Count,
                     @Query('before', new ParseIntPipe({ optional: true }), new DefaultValuePipe('1')) before: number,
                     @Query('typed', new ParseIntPipe({ optional: true }), new DefaultValuePipe(1)) typed: number,
+                    @Query('qualified', Common.ParseIntPipe) qualified: string,
                 ) {}
             }
             "#,
@@ -2439,6 +2456,7 @@ mod tests {
                 r##"alias false {"allOf":[{"$ref":"#/components/schemas/Count"}],"default":3}"##,
                 r#"before false {"type":"integer"}"#,
                 r#"typed false {"type":"integer","default":1}"#,
+                r#"qualified true {"type":"integer"}"#,
             ]
         );
     }
