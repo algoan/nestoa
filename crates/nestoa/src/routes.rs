@@ -460,9 +460,7 @@ impl<'a> Extractor<'a> {
                             {
                                 Some(p) => {
                                     p.required |= rp.required;
-                                    if p.schema != rp.schema {
-                                        p.schema = json!({ "allOf": [p.schema.take(), rp.schema] });
-                                    }
+                                    p.schema = merged_param_schema(p.schema.take(), rp.schema);
                                     p.description = p.description.take().or(rp.description);
                                 }
                                 None => params.push(rp),
@@ -798,7 +796,7 @@ impl<'a> Extractor<'a> {
                 }
             };
             pipes = pipe_effects(d, decorator_arg.is_some(), |e| {
-                literal_json(e)
+                literal_json(crate::constval::unwrap(e))
                     .or_else(|| {
                         // `const DEFAULT = true`, which constval doesn't hold.
                         let Expr::Ident(i) = crate::constval::unwrap(e) else {
@@ -999,7 +997,7 @@ fn pipe_effects(
         }
         effects.schema = Some(schema);
         let optional = matches!(
-            args.first().map(|a| a.expr.as_ref()),
+            args.first().map(|a| crate::constval::unwrap(&a.expr)),
             Some(Expr::Object(options))
                 if matches!(object_value(options, "optional"), Some(Expr::Lit(Lit::Bool(b))) if b.value)
         );
@@ -1077,6 +1075,25 @@ fn literal_json(expr: &Expr) -> Option<Value> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The schema of a parameter two declarations read. Both must hold, unless
+/// their types conflict: the wire value is a string either way, and a
+/// non-string type is what a parse pipe turns it into, so that one wins.
+fn merged_param_schema(first: Value, second: Value) -> Value {
+    if first == second {
+        return first;
+    }
+    match (first["type"].as_str(), second["type"].as_str()) {
+        (Some(a), Some(b)) if a != b => {
+            if a == "string" {
+                second
+            } else {
+                first
+            }
+        }
+        _ => json!({ "allOf": [first, second] }),
     }
 }
 
@@ -2454,6 +2471,8 @@ mod tests {
                     @Query('qualified', Common.ParseIntPipe) qualified: string,
                     @Query('flag', new DefaultValuePipe(ON), ParseBoolPipe) flag: boolean,
                     @Query('nan', new DefaultValuePipe('NaN'), ParseFloatPipe) nan: number,
+                    @Query('asserted', new DefaultValuePipe(true as const), ParseBoolPipe) asserted: boolean,
+                    @Query('wrapped', new ParseIntPipe({ optional: true } as const)) wrapped: number,
                 ) {}
             }
             "#,
@@ -2485,6 +2504,8 @@ mod tests {
                 r#"qualified true {"type":"integer"}"#,
                 r#"flag false {"type":"boolean","default":true}"#,
                 r#"nan true {"type":"number"}"#,
+                r#"asserted false {"type":"boolean","default":true}"#,
+                r#"wrapped false {"type":"integer"}"#,
             ]
         );
     }
@@ -2550,7 +2571,7 @@ mod tests {
         assert_eq!(
             params,
             [
-                r#"page true {"allOf":[{"type":"string"},{"type":"number"}]}"#,
+                r#"page true {"type":"number"}"#,
                 r#"selector true {"type":"string"}"#,
             ]
         );
