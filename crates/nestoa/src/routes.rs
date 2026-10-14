@@ -650,7 +650,7 @@ impl<'a> Extractor<'a> {
         key: &str,
     ) -> Option<Option<Vec<Version>>> {
         let d = decorators.iter().find(|d| decorator_name(d) == decorator)?;
-        let Expr::Object(o) = first_arg(d)? else {
+        let Expr::Object(o) = crate::constval::unwrap(first_arg(d)?) else {
             return None;
         };
         Some(versions(self.project, file, &object_value(o, key)?))
@@ -669,7 +669,7 @@ impl<'a> Extractor<'a> {
             return Some(Vec::new());
         };
         let path_option: Expr;
-        let expr = match arg.expr.as_ref() {
+        let expr = match crate::constval::unwrap(&arg.expr) {
             Expr::Object(o) => match object_value(o, "path") {
                 Some(path) => {
                     path_option = path;
@@ -937,7 +937,14 @@ fn pipe_effects(d: &Decorator) -> PipeEffects {
             (Some(schema), true) => {
                 parsed_default(default.clone(), schema).filter(|parsed| *parsed == default)
             }
-            _ => after_default.iter().try_fold(default, parsed_default),
+            _ => {
+                let parsed = after_default.iter().try_fold(default, parsed_default);
+                // A pipe after the default rejects it: a missing value fails.
+                if parsed.is_none() {
+                    effects.required = Some(true);
+                }
+                parsed
+            }
         };
     }
     effects
@@ -2360,7 +2367,7 @@ mod tests {
                 r#"marked true {"type":"integer"}"#,
                 r#"chain true {"type":"integer"}"#,
                 r#"text false {"type":"integer","default":2}"#,
-                r#"bad false {"type":"integer"}"#,
+                r#"bad true {"type":"integer"}"#,
                 r#"dynamic false {"type":"number"}"#,
                 r#"before false {"type":"integer"}"#,
                 r#"typed false {"type":"integer","default":1}"#,
@@ -2525,6 +2532,10 @@ mod tests {
                     export class ShortController {
                         @Get() list() {}
                     }
+                    @Controller({ path: 'wrapped', version: '8' } as const)
+                    export class WrappedController {
+                        @Get() list() {}
+                    }
                     @Controller({ path: 'other', version: getVersion() })
                     export class OtherController {
                         @Get() list() {}
@@ -2535,8 +2546,9 @@ mod tests {
             &["main.ts", "ctrl.ts"],
             crate::config::Config::default(),
         );
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         find(&routes, HttpMethod::Get, "/v7/short");
+        find(&routes, HttpMethod::Get, "/v8/wrapped");
         let route = find(&routes, HttpMethod::Get, "/v1/items/{code}");
         assert_eq!(
             route.parameters[0].schema,

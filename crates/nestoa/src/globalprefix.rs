@@ -219,11 +219,17 @@ fn global_prefix(project: &Project, files: &[&PathBuf], project_root: &Path) -> 
         };
         parsed.module.visit_with(&mut finder);
         let Some(args) = finder.args else { continue };
+        // The first call decides: one that can't be read leaves routes
+        // unprefixed rather than taking another file's prefix.
         let Some(prefix) = args
             .first()
             .and_then(|arg| resolve_prefix_expr(arg, parsed, project, project_root))
         else {
-            continue;
+            crate::diag::warn(format!(
+                "{}: cannot evaluate setGlobalPrefix's prefix; routes are left unprefixed",
+                file.display()
+            ));
+            return Bootstrap::default();
         };
         let exclude = args
             .get(1)
@@ -714,5 +720,20 @@ mod tests {
             crate::diag::take_warnings(),
             ["cannot evaluate enableVersioning's options; paths are left unversioned"]
         );
+    }
+
+    #[test]
+    fn an_unreadable_prefix_in_main_ts_is_not_replaced() {
+        crate::diag::take_warnings();
+        let root = temp_root("prefix-unreadable");
+        let project = project_from(
+            &root,
+            &[
+                ("src/main.ts", "app.setGlobalPrefix(getPrefix());"),
+                ("src/other.ts", "app.setGlobalPrefix('other');"),
+            ],
+        );
+        assert_eq!(detect(&project, &files(&project), &root).prefix, None);
+        assert_eq!(crate::diag::take_warnings().len(), 1);
     }
 }
