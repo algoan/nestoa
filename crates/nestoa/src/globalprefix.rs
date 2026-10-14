@@ -142,7 +142,14 @@ fn unnamed_params(path: &str) -> String {
 /// is tried first, then the others in sorted order. Files pulled in only
 /// for type resolution (workspace libs, packages) are never scanned: a test
 /// helper in a lib may set a prefix of its own.
-pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Bootstrap {
+/// `with_prefix: false` skips the global prefix (and its warnings), for a
+/// config that sets `basePath` or turns prefix detection off.
+pub fn detect(
+    project: &Project,
+    files: &[PathBuf],
+    project_root: &Path,
+    with_prefix: bool,
+) -> Bootstrap {
     let mut files: Vec<&PathBuf> = files.iter().collect();
     files.sort_by_key(|f| (f.file_name().is_none_or(|n| n != "main.ts"), *f));
     // The first `enableVersioning` call decides, even one that leaves paths
@@ -151,7 +158,11 @@ pub fn detect(project: &Project, files: &[PathBuf], project_root: &Path) -> Boot
         .iter()
         .find_map(|f| Some((*f, call_args(project, f, "enableVersioning")?)))
         .and_then(|(f, args)| uri_versioning(project, f, &args));
-    let mut bootstrap = global_prefix(project, &files, project_root);
+    let mut bootstrap = if with_prefix {
+        global_prefix(project, &files, project_root)
+    } else {
+        Bootstrap::default()
+    };
     bootstrap.versioning = versioning;
     bootstrap
 }
@@ -496,7 +507,9 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect(&project, &files(&project), &root).prefix.as_deref(),
+            detect(&project, &files(&project), &root, true)
+                .prefix
+                .as_deref(),
             Some("api")
         );
     }
@@ -512,7 +525,9 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect(&project, &files(&project), &root).prefix.as_deref(),
+            detect(&project, &files(&project), &root, true)
+                .prefix
+                .as_deref(),
             Some("v2")
         );
     }
@@ -534,7 +549,9 @@ mod tests {
             )],
         );
         assert_eq!(
-            detect(&project, &files(&project), &root).prefix.as_deref(),
+            detect(&project, &files(&project), &root, true)
+                .prefix
+                .as_deref(),
             Some("v2")
         );
     }
@@ -549,7 +566,7 @@ mod tests {
                 "import { settings } from './local';\nasync function bootstrap() { app.setGlobalPrefix(settings.prefix); }",
             )],
         );
-        assert_eq!(detect(&project, &files(&project), &root).prefix, None);
+        assert_eq!(detect(&project, &files(&project), &root, true).prefix, None);
     }
 
     #[test]
@@ -565,11 +582,11 @@ mod tests {
         );
         let entry = [root.join("src/a-setup.ts"), root.join("src/main.ts")];
         assert_eq!(
-            detect(&project, &entry, &root).prefix.as_deref(),
+            detect(&project, &entry, &root, true).prefix.as_deref(),
             Some("api")
         );
         assert_eq!(
-            detect(&project, &entry[..1], &root).prefix.as_deref(),
+            detect(&project, &entry[..1], &root, true).prefix.as_deref(),
             Some("setup")
         );
     }
@@ -584,7 +601,7 @@ mod tests {
                 "app.enableVersioning({ type: VersioningType.URI, prefix: 'ver', defaultVersion: ['1', VERSION_NEUTRAL] });",
             )],
         );
-        let versioning = detect(&project, &files(&project), &root)
+        let versioning = detect(&project, &files(&project), &root, true)
             .versioning
             .expect("URI versioning");
         assert_eq!(versioning.prefix, "ver");
@@ -598,7 +615,7 @@ mod tests {
                 "const VERSIONS = ['1', VERSION_NEUTRAL] satisfies VersionValue[];\napp.enableVersioning({ defaultVersion: VERSIONS });",
             )],
         );
-        let versioning = detect(&project, &files(&project), &consts)
+        let versioning = detect(&project, &files(&project), &consts, true)
             .versioning
             .unwrap();
         assert_eq!(versioning.default_versions, [Some("1".to_string()), None]);
@@ -612,7 +629,7 @@ mod tests {
             )],
         );
         assert!(
-            detect(&project, &files(&project), &header)
+            detect(&project, &files(&project), &header, true)
                 .versioning
                 .is_none()
         );
@@ -626,7 +643,7 @@ mod tests {
                  app.enableVersioning(uri);",
             )],
         );
-        let detected = detect(&project, &files(&project), &through_variable);
+        let detected = detect(&project, &files(&project), &through_variable, true);
         assert_eq!(
             detected.versioning.map(|v| v.prefix).as_deref(),
             Some("ver")
@@ -641,7 +658,7 @@ mod tests {
             )],
         );
         assert!(
-            detect(&project, &files(&project), &unreadable)
+            detect(&project, &files(&project), &unreadable, true)
                 .versioning
                 .is_none()
         );
@@ -650,7 +667,7 @@ mod tests {
             &[("src/main.ts", "function f(o) { app.enableVersioning(o); }")],
         );
         assert!(
-            detect(&project, &files(&project), &unreadable)
+            detect(&project, &files(&project), &unreadable, true)
                 .versioning
                 .is_none()
         );
@@ -670,7 +687,7 @@ mod tests {
             ],
         );
         assert!(
-            detect(&project, &files(&project), &root)
+            detect(&project, &files(&project), &root, true)
                 .versioning
                 .is_none()
         );
@@ -690,7 +707,7 @@ mod tests {
                 ),
             ],
         );
-        let versioning = detect(&project, &files(&project), &imported)
+        let versioning = detect(&project, &files(&project), &imported, true)
             .versioning
             .expect("URI versioning");
         assert_eq!(versioning.prefix, "ver");
@@ -707,7 +724,7 @@ mod tests {
                 "const options = { exclude: ['health'] } as const;\napp.setGlobalPrefix('api', options);",
             )],
         );
-        let bootstrap = detect(&project, &files(&project), &root);
+        let bootstrap = detect(&project, &files(&project), &root, true);
         assert!(bootstrap.excludes("get", "/health"));
         assert!(!bootstrap.excludes("get", "/other"));
     }
@@ -724,7 +741,7 @@ mod tests {
                  app.enableVersioning({ prefix: getPrefix() });",
             )],
         );
-        let bootstrap = detect(&project, &files(&project), &root);
+        let bootstrap = detect(&project, &files(&project), &root, true);
         assert!(!bootstrap.excludes("post", "/health"));
         assert!(bootstrap.excludes("post", "/ping"));
         assert!(bootstrap.versioning.is_none());
@@ -745,7 +762,7 @@ mod tests {
                 ("src/other.ts", "app.setGlobalPrefix('other');"),
             ],
         );
-        assert_eq!(detect(&project, &files(&project), &root).prefix, None);
+        assert_eq!(detect(&project, &files(&project), &root, true).prefix, None);
         assert_eq!(crate::diag::take_warnings().len(), 1);
     }
 
@@ -765,6 +782,23 @@ mod tests {
                 ),
             ],
         );
-        assert!(detect(&project, &files(&project), &root).excludes("get", "/health"));
+        assert!(detect(&project, &files(&project), &root, true).excludes("get", "/health"));
+    }
+
+    #[test]
+    fn without_prefix_detection_nothing_about_the_prefix_is_reported() {
+        crate::diag::take_warnings();
+        let root = temp_root("prefix-off");
+        let project = project_from(
+            &root,
+            &[(
+                "src/main.ts",
+                "app.setGlobalPrefix(getPrefix());\napp.enableVersioning();",
+            )],
+        );
+        let bootstrap = detect(&project, &files(&project), &root, false);
+        assert_eq!(bootstrap.prefix, None);
+        assert!(bootstrap.versioning.is_some());
+        assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
     }
 }

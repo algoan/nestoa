@@ -694,6 +694,39 @@ impl<'a> Extractor<'a> {
         paths
     }
 
+    /// The property a `@Query`/`@Param`/`@Headers`/`@Body` decorator reads:
+    /// `Ok(None)` for the whole object (no argument, or only pipes),
+    /// `Err(source text)` for a name that can't be evaluated.
+    fn param_name(&self, file: &Path, d: &Decorator) -> Result<Option<String>, String> {
+        let Some(arg) = first_arg(d) else {
+            return Ok(None);
+        };
+        if let Some(name) = crate::constval::string(self.project, file, arg) {
+            return Ok(Some(name));
+        }
+        // A pipe given in place of the name: `@Query(new ValidationPipe())`.
+        let pipe = match crate::constval::unwrap(arg) {
+            Expr::New(_) | Expr::Call(_) => true,
+            Expr::Ident(i) => {
+                i.sym.ends_with("Pipe")
+                    || matches!(
+                        self.project.resolve(file, &i.sym),
+                        Some((_, crate::symbols::Symbol::Class(_)))
+                    )
+            }
+            _ => false,
+        };
+        if pipe {
+            return Ok(None);
+        }
+        Err(self
+            .project
+            .files
+            .get(file)
+            .and_then(|f| f.text(arg.span()))
+            .unwrap_or_else(|| "argument".to_string()))
+    }
+
     /// The status named by `@HttpCode(<Enum>.<MEMBER>)`: a member of an enum
     /// in the symbol table, or of NestJS's `HttpStatus`, whose declarations are
     /// not parsed unless `@nestjs/common` is in `resolvePackages`.
@@ -743,7 +776,15 @@ impl<'a> Extractor<'a> {
                 },
             };
             location = Some(kind);
-            decorator_arg = string_arg(d);
+            decorator_arg = match self.param_name(file, d) {
+                Ok(name) => name,
+                Err(text) => {
+                    crate::diag::warn(format!(
+                        "cannot evaluate the name {text} of @{name}(…); the parameter is left out"
+                    ));
+                    return Some(ParsedParam::Ignored);
+                }
+            };
             pipes = pipe_effects(d);
             break;
         }
@@ -1200,18 +1241,6 @@ fn member_arg(d: &swc_ecma_ast::Decorator) -> Option<(String, String)> {
         }
         _ => None,
     }
-}
-
-fn string_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
-    let call = match &*d.expr {
-        Expr::Call(c) => c,
-        _ => return None,
-    };
-    let first = call.args.first()?;
-    if let Expr::Lit(Lit::Str(s)) = first.expr.as_ref() {
-        return Some(s.value.to_string_lossy().into_owned());
-    }
-    None
 }
 
 /// Whether any decorator in `decorators` has one of the given names.
@@ -2018,7 +2047,8 @@ mod tests {
             }
         }
 
-        let mut bootstrap = crate::globalprefix::detect(&project, &entry, &dir);
+        let mut bootstrap =
+            crate::globalprefix::detect(&project, &entry, &dir, config.base_path.is_none());
         if config.base_path.is_none() {
             config.base_path = bootstrap.prefix.take();
         }
@@ -2372,6 +2402,38 @@ mod tests {
                 r#"before false {"type":"integer"}"#,
                 r#"typed false {"type":"integer","default":1}"#,
             ]
+        );
+    }
+
+    #[test]
+    fn parameter_names_from_constants() {
+        crate::diag::take_warnings();
+        let routes = extract_routes(
+            "param-names",
+            r#"
+            const HEADER = 'x-request-id';
+            const KEYS = { PAGE: 'page' };
+            @Controller('items')
+            export class ItemsController {
+                @Get()
+                list(
+                    @Headers(HEADER) id: string,
+                    @Query(KEYS.PAGE) page: string,
+                    @Query(new ValidationPipe()) all: { q: string },
+                    @Query(UNKNOWN) lost: string,
+                ) {}
+            }
+            "#,
+        );
+        let names: Vec<&str> = find(&routes, HttpMethod::Get, "/items")
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["x-request-id", "page", "q"]);
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["cannot evaluate the name UNKNOWN of @Query(…); the parameter is left out"]
         );
     }
 
