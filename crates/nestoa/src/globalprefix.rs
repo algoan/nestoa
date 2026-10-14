@@ -199,7 +199,10 @@ fn uri_versioning(project: &Project, file: &Path, args: &[Expr]) -> Option<UriVe
     let mut holder = None;
     let (file, options) = unreadable(options_object(project, file, arg, &mut holder))?;
     let file = file.as_path();
-    match object_value(options, "type") {
+    match object_value(options, "type")
+        .as_ref()
+        .map(crate::constval::unwrap)
+    {
         None => {}
         Some(Expr::Member(MemberExpr {
             prop: MemberProp::Ident(kind),
@@ -662,7 +665,7 @@ mod tests {
             &through_variable,
             &[(
                 "src/main.ts",
-                "const uri = { type: VersioningType.URI, prefix: 'ver' } as const satisfies VersioningOptions;\n\
+                "const uri = { type: VersioningType.URI as const, prefix: 'ver' } as const satisfies VersioningOptions;\n\
                  app.enableVersioning(uri);",
             )],
         );

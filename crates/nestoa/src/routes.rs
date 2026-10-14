@@ -460,7 +460,11 @@ impl<'a> Extractor<'a> {
                             {
                                 Some(p) => {
                                     p.required |= rp.required;
-                                    p.schema = merged_param_schema(p.schema.take(), rp.schema);
+                                    p.schema = merged_param_schema(
+                                        p.schema.take(),
+                                        rp.schema,
+                                        self.components,
+                                    );
                                     p.description = p.description.take().or(rp.description);
                                 }
                                 None => params.push(rp),
@@ -1085,6 +1089,19 @@ fn literal_json(expr: &Expr) -> Option<Value> {
     }
 }
 
+/// A schema's `type`, following a `$ref` (`page?: PageText`, an alias of
+/// `string`).
+fn schema_type<'a>(schema: &'a Value, components: &'a ComponentSchemas) -> Option<&'a str> {
+    match schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        Some(name) => schema_type(components.schemas.get(name)?, components),
+        None => schema["type"].as_str(),
+    }
+}
+
 /// Whether two parameters of one location have the same name; header names
 /// are case-insensitive.
 fn same_name(a: &RouteParam, b: &RouteParam) -> bool {
@@ -1097,11 +1114,14 @@ fn same_name(a: &RouteParam, b: &RouteParam) -> bool {
 /// The schema of a parameter two declarations read. Both must hold, except
 /// that a `string` gives way to another type: the wire value is a string
 /// either way, and the other type is what a parse pipe turns it into.
-fn merged_param_schema(first: Value, second: Value) -> Value {
+fn merged_param_schema(first: Value, second: Value, components: &ComponentSchemas) -> Value {
     if first == second {
         return first;
     }
-    match (first["type"].as_str(), second["type"].as_str()) {
+    match (
+        schema_type(&first, components),
+        schema_type(&second, components),
+    ) {
         (Some("string"), Some(b)) if b != "string" => second,
         (Some(a), Some("string")) if a != "string" => first,
         _ => json!({ "allOf": [first, second] }),
@@ -2566,11 +2586,12 @@ mod tests {
             "merged",
             r#"
             const ParseIntPipe = 'selector';
+            export type PageText = string;
             @Controller('items')
             export class ItemsController {
                 @Get()
                 list(
-                    @Query() dto: { page?: string },
+                    @Query() dto: { page?: PageText },
                     @Query('page', ParseFloatPipe) page: number,
                     @Query('page', ParseIntPipe) again: number,
                     @Query(ParseIntPipe) value: string,
