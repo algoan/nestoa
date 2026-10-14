@@ -909,6 +909,15 @@ fn literal_json(expr: &Expr) -> Option<Value> {
 /// by the operation's security and media types instead.
 const IGNORED_HEADERS: [&str; 3] = ["Accept", "Content-Type", "Authorization"];
 
+/// `schema` without its `description`.
+fn undocumented(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if let Some(o) = schema.as_object_mut() {
+        o.remove("description");
+    }
+    schema
+}
+
 /// An object schema's properties, and the names of the required ones.
 type ObjectMembers = (Vec<(String, Value)>, Vec<String>);
 
@@ -923,12 +932,29 @@ fn object_members(schema: &Value, components: &ComponentSchemas) -> Option<Objec
     {
         return object_members(components.schemas.get(name)?, components);
     }
+    // A property declared in several branches (a field a subclass
+    // redeclares) must satisfy each declaration.
     if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
-        let (mut properties, mut required) = (Vec::new(), Vec::new());
+        let (mut properties, mut required): ObjectMembers = (Vec::new(), Vec::new());
         for branch in branches {
             let (p, r) = object_members(branch, components)?;
-            properties.extend(p);
-            required.extend(r);
+            for (name, schema) in p {
+                match properties.iter_mut().find(|(n, _)| *n == name) {
+                    // Only the documentation differs: the subclass's wins.
+                    Some((_, existing)) if undocumented(existing) == undocumented(&schema) => {
+                        *existing = schema;
+                    }
+                    Some((_, existing)) => {
+                        *existing = json!({ "allOf": [existing.take(), schema] });
+                    }
+                    None => properties.push((name, schema)),
+                }
+            }
+            for name in r {
+                if !required.contains(&name) {
+                    required.push(name);
+                }
+            }
         }
         return Some((properties, required));
     }
@@ -1390,9 +1416,11 @@ fn expand_optional_params(path: &str) -> Vec<(String, Vec<(String, String)>)> {
         let mut pattern = None;
         if chars.peek() == Some(&'(') {
             chars.next();
-            let (mut regex, mut depth) = (String::new(), 1);
+            let (mut regex, mut depth, mut escaped) = (String::new(), 1, false);
             for next in chars.by_ref() {
                 match next {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
                     '(' => depth += 1,
                     ')' => depth -= 1,
                     _ => {}
@@ -1847,6 +1875,13 @@ mod tests {
             concrete(None, "users", Some("{/:id}/posts")),
             ["/users/{id}/posts", "/users/posts"]
         );
+        let escaped = concrete_paths(&join_paths(None, "re", Some(":v(a\\)b)/x")));
+        assert_eq!(escaped.len(), 1);
+        assert_eq!(escaped[0].path, "/re/{v}/x");
+        assert_eq!(
+            escaped[0].patterns,
+            [("v".to_string(), "^(?:a\\)b)$".to_string())]
+        );
         let braced = concrete_paths(&join_paths(None, "re", Some(":id(\\d{2})")));
         assert_eq!(braced.len(), 1);
         assert_eq!(
@@ -2287,7 +2322,7 @@ mod tests {
             &[
                 (
                     "dto.ts",
-                    "export class Paging { limit?: number; }\n\
+                    "export class Paging { limit?: number; q?: string; page?: string; }\n\
                      export class ListQuery extends Paging {\n\
                        /** Free text. */\n\
                        q: string;\n\
@@ -2335,7 +2370,7 @@ mod tests {
             [
                 r#"Query limit false {"type":"number"} -"#,
                 r#"Query q true {"type":"string"} Free text."#,
-                r#"Query page false {"type":"number"} -"#,
+                r#"Query page false {"allOf":[{"type":"string"},{"type":"number"}]} -"#,
             ]
         );
         assert_eq!(
