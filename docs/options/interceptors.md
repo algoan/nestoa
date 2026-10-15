@@ -75,6 +75,9 @@ findOne(): Promise<Book> { … }
 // GET /books/{id}/signed → the configured envelope
 ```
 
-A `response` override wins over the type-inferred `Out`. For one handler that
+A `response` override wins over the type-inferred `Out`. When several of a
+route's interceptors have a matching override, the last one wins: controller
+interceptors come first, then the method's, each in `@UseInterceptors(...)`
+order. The suffix check here is a plain string suffix. For one handler that
 returns a different type per path without an interceptor, use the
 [`@route-mapping`](../jsdoc.md#route-mapping) JSDoc tag.

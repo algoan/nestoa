@@ -25,7 +25,7 @@ same PR as the change.
 Run `cargo` from the repository root.
 
 ```sh
-make ci                                # what CI runs: fmt check, clippy -D warnings, tests, release build
+make ci                                # mirrors the CI jobs: fmt check, clippy -D warnings, tests, release build
 cargo test --package nestoa routes     # tests of one module
 cargo test test_name                   # one test
 cargo build --release
@@ -37,7 +37,7 @@ cargo build --release
 
 A change is done when all of the following hold. Report each result, including failures, in the PR.
 
-1. **`make ci` passes.** Run it before every push; CI runs the same targets.
+1. **`make ci` passes.** Run it before every push; it mirrors the checks the CI workflow runs.
 2. **Every behaviour change has a regression test.** Tests are inline `#[cfg(test)] mod tests`
    blocks in the module that changed, built on a small in-memory or temporary TypeScript project.
    Assert on the emitted schema, route or warning (`diag::take_warnings`), not just "no panic".

@@ -20,7 +20,9 @@ export class Book {
 export class BooksController {
   /** Find a book */
   @Get(':id')
-  findOne(@Param('id') id: string): Promise<Book> { … }
+  findOne(@Param('id') id: string): Promise<Book> {
+    return this.books.findOne(id);
+  }
 }
 ```
 
@@ -53,8 +55,9 @@ components:
         title: { type: string }
         publishedOn: { type: string, format: date-time }
       required: [isbn, title]
-    Error: { … }
 ```
+
+The shared `Error` component referenced by `401` is omitted here.
 
 ## Install
 

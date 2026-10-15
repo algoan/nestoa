@@ -5,8 +5,9 @@ Inherit settings from another config file.
 - **Type:** path, relative to the file that declares it
 - **Default:** none
 
-```jsonc
-// nestoa.base.json, shared by every service of a monorepo
+`nestoa.base.json`, shared by every service of a monorepo:
+
+```json
 {
   "output": "openapi.yaml",
   "resolvePackages": ["@acme/*"],
@@ -14,8 +15,9 @@ Inherit settings from another config file.
 }
 ```
 
-```jsonc
-// services/books/nestoa.config.json
+`services/books/nestoa.config.json`:
+
+```json
 {
   "extends": "../../nestoa.base.json",
   "info": { "title": "Books", "version": "1.0.0" }

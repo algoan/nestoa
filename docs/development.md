@@ -21,6 +21,10 @@ Tests are inline `#[cfg(test)] mod tests` blocks in each module, not a separate
 `tests/` directory. Most build a small in-memory or temporary project and
 assert on the emitted schema or route.
 
+Unit tests are only part of validating a change: see the
+[validation checklist in `CLAUDE.md`](../CLAUDE.md#validating-a-change) for the
+end-to-end, `--strict`, determinism and OpenAPI checks.
+
 ```sh
 cargo test                             # everything
 cargo test --package nestoa jsdoc      # one module
@@ -72,4 +76,5 @@ Packages registry (`@algoan/nestoa`, `@algoan/nestoa-<tag>`). It also keeps
 only the platform packages that were actually built in the main package's
 `optionalDependencies`, and publishes them all at the same version. A user
 only downloads the platform package that matches their machine. On a platform
-with no package, the install has no binary to run.
+without a platform package, there is no bundled binary to run. Set
+`NESTOA_BINARY` to point the shim at a separately built executable.

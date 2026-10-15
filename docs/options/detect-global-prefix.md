@@ -25,9 +25,12 @@ app.setGlobalPrefix('api', {
 - **The prefix** is resolved when it is a string literal, a local `const` bound
   to a string, or a [`node-config-ts`](https://www.npmjs.com/package/node-config-ts)
   member such as `config.globalPrefix` (looked up in `config/default.json`).
+- If the prefix can't be evaluated, nestoa warns and leaves **every** route
+  unprefixed. It does not look for another `setGlobalPrefix` call.
 - **`exclude`** keeps the listed routes unprefixed. Entries can be a path
   (`'health'`), a `{ path, method }` object, or a path ending in a `(.*)` / `*`
-  wildcard.
+  wildcard. If `exclude` can't be evaluated, nestoa warns and every route keeps
+  the prefix.
 
 Set it to `false` to keep routes unprefixed when no `basePath` is given.
 

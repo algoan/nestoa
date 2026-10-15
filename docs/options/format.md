@@ -10,4 +10,6 @@ Serialisation of the output document.
 { "output": "openapi.txt", "format": "yaml" }
 ```
 
-Only needed when the output file's extension does not say which format it is.
+An explicit `format` wins over the extension: `"output": "openapi.json"` with
+`"format": "yaml"` writes YAML. Set it when the extension is ambiguous or
+you need a format other than the one it implies.
