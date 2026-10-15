@@ -184,6 +184,17 @@ fn instantiation_suffix(params: &[String], env: &TypeEnv) -> String {
         .collect()
 }
 
+/// What `SchemaCtx::class_member` reads off a class field or a constructor
+/// parameter property.
+struct ClassMember<'a> {
+    span: Span,
+    decorators: &'a [swc_ecma_ast::Decorator],
+    type_ann: Option<&'a swc_ecma_ast::TsTypeAnn>,
+    init: Option<&'a Expr>,
+    /// Declared with `?`.
+    optional: bool,
+}
+
 pub struct SchemaCtx<'a> {
     pub project: &'a Project,
     pub components: &'a mut ComponentSchemas,
@@ -824,10 +835,8 @@ impl<'a> SchemaCtx<'a> {
         let mut required: Vec<String> = Vec::new();
         for el in &lit.members {
             if let TsTypeElement::TsPropertySignature(p) = el {
-                let name = match &*p.key {
-                    Expr::Ident(i) => i.sym.to_string(),
-                    Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
-                    _ => continue,
+                let Some(name) = property_key(&p.key) else {
+                    continue;
                 };
                 // `@internal`/`@private` members never reach the wire.
                 if self.jsdoc(file, p.span).is_some_and(|d| d.internal) {
@@ -839,7 +848,12 @@ impl<'a> SchemaCtx<'a> {
                     .map(|t| self.ts_type_to_schema(file, &t.type_ann))
                     .unwrap_or_else(|| json!({}));
                 props.insert(name.clone(), schema);
-                if !p.optional {
+                if !p.optional
+                    && !p
+                        .type_ann
+                        .as_ref()
+                        .is_some_and(|t| admits_undefined(&t.type_ann))
+                {
                     required.push(name);
                 }
             }
@@ -989,6 +1003,118 @@ impl<'a> SchemaCtx<'a> {
         ref_value(&name)
     }
 
+    /// A class field as `(name, schema, optional)`, or nothing when it never
+    /// reaches the wire. A `static` member lives on the constructor, never on
+    /// an instance, and routinely holds internals (a logger, a cache).
+    /// Accessibility is deliberately *not* considered: TypeScript erases
+    /// `private`, so such a field is still serialized.
+    fn class_prop(
+        &mut self,
+        file: &Path,
+        p: &swc_ecma_ast::ClassProp,
+    ) -> Vec<(String, Value, bool)> {
+        if p.is_static {
+            return Vec::new();
+        }
+        let Some(name) = prop_name_key(&p.key) else {
+            return Vec::new();
+        };
+        let member = ClassMember {
+            span: p.span,
+            decorators: &p.decorators,
+            type_ann: p.type_ann.as_deref(),
+            init: p.value.as_deref(),
+            optional: p.is_optional,
+        };
+        self.class_member(file, name, member).into_iter().collect()
+    }
+
+    /// A constructor parameter property (`constructor(public name: string)`),
+    /// which declares a field like a class property does.
+    fn param_prop(
+        &mut self,
+        file: &Path,
+        pp: &swc_ecma_ast::TsParamProp,
+    ) -> Option<(String, Value, bool)> {
+        let (binding, init) = match &pp.param {
+            swc_ecma_ast::TsParamPropParam::Ident(b) => (b, None),
+            swc_ecma_ast::TsParamPropParam::Assign(a) => match &*a.left {
+                swc_ecma_ast::Pat::Ident(b) => (b, Some(&*a.right)),
+                _ => return None,
+            },
+        };
+        let member = ClassMember {
+            span: pp.span,
+            decorators: &pp.decorators,
+            type_ann: binding.type_ann.as_deref(),
+            init,
+            optional: binding.id.optional,
+        };
+        self.class_member(file, binding.id.sym.to_string(), member)
+    }
+
+    /// Lower a class member as `(name, schema, optional)`, or nothing when
+    /// its JSDoc or decorators keep it off the wire. That is decided before
+    /// its type is lowered, so a hidden member's types never become components.
+    fn class_member(
+        &mut self,
+        file: &Path,
+        name: String,
+        member: ClassMember,
+    ) -> Option<(String, Value, bool)> {
+        let doc = self.jsdoc(file, member.span);
+        // `@internal`/`@private` members never reach the wire.
+        if doc.as_ref().is_some_and(|d| d.internal) || member.decorators.iter().any(hides_property)
+        {
+            return None;
+        }
+        let mut schema = match (member.type_ann, member.init) {
+            (Some(t), _) => self.ts_type_to_schema(file, &t.type_ann),
+            (None, Some(init)) => self.initializer_schema(file, init),
+            (None, None) => json!({}),
+        };
+        if let Some(doc) = &doc {
+            attach_doc(&mut schema, doc);
+        }
+        let optional = member.optional
+            || member
+                .type_ann
+                .is_some_and(|t| admits_undefined(&t.type_ann))
+            || member.decorators.iter().any(marks_optional);
+        Some((name, schema, optional))
+    }
+
+    /// The type TypeScript infers for an unannotated field from its
+    /// initialiser, widened as for a mutable field (`a = 1` is a `number`).
+    fn initializer_schema(&mut self, file: &Path, init: &Expr) -> Value {
+        match init {
+            Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) => json!({ "type": "string" }),
+            Expr::Lit(Lit::Num(_)) => json!({ "type": "number" }),
+            Expr::Lit(Lit::Bool(_)) => json!({ "type": "boolean" }),
+            Expr::Unary(u)
+                if matches!(
+                    u.op,
+                    swc_ecma_ast::UnaryOp::Minus | swc_ecma_ast::UnaryOp::Plus
+                ) && matches!(*u.arg, Expr::Lit(Lit::Num(_))) =>
+            {
+                json!({ "type": "number" })
+            }
+            Expr::New(n) if matches!(&*n.callee, Expr::Ident(id) if id.sym == "Date") => {
+                json!({ "type": "string", "format": "date-time" })
+            }
+            Expr::TsAs(a) => self.ts_type_to_schema(file, &a.type_ann),
+            Expr::Paren(p) => self.initializer_schema(file, &p.expr),
+            _ => {
+                let text = self
+                    .project
+                    .files
+                    .get(file)
+                    .and_then(|f| f.text(init.span()));
+                json!({ "x-unresolved": text.unwrap_or_else(|| "initializer".to_string()) })
+            }
+        }
+    }
+
     pub fn symbol_to_schema(&mut self, file: &Path, sym: &Symbol) -> Value {
         match sym {
             Symbol::Interface(i) => {
@@ -1005,10 +1131,8 @@ impl<'a> SchemaCtx<'a> {
                 }
                 for el in i.decls().flat_map(|d| &d.body.body) {
                     if let TsTypeElement::TsPropertySignature(p) = el {
-                        let name = match &*p.key {
-                            Expr::Ident(i) => i.sym.to_string(),
-                            Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
-                            _ => continue,
+                        let Some(name) = property_key(&p.key) else {
+                            continue;
                         };
                         let doc = self.jsdoc(file, p.span);
                         // `@internal`/`@private` members never reach the wire.
@@ -1023,8 +1147,12 @@ impl<'a> SchemaCtx<'a> {
                         if let Some(doc) = &doc {
                             attach_doc(&mut schema, doc);
                         }
+                        let optional = p.optional
+                            || p.type_ann
+                                .as_ref()
+                                .is_some_and(|t| admits_undefined(&t.type_ann));
                         props.insert(name.clone(), schema);
-                        if !p.optional && !required.contains(&name) {
+                        if !optional && !required.contains(&name) {
                             required.push(name);
                         }
                     }
@@ -1111,46 +1239,23 @@ impl<'a> SchemaCtx<'a> {
                     all_of.push(parent);
                 }
                 for member in &c.body {
-                    if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
-                        // A `static` member lives on the constructor, never on
-                        // an instance, so it is never part of the serialized
-                        // body — and it routinely holds internals (a logger, a
-                        // cache) whose types would otherwise be dragged into the
-                        // components. Accessibility is deliberately *not*
-                        // considered: TypeScript erases `private`, so such a
-                        // field is still serialized and still belongs on the
-                        // wire. Use the `@internal`/`@private` JSDoc tag to drop
-                        // one on purpose.
-                        if p.is_static {
-                            continue;
-                        }
-                        let name = match &p.key {
-                            swc_ecma_ast::PropName::Ident(i) => i.sym.to_string(),
-                            swc_ecma_ast::PropName::Str(s) => {
-                                s.value.to_string_lossy().into_owned()
-                            }
-                            _ => continue,
-                        };
-                        let doc = self.jsdoc(file, p.span);
-                        // `@internal`/`@private` members never reach the wire.
-                        if doc.as_ref().is_some_and(|d| d.internal) {
-                            continue;
-                        }
-                        let mut schema = p
-                            .type_ann
-                            .as_ref()
-                            .map(|t| self.ts_type_to_schema(file, &t.type_ann))
-                            .unwrap_or_else(|| json!({}));
-                        if let Some(doc) = &doc {
-                            attach_doc(&mut schema, doc);
-                        }
-                        // class-validator `@IsOptional()` decorator implies optional.
-                        let has_is_optional = p
-                            .decorators
+                    let lowered = match member {
+                        swc_ecma_ast::ClassMember::ClassProp(p) => self.class_prop(file, p),
+                        swc_ecma_ast::ClassMember::Constructor(ctor) => ctor
+                            .params
                             .iter()
-                            .any(|d| decorator_name(d) == "IsOptional");
+                            .filter_map(|param| match param {
+                                swc_ecma_ast::ParamOrTsParamProp::TsParamProp(pp) => {
+                                    self.param_prop(file, pp)
+                                }
+                                swc_ecma_ast::ParamOrTsParamProp::Param(_) => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for (name, schema, optional) in lowered {
                         props.insert(name.clone(), schema);
-                        if !p.is_optional && !has_is_optional {
+                        if !optional {
                             required.push(name);
                         }
                     }
@@ -1181,6 +1286,93 @@ impl<'a> SchemaCtx<'a> {
             }
         }
     }
+}
+
+/// The name of an interface or type-literal member, `None` for a computed key.
+fn property_key(key: &Expr) -> Option<String> {
+    match key {
+        Expr::Ident(i) => Some(i.sym.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+        Expr::Lit(Lit::Num(n)) => Some(number_json(n.value).to_string()),
+        _ => None,
+    }
+}
+
+/// The name of a class member, `None` for a computed or private (`#x`) key.
+fn prop_name_key(key: &swc_ecma_ast::PropName) -> Option<String> {
+    match key {
+        swc_ecma_ast::PropName::Ident(i) => Some(i.sym.to_string()),
+        swc_ecma_ast::PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
+        swc_ecma_ast::PropName::Num(n) => Some(number_json(n.value).to_string()),
+        _ => None,
+    }
+}
+
+/// Whether a property's declared type admits `undefined`, which makes it
+/// optional on the wire like a `?` does.
+fn admits_undefined(ty: &TsType) -> bool {
+    match ty {
+        TsType::TsKeywordType(k) => matches!(
+            k.kind,
+            TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsVoidKeyword
+        ),
+        TsType::TsParenthesizedType(p) => admits_undefined(&p.type_ann),
+        TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
+            u.types.iter().any(|t| admits_undefined(t))
+        }
+        _ => false,
+    }
+}
+
+/// The decorator's own name, without a namespace (`@ns.Exclude()` -> `Exclude`).
+fn decorator_base_name(d: &swc_ecma_ast::Decorator) -> String {
+    let name = decorator_name(d);
+    name.rsplit('.').next().unwrap_or_default().to_string()
+}
+
+/// `@Exclude()` (class-transformer) and `@ApiHideProperty()` (`@nestjs/swagger`)
+/// keep a property off the wire, except `@Exclude({ toClassOnly: true })`,
+/// which only drops it from incoming payloads.
+fn hides_property(d: &swc_ecma_ast::Decorator) -> bool {
+    match decorator_base_name(d).as_str() {
+        "ApiHideProperty" => true,
+        "Exclude" => decorator_option_bool(d, "toClassOnly") != Some(true),
+        _ => false,
+    }
+}
+
+/// `@IsOptional()`, `@ApiPropertyOptional()` and `@ApiProperty({ required: false })`.
+fn marks_optional(d: &swc_ecma_ast::Decorator) -> bool {
+    match decorator_base_name(d).as_str() {
+        "IsOptional" | "ApiPropertyOptional" => true,
+        "ApiProperty" => decorator_option_bool(d, "required") == Some(false),
+        _ => false,
+    }
+}
+
+/// A boolean literal option of a decorator's first-argument object literal.
+fn decorator_option_bool(d: &swc_ecma_ast::Decorator, key: &str) -> Option<bool> {
+    let Expr::Call(call) = &*d.expr else {
+        return None;
+    };
+    let Expr::Object(obj) = &*call.args.first()?.expr else {
+        return None;
+    };
+    obj.props.iter().find_map(|p| {
+        let swc_ecma_ast::PropOrSpread::Prop(p) = p else {
+            return None;
+        };
+        let swc_ecma_ast::Prop::KeyValue(kv) = &**p else {
+            return None;
+        };
+        if prop_name_key(&kv.key).as_deref() != Some(key) {
+            return None;
+        }
+        match &*kv.value {
+            Expr::Lit(Lit::Bool(b)) => Some(b.value),
+            _ => None,
+        }
+    })
 }
 
 fn enum_value_type(v: &EnumValue) -> &'static str {
@@ -3163,6 +3355,114 @@ mod tests {
     }
 
     #[test]
+    fn constructor_parameter_properties_are_lowered() {
+        let [pet] = lower_all(
+            "",
+            "export class Pet {\n\
+               species = 'cat';\n\
+               constructor(public name: string, private age?: number, readonly tag = 1, plain: boolean) {}\n\
+             }",
+            &["Pet"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&pet), ["species", "name", "age", "tag"]);
+        assert_eq!(pet["properties"]["age"], json!({"type": "number"}));
+        assert_eq!(pet["properties"]["tag"], json!({"type": "number"}));
+        assert_eq!(required_names(&pet), ["species", "name", "tag"]);
+    }
+
+    #[test]
+    fn a_union_with_undefined_makes_a_property_optional() {
+        let [class, iface, alias] = lower_all(
+            "",
+            "export class Book { a: string | undefined; b: (number | void); c: string; }\n\
+             export interface Author { a: string | undefined; c: string; }\n\
+             export type Order = { a: undefined | string; c: string };",
+            &["Book", "Author", "Order"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&class), ["c"]);
+        assert_eq!(class["properties"]["a"], json!({"type": "string"}));
+        assert_eq!(required_names(&iface), ["c"]);
+        assert_eq!(required_names(&alias), ["c"]);
+    }
+
+    #[test]
+    fn serialization_decorators_hide_or_relax_properties() {
+        let [user] = lower_all(
+            "",
+            "export class User {\n\
+               @Exclude() password: string;\n\
+               @ApiHideProperty() internal: string;\n\
+               @Exclude({ toClassOnly: true }) computed: string;\n\
+               @ApiPropertyOptional() nickname: string;\n\
+               @ApiProperty({ required: false, description: 'd' }) bio: string;\n\
+               @ApiProperty({ required: true }) email: string;\n\
+               @Transformer.Exclude() token: string;\n\
+             }",
+            &["User"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&user), ["computed", "nickname", "bio", "email"]);
+        assert_eq!(required_names(&user), ["computed", "email"]);
+    }
+
+    #[test]
+    fn a_hidden_property_type_never_becomes_a_component() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            "export class Secret { value: string; }\n\
+             export class Internal { value: string; }\n\
+             export class User {\n\
+               @Exclude() secret: Secret;\n\
+               /** @internal */ internal: Internal;\n\
+               name: string;\n\
+             }",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&dir.join("dto.ts"), "User").unwrap();
+        let user = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(prop_names(&user), ["name"]);
+        assert!(components.schemas.is_empty());
+        assert!(components.allocated.is_empty());
+    }
+
+    #[test]
+    fn untyped_fields_are_inferred_from_their_initialiser() {
+        let [widget] = lower_all(
+            "",
+            "export class Widget {\n\
+               a = 1; b = 'x'; c = true; d = -2; e = new Date(); f = `t`;\n\
+               g = 0 as number; h = compute(); i;\n\
+             }",
+            &["Widget"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &widget["properties"];
+        assert_eq!(p["a"], json!({"type": "number"}));
+        assert_eq!(p["b"], json!({"type": "string"}));
+        assert_eq!(p["c"], json!({"type": "boolean"}));
+        assert_eq!(p["d"], json!({"type": "number"}));
+        assert_eq!(p["e"], json!({"type": "string", "format": "date-time"}));
+        assert_eq!(p["f"], json!({"type": "string"}));
+        assert_eq!(p["g"], json!({"type": "number"}));
+        assert_eq!(p["h"], json!({"x-unresolved": "compute()"}));
+        assert_eq!(p["i"], json!({}));
+    }
+
+    #[test]
     fn utility_types_edit_the_resolvable_part_of_an_unresolved_parent() {
         let [partial, pick, omit] = lower_all(
             "import { External } from '@acme/missing';\n\
@@ -3336,5 +3636,22 @@ mod tests {
             json!({"type": "object", "additionalProperties": {"type": "boolean"}})
         );
         assert_eq!(p["e"]["additionalProperties"], json!({"type": "number"}));
+    }
+
+    #[test]
+    fn numeric_property_keys_are_kept() {
+        let [iface, class, lit] = lower_all(
+            "",
+            "export interface Pair { 0: string; 1?: number; }\n\
+             export class Grid { 0: string; }\n\
+             export type Cell = { 2: boolean };",
+            &["Pair", "Grid", "Cell"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&iface), ["0", "1"]);
+        assert_eq!(required_names(&iface), ["0"]);
+        assert_eq!(prop_names(&class), ["0"]);
+        assert_eq!(prop_names(&lit), ["2"]);
     }
 }
