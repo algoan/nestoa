@@ -40,19 +40,48 @@ including handlers inherited through `extends`:
 | `ObjectId`, `Buffer` | `type: string` |
 | `T[]`, `Array<T>`, `readonly T[]` | `type: array` |
 | `[A, B]` | `prefixItems` + `items: false` |
+| `[A, ...B[]]` | `prefixItems` + `items: B` |
+| `42`, `'a'`, `true` | a one-value `enum` (a whole number is written `42`, not `42.0`) |
 | `A \| B` | `anyOf`, or one merged `enum` for literals |
 | `A & B` | `allOf` |
 | `class B extends A`, `interface B extends A` | `allOf` with the base |
-| `enum`, `Enum.MEMBER`, `keyof typeof Enum` | `enum` |
-| `Partial`, `Required`, `Pick`, `Omit`, `Record<K, V>`, `Readonly`, `NonNullable` | the reshaped object |
+| `enum`, `Enum.MEMBER`, `keyof typeof Enum` | `enum`, with computed members (`1 << 2`, `A \| B`, `B = A`) evaluated |
+| `Partial`, `Required`, `Pick`, `Omit`, `Readonly` | the reshaped object |
+| `NonNullable<T>` | `T` without its `null` member |
+| `Record<'a' \| 'b', V>` | `properties` `a` and `b`, both required |
+| `Record<string, V>`, `Map<K, V>` | `additionalProperties: V` |
+| `Set<T>` | `type: array`, `uniqueItems: true` |
+| `Awaited<T>`, `Promise<T>`, `Observable<T>` | `T` |
 | `PartialType`, `PickType`, `OmitType`, `IntersectionType` from `@nestjs/*` | the reshaped object |
 | `Exclude`, `Extract` | the filtered union |
 | `X['key']` | the property's schema |
 | a named class, interface, type alias or enum | a `$ref` to a component |
 
-Static class members are never part of a schema. A type nestoa does not lower
-(mapped and conditional types, `typeof`, …) or cannot find is emitted as
-`x-unresolved` with its source text, never as an empty schema. See
+### Properties
+
+A class's properties are its fields and its constructor parameter properties
+(`constructor(public name: string)`). Static members are never part of a
+schema, and neither is a property marked `@internal`/`@private` in
+[JSDoc](jsdoc.md), `@ApiHideProperty()`, or class-transformer's `@Exclude()`
+(unless `toClassOnly: true`, which only drops it from incoming payloads). A
+field without a type annotation takes the type of its initialiser
+(`count = 0` is a `number`, `at = new Date()` a date-time string); one nestoa
+cannot infer is `x-unresolved`.
+
+A property is left out of `required` when it is declared with `?`, when its
+type admits `undefined` (`string | undefined`), or when it carries
+`@IsOptional()`, `@ApiPropertyOptional()` or `@ApiProperty({ required: false })`.
+
+`Partial`, `Pick`, `Omit` and the `@nestjs/*` helpers edit inherited
+properties too. When a parent cannot be resolved (a class from an unresolved
+package), it is kept as an `x-unresolved` `allOf` branch beside the edited
+properties of the rest.
+
+### Unresolved types
+
+A type nestoa does not lower (mapped and conditional types, `typeof`,
+`ReturnType`, …) or cannot find is emitted as `x-unresolved` with its source
+text, never as an empty schema. See
 [CLI](cli.md#diagnostics-and---strict).
 
 ## OpenAPI 3.1 and 3.0
@@ -88,7 +117,8 @@ versions, so a 3.1 document is never also a 3.0 one. Use
   uses JSON Schema 2020-12 throughout: `string | null` widens the type
   (`type: ["string", "null"]`), a nullable enum lists `null` among its values,
   and a nullable union or `$ref` gains an explicit `{ "type": "null" }` member.
-- **Tuples.** `[number, number]` lowers to `prefixItems` + `items: false`.
+- **Tuples.** `[number, number]` lowers to `prefixItems` + `items: false`,
+  and `[string, ...number[]]` to `prefixItems` + `items: {type: number}`.
   3.0 arrays are homogeneous and have neither keyword.
 
 A property declared `null` outright lowers to `type: "null"`, which 3.0 also
@@ -122,6 +152,9 @@ verbatim through `interceptors[].response.schema`:
 | `type: [A, B]` (multi-type) | `anyOf: [{type: A}, {type: B}]` |
 | `const: v` | `enum: [v]` |
 | `prefixItems: [A, B]` + `items: false` | `items: <A merged with B>` + `maxItems` — **order is lost** |
+| `prefixItems: [A]` + `items: B` | `items: <A merged with B>` — **order is lost** |
+| `exclusiveMinimum: n` (and maximum) | `minimum: n` + `exclusiveMinimum: true` |
+| `examples: [a, …]` on a schema | `example: a` |
 
 The nullable-union, standalone-null and tuple rows lose information, and that
 is a limit of 3.0.3 rather than a shortcut. `nullable` only means something
@@ -133,12 +166,13 @@ schema either. Likewise its arrays are homogeneous, so a tuple keeps its
 maximum length — `maxItems`, matching `prefixItems`, which caps an array
 without requiring every position — but not its per-position types.
 
-Only the closed tuple the analyser emits (`prefixItems` with `items: false`)
-is converted. An open tuple — `items` absent, `true`, or a tail schema — is
-passed through untouched: approximating one means inventing bounds and
-guessing how to fold the tail into a single element schema, and nothing in the
-analyser produces one. `minItems` is never synthesized either, since
-`prefixItems` constrains the positions an array has without requiring them.
+An open tuple (`[A, ...B[]]`) merges its tail into the same `items` and gets
+no `maxItems`. `minItems` is never synthesized, since `prefixItems` constrains
+the positions an array has without requiring them.
+
+The last two rows only concern schemas you supply verbatim: the analyser never
+emits `exclusiveMinimum`, `exclusiveMaximum` or `examples` itself. An
+`enum: [null]` loses its constraint, like a standalone `type: "null"`.
 
 Instance data is never touched: the pass does not descend into `example`,
 `examples`, `default`, `enum`/`const` values or `x-` extensions, so a
