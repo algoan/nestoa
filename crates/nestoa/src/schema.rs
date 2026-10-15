@@ -1879,7 +1879,15 @@ mod tests {
 
     #[test]
     fn enums_follow_typescript_member_values() {
-        let [level, neg, strings, mixed, computed, member, unknown_member] = lower_all(
+        let [
+            level,
+            neg,
+            strings,
+            mixed,
+            computed,
+            member,
+            implicit_member,
+        ] = lower_all(
             "export enum Level { A = 1, B, C }\n\
              export enum Neg { A = -1, B }\n\
              export enum S { X = 'x', Y = 'y' }\n\
@@ -1899,9 +1907,9 @@ mod tests {
             mixed,
             json!({ "type": ["string", "number"], "enum": ["a", 2] })
         );
-        assert_eq!(computed, json!({ "x-unresolved": "Computed" }));
+        assert_eq!(computed, json!({ "type": "number", "enum": [2, 3] }));
         assert_eq!(member, json!({ "type": "number", "enum": [3] }));
-        assert_eq!(unknown_member, json!({ "x-unresolved": "Computed.B" }));
+        assert_eq!(implicit_member, json!({ "type": "number", "enum": [3] }));
     }
 
     #[test]
@@ -2977,5 +2985,20 @@ mod tests {
             "got {}",
             props.get("maybe").unwrap()
         );
+    }
+
+    #[test]
+    fn enum_members_computed_from_siblings_are_evaluated() {
+        let [flags, aliases] = lower_all(
+            "",
+            "export enum Flags { None = 0, A = 1 << 0, B = 1 << 1, AB = A | B, C = Flags.AB + 1, D = ~0 }\n\
+             export enum Aliases { First = 'first', Same = First, Next = 3, After }",
+            &["Flags", "Aliases"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(flags["enum"], json!([0, 1, 2, 3, 4, -1]));
+        assert_eq!(aliases["type"], json!(["string", "number"]));
+        assert_eq!(aliases["enum"], json!(["first", "first", 3, 4]));
     }
 }

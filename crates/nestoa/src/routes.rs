@@ -3213,7 +3213,7 @@ mod tests {
                 ("ctrl.ts", controller),
                 (
                     "codes.ts",
-                    "export enum Codes { Label = 'x', Accepted = 202, Later, Sum = 1 + 1, Next }",
+                    "export enum Codes { Label = 'x', Accepted = 202, Later, Sum = 'ab'.length, Next }",
                 ),
             ],
             "ctrl.ts",
