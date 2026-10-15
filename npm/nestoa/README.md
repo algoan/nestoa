@@ -1,62 +1,38 @@
 # nestoa
 
-Static OpenAPI / AsyncAPI generator for NestJS and TypeScript codebases.
+Generate an OpenAPI document from a NestJS project's source code.
 
-`nestoa` analyses TypeScript source code (no runtime, no decorators metadata
-required) to produce OpenAPI 3.1 documents from your controllers, DTOs,
-interfaces and JSDoc comments. It is implemented in Rust and distributed as
-prebuilt platform binaries through npm.
+nestoa reads your controllers, DTOs and JSDoc comments and writes
+`openapi.json` (or `.yaml`). It never compiles or starts your app, so the same
+code always gives the same document.
 
 ## Install
 
-```sh
-npm install --save-dev nestoa
-# or
-pnpm add -D nestoa
+GitHub Packages requires a token even to install: a personal access token
+(classic) with `read:packages`, exported as `GITHUB_TOKEN` (never committed).
+
+```ini
+# .npmrc
+@algoan:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
 ```
 
-The right prebuilt binary (`@nestoa/<platform>`) is selected automatically via
-`optionalDependencies`.
+```sh
+npm install --save-dev @algoan/nestoa
+```
+
+The right prebuilt binary for your platform is picked automatically.
 
 ## Use
 
 ```sh
-npx nestoa                  # generates openapi.json from ./src
-npx nestoa ./apps/api       # point at a different project root
-npx nestoa -o spec.yaml     # YAML output
+npx nestoa                # reads ./src, writes ./openapi.json
+npx nestoa -o openapi.yaml
+npx nestoa --strict       # in CI: fail if anything could not be documented
 ```
 
-Drop a `nestoa.config.json` (or `.yaml`) at the project root to customise
-inputs, output path, base path, info block, and decorator aliases:
-
-```json
-{
-  "include": ["src"],
-  "exclude": ["**/*.spec.ts"],
-  "output": "openapi.json",
-  "basePath": "/api/v1",
-  "info": { "title": "My API", "version": "1.2.3" },
-  "decoratorAliases": {
-    "AuthUser": "user",
-    "ApiHeader": "header"
-  }
-}
-```
-
-## How it works
-
-`nestoa` parses every `.ts` file with the swc parser, builds a cross-file
-symbol table, walks classes decorated with `@Controller`, and emits an
-OpenAPI document including:
-
-- Routes (`@Get` / `@Post` / `@Put` / `@Patch` / `@Delete` / `@Head` /
-  `@Options` / `@All`) with their summary and description sourced from JSDoc.
-- Path / query / header parameters via `@Param`, `@Query`, `@Headers`.
-- Request bodies via `@Body`.
-- Response types inferred from the method return type, unwrapping `Promise`,
-  `Observable`, arrays and tuples.
-- Schemas for referenced interfaces, type aliases, classes and enums, with
-  property-level JSDoc preserved.
+Configuration, CLI and output are documented in the
+[repository's docs](https://github.com/algoan/nestoa/tree/main/docs).
 
 ## License
 
