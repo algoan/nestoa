@@ -2717,7 +2717,7 @@ mod tests {
         // stripped at runtime (toJSON / formatLean) and must not appear on the wire.
         let (project, dir) = project_from(&[(
             "dto.ts",
-            "export class Dto {\n  /** Public field */\n  name?: string;\n  /**\n   * Raw data from the aggregator\n   * @internal\n   */\n  rawData?: string;\n  /** @private */\n  secret?: string;\n}",
+            "export class Dto {\n  /** Public field */\n  name?: string;\n  /**\n   * Raw data from the supplier\n   * @internal\n   */\n  rawData?: string;\n  /** @private */\n  secret?: string;\n}",
         )]);
         let mut components = ComponentSchemas::default();
         let mut ctx = SchemaCtx {

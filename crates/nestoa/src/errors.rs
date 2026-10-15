@@ -13,7 +13,7 @@
 //!   the `@throws` JSDoc tag and config `routes[].add` / `global`.
 //!
 //! Every error response shares one body shape, the `{ code, message, status }`
-//! object emitted by `@algoan`'s global `HttpExceptionFilter`, registered once
+//! object emitted by a custom global `HttpExceptionFilter`, registered once
 //! as the `Error` component and referenced by every error response.
 
 use std::collections::BTreeMap;
@@ -335,18 +335,18 @@ mod tests {
     fn route_override_method_filter() {
         let mut cfg = ErrorResponses::default();
         cfg.routes.push(RouteErrors {
-            when_path_ends_with: Some("/customers".into()),
+            when_path_ends_with: Some("/owners".into()),
             path: None,
             method: Some("post".into()),
             add: vec![422],
         });
         let post = RouteSignals {
             method: "post",
-            ..signals("/v2/customers")
+            ..signals("/v2/owners")
         };
         let get = RouteSignals {
             method: "get",
-            ..signals("/v2/customers")
+            ..signals("/v2/owners")
         };
         assert!(compute(&post, &cfg).contains_key(&422));
         assert!(!compute(&get, &cfg).contains_key(&422)); // GET sibling untouched
@@ -357,7 +357,7 @@ mod tests {
         let scanned = [422u16, 404u16];
         let sig = RouteSignals {
             scanned_throws: &scanned,
-            ..signals("/x/{id}/scores")
+            ..signals("/x/{id}/reviews")
         };
         let on = compute(&sig, &ErrorResponses::default());
         assert_eq!(on[&422], "Unprocessable Entity");
@@ -379,7 +379,7 @@ mod tests {
             has_roles: true,
             has_body: true,
             pipes: &pipes,
-            ..signals("/v2/customers/{id}")
+            ..signals("/v2/owners/{id}")
         };
         let errors = compute(&sig, &cfg);
         assert_eq!(
@@ -426,18 +426,18 @@ mod tests {
     fn throws_and_route_overrides_add_tier_b() {
         let mut cfg = ErrorResponses::default();
         cfg.routes.push(RouteErrors {
-            when_path_ends_with: Some("/aggregate".into()),
+            when_path_ends_with: Some("/publish".into()),
             path: None,
             method: None,
             add: vec![409],
         });
-        let throws = vec![(422u16, Some("product disabled".to_string()))];
+        let throws = vec![(422u16, Some("author disabled".to_string()))];
         let sig = RouteSignals {
             throws: &throws,
-            ..signals("/connect/aggregate")
+            ..signals("/library/publish")
         };
         let errors = compute(&sig, &cfg);
-        assert_eq!(errors[&422], "product disabled");
+        assert_eq!(errors[&422], "author disabled");
         assert_eq!(errors[&409], "Conflict");
     }
 
@@ -492,21 +492,17 @@ mod tests {
     fn configured_paths_accept_express_params() {
         let ro = RouteErrors {
             when_path_ends_with: None,
-            path: Some("/v2/customers/:id".into()),
+            path: Some("/v2/owners/:id".into()),
             method: None,
             add: vec![409],
         };
-        assert!(route_matches(&ro, "get", "/v2/customers/{id}"));
+        assert!(route_matches(&ro, "get", "/v2/owners/{id}"));
         let suffix = RouteErrors {
-            when_path_ends_with: Some(":id/aggregate".into()),
+            when_path_ends_with: Some(":id/publish".into()),
             path: None,
             ..ro
         };
-        assert!(route_matches(
-            &suffix,
-            "post",
-            "/v2/customers/{id}/aggregate"
-        ));
+        assert!(route_matches(&suffix, "post", "/v2/owners/{id}/publish"));
         let in_segment = RouteErrors {
             when_path_ends_with: None,
             path: Some("/files/:name.:ext".into()),
@@ -527,24 +523,24 @@ mod tests {
             routes: vec![
                 RouteErrors {
                     when_path_ends_with: None,
-                    path: Some("/customers".into()),
+                    path: Some("/owners".into()),
                     method: Some("post".into()),
                     add: vec![409],
                 },
                 RouteErrors {
                     when_path_ends_with: None,
-                    path: Some("/v2/customers".into()),
+                    path: Some("/v2/owners".into()),
                     method: Some("post".into()),
                     add: vec![409],
                 },
             ],
             ..ErrorResponses::default()
         };
-        let routes = [("post", "/v2/customers"), ("get", "/v2/customers")];
+        let routes = [("post", "/v2/owners"), ("get", "/v2/owners")];
         warn_unmatched(&cfg, routes.iter().copied());
         let warnings = crate::diag::take_warnings();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("413"), "{warnings:?}");
-        assert!(warnings[1].contains("\"/customers\""), "{warnings:?}");
+        assert!(warnings[1].contains("\"/owners\""), "{warnings:?}");
     }
 }

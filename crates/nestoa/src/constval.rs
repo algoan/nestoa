@@ -1,7 +1,7 @@
 //! Static evaluation of the string expressions decorators take as paths and
 //! versions: literals, template literals and `+` concatenations of them,
 //! variables (`BASE`), properties of object constants (`ROUTES.LIST`) and
-//! string enum members (`AggregatorAlias.LINXO`), followed across modules.
+//! string enum members (`Species.CAT`), followed across modules.
 
 use std::path::Path;
 

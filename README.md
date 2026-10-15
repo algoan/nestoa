@@ -33,7 +33,7 @@ Optional `nestoa.config.json` (or `.yaml` / `.yml`) at the project root:
   },
   "errorResponses": {
     "auth": "global",
-    "routes": [{ "whenPathEndsWith": "/aggregate", "add": [409] }]
+    "routes": [{ "whenPathEndsWith": "/publish", "add": [409] }]
   }
 }
 ```
@@ -98,11 +98,11 @@ Observable-unwrapped) return type against `In` to bind the interceptor's generic
 parameters, then lowers `Out` as the response schema.
 
 Lowering `Out` performs **generic instantiation** — a named type carrying
-arguments (`PaginatedData<T>`, or `MultiStatusResponse<Omit<T, 'validity'>>`)
+arguments (`PaginatedData<T>`, or `MultiStatusResponse<Omit<T, 'createdAt'>>`)
 binds the referenced declaration's own parameters to those arguments and is
 inlined *per route*, so utility types like `Omit` applied to a bound parameter
 resolve and two controllers using the same interceptor with different element
-types never collide on one component. For example `@algoan/multi-status`'s
+types never collide on one component. For example a multi-status interceptor
 `MultiStatusInterceptor<T>` (`T[]` → `MultiStatusResponse<Omit<T, …>>`) yields
 the batch envelope with each element's `resource` set to the controller's own
 DTO, and `@HttpCode(MULTI_STATUS)` on the handler sets the status to `207` (the
@@ -117,9 +117,9 @@ keyed by the class name as written in `@UseInterceptors(...)`, covers the rest:
   "interceptors": {
     "LoggingInterceptor": { "ignore": true },
     "BulkBodyInterceptor": { "requestBody": "single-or-array" },
-    "SignResponseInterceptor": {
+    "SigningInterceptor": {
       "response": {
-        "whenPathEndsWith": "/jws",
+        "whenPathEndsWith": "/signed",
         "schema": { "type": "object", "properties": { "payload": { "type": "string" } } }
       }
     }
@@ -135,7 +135,7 @@ keyed by the class name as written in `@UseInterceptors(...)`, covers the rest:
 - `response: { whenPathEndsWith?, schema }` — an OpenAPI schema used verbatim,
   for interceptors whose wire shape is runtime control flow rather than a type.
   The optional suffix lets sibling routes sharing one interceptor via an array
-  path (`@Get([':id', ':id/jws'])`) keep distinct shapes.
+  path (`@Get([':id', ':id/signed'])`) keep distinct shapes.
 
 ### Error responses
 
@@ -154,7 +154,7 @@ Two tiers, both configured under `errorResponses`:
 | `401` | The route is authenticated and not opted out. `auth` selects the wiring: `global` (default — an `APP_GUARD`), `per-controller` (only routes with `@UseGuards(AuthGuard)`), or `none`. A decorator in `authOptOut` (default `Unprotected`) turns it off per route/controller. |
 | `403` | The route or controller carries a `roleDecorators` decorator (default `Roles`). |
 | `400` | The route has a `@Body` DTO and `validation` is on (default true — assumes a global `ValidationPipe`). |
-| `404` / `400` | A pipe in the `pipes` map is applied to a `@Param`/`@Query`. Defaults map the `@algoan` `ParseObjectIdPipe`/`ParseDatePipe` to `404` and Nest's built-in parse pipes to `400`. |
+| `404` / `400` | A pipe in the `pipes` map is applied to a `@Param`/`@Query`. Defaults map `ParseObjectIdPipe`/`ParseDatePipe` to `404` and Nest's built-in parse pipes to `400`. |
 | any | The handler body itself contains `throw new <HttpException>(...)` — e.g. `throw new UnprocessableEntityException()` → `422`. Only the handler's own body is scanned (not called services), so it stays deterministic. Turn off with `scanThrows: false`. |
 
 **Tier B — declared** (for errors thrown deep in *service* code that no
@@ -164,14 +164,14 @@ controller-level analysis can see):
   `@exception`) on the handler:
   ```ts
   /**
-   * Aggregate the connection.
-   * @throws 409 The connection has already been aggregated
-   * @throws 422 Product disabled
+   * Publish the book.
+   * @throws 409 The book has already been published
+   * @throws 422 Author disabled
    */
-  @Post(':id/aggregate')
+  @Post(':id/publish')
   ```
 - Config `routes[].add` (add status codes per path / path-suffix, optionally
-  restricted to one `method` so `POST /customers` can get a `422` its `GET`
+  restricted to one `method` so `POST /owners` can get a `422` its `GET`
   sibling doesn't) and `global` (filter-level codes such as a `413` from an
   Express body-size limit, optionally gated on a suffix).
 

@@ -76,7 +76,7 @@ pub fn request_body_transform(
 /// route's interceptors declares one whose `whenPathEndsWith` matches the path
 /// (or has no suffix condition). This covers interceptors whose transform is
 /// runtime control flow the type signature can't express — e.g. a signing
-/// interceptor that only rewrites the body when the URL ends in `/jws`, leaving
+/// interceptor that only rewrites the body when the URL ends in `/signed`, leaving
 /// the sibling route (same interceptor, different array path) untouched.
 ///
 /// Later interceptors in the list win, mirroring `rewrite_response`'s ordering.
@@ -1058,14 +1058,14 @@ mod tests {
         assert_eq!(refstr, "#/components/schemas/DataToPaginate");
     }
 
-    fn jws_controller() -> String {
+    fn signed_controller() -> String {
         r#"
             import { Project } from './project.dto';
 
-            @Controller('analyses')
-            export class AnalysisController {
-                @Get([':id', ':id/jws'])
-                @UseInterceptors(new SignResponseInterceptor('role'))
+            @Controller('books')
+            export class BooksController {
+                @Get([':id', ':id/signed'])
+                @UseInterceptors(new SigningInterceptor('role'))
                 public async findById(): Promise<Project> {
                     return null as any;
                 }
@@ -1077,20 +1077,20 @@ mod tests {
     #[test]
     fn response_override_applies_only_to_matching_path() {
         let (project, _dir, paths) = build(
-            "jws",
+            "signed",
             &[
                 ("project.dto.ts", PROJECT_DTO),
-                ("analysis.controller.ts", &jws_controller()),
+                ("books.controller.ts", &signed_controller()),
             ],
         );
         let mut config = Config::default();
         config.interceptors.insert(
-            "SignResponseInterceptor".to_string(),
+            "SigningInterceptor".to_string(),
             crate::config::InterceptorConfig {
                 ignore: false,
                 request_body: None,
                 response: Some(crate::config::ResponseOverride {
-                    when_path_ends_with: Some("/jws".to_string()),
+                    when_path_ends_with: Some("/signed".to_string()),
                     schema: json!({
                         "type": "object",
                         "properties": {
@@ -1105,20 +1105,20 @@ mod tests {
         );
         let (routes, _components) = extract(&config, &project, &[paths[1].clone()]);
 
-        let jws = routes
+        let signed = routes
             .iter()
-            .find(|r| r.path.ends_with("/jws"))
-            .expect("jws route present");
+            .find(|r| r.path.ends_with("/signed"))
+            .expect("signed route present");
         let plain = routes
             .iter()
-            .find(|r| !r.path.ends_with("/jws"))
+            .find(|r| !r.path.ends_with("/signed"))
             .expect("plain sibling present");
 
-        // The /jws sibling carries the configured JWS envelope.
-        let jws_resp = jws.response.as_ref().expect("jws response schema");
-        let props = jws_resp
+        // The /signed sibling carries the configured JWS envelope.
+        let signed_resp = signed.response.as_ref().expect("signed response schema");
+        let props = signed_resp
             .get("properties")
-            .expect("jws object with properties");
+            .expect("signed object with properties");
         assert!(props.get("protected").is_some());
         assert!(props.get("payload").is_some());
         assert!(props.get("signature").is_some());
@@ -1135,15 +1135,15 @@ mod tests {
     #[test]
     fn response_override_without_suffix_applies_to_all_paths() {
         let (project, _dir, paths) = build(
-            "jws_all",
+            "signed_all",
             &[
                 ("project.dto.ts", PROJECT_DTO),
-                ("analysis.controller.ts", &jws_controller()),
+                ("books.controller.ts", &signed_controller()),
             ],
         );
         let mut config = Config::default();
         config.interceptors.insert(
-            "SignResponseInterceptor".to_string(),
+            "SigningInterceptor".to_string(),
             crate::config::InterceptorConfig {
                 ignore: false,
                 request_body: None,

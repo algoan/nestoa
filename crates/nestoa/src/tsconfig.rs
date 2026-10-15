@@ -1,7 +1,7 @@
 //! Resolution of TypeScript `compilerOptions.paths` aliases.
 //!
 //! NestJS monorepos (Nx, pnpm workspaces) map package-style import specifiers
-//! such as `@algoan/aggregator-raw-data` onto in-repo source folders via
+//! such as `@acme/shared-dto` onto in-repo source folders via
 //! `tsconfig.base.json` `paths`. nestoa does not run `tsc`, so it resolves these
 //! aliases itself: the `extends` chain is followed to the config that declares
 //! `paths`, and each pattern is matched (including a single `*` wildcard) to a
@@ -338,15 +338,15 @@ mod tests {
     #[test]
     fn matches_exact_and_wildcard_patterns() {
         assert_eq!(
-            match_pattern("@algoan/core", "@algoan/core"),
+            match_pattern("@acme/core", "@acme/core"),
             Some(String::new())
         );
-        assert_eq!(match_pattern("@algoan/core", "@algoan/other"), None);
+        assert_eq!(match_pattern("@acme/core", "@acme/other"), None);
         assert_eq!(
-            match_pattern("@algoan/raw/*", "@algoan/raw/budget-insight"),
-            Some("budget-insight".to_string())
+            match_pattern("@acme/raw/*", "@acme/raw/books"),
+            Some("books".to_string())
         );
-        assert_eq!(match_pattern("@algoan/raw/*", "@algoan/other/x"), None);
+        assert_eq!(match_pattern("@acme/raw/*", "@acme/other/x"), None);
     }
 
     #[test]
@@ -385,25 +385,25 @@ mod tests {
                 (
                     "tsconfig.json",
                     r#"{ "compilerOptions": { "paths": {
-                        "@algoan/*": ["libs/any/*"],
-                        "@algoan/core/*": ["libs/core/*"],
-                        "@algoan/core/exact": ["libs/exact.ts"]
+                        "@acme/*": ["libs/any/*"],
+                        "@acme/core/*": ["libs/core/*"],
+                        "@acme/core/exact": ["libs/exact.ts"]
                     } } }"#,
                 ),
             ],
         );
         let paths = load_tsconfig_paths(&dir, None).unwrap();
         assert_eq!(
-            paths.resolve("@algoan/core/x"),
+            paths.resolve("@acme/core/x"),
             Some(dir.join("libs/core/x.ts"))
         );
-        assert_eq!(paths.resolve("@algoan/x"), Some(dir.join("libs/any/x.ts")));
+        assert_eq!(paths.resolve("@acme/x"), Some(dir.join("libs/any/x.ts")));
         assert_eq!(
-            paths.resolve("@algoan/core/exact"),
+            paths.resolve("@acme/core/exact"),
             Some(dir.join("libs/exact.ts"))
         );
         // The best pattern's targets are the only ones tried.
-        assert_eq!(paths.resolve("@algoan/core/missing"), None);
+        assert_eq!(paths.resolve("@acme/core/missing"), None);
     }
 
     #[test]
@@ -476,7 +476,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("tsconfig.base.json"),
-            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@algoan/core": ["libs/core/src/index.ts"] } } }"#,
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@acme/core": ["libs/core/src/index.ts"] } } }"#,
         )
         .unwrap();
         std::fs::write(
@@ -487,13 +487,13 @@ mod tests {
 
         let paths = load_tsconfig_paths(&dir.join("svc"), None).expect("load");
         assert_eq!(paths.len(), 1);
-        let resolved = paths.resolve("@algoan/core").expect("resolve alias");
+        let resolved = paths.resolve("@acme/core").expect("resolve alias");
         assert!(
             resolved.ends_with("libs/core/src/index.ts"),
             "got {:?}",
             resolved
         );
-        assert!(paths.resolve("@algoan/missing").is_none());
+        assert!(paths.resolve("@acme/missing").is_none());
     }
 
     #[test]
