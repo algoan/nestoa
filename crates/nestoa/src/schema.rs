@@ -52,9 +52,9 @@ impl ComponentSchemas {
         loop {
             let before = pending.len();
             pending.retain(
-                |(name, base, edit)| match flatten_object(&self.schemas, base, 0) {
-                    Some(obj) => {
-                        self.schemas.insert(name.clone(), apply_edit(obj, edit));
+                |(name, base, edit)| match reshape(&self.schemas, base, edit) {
+                    Some(edited) => {
+                        self.schemas.insert(name.clone(), edited);
                         false
                     }
                     None => true,
@@ -221,7 +221,7 @@ impl<'a> SchemaCtx<'a> {
                 TsLit::Str(s) => {
                     json!({ "type": "string", "enum": [s.value.to_string_lossy().into_owned()] })
                 }
-                TsLit::Number(n) => json!({ "type": "number", "enum": [n.value] }),
+                TsLit::Number(n) => json!({ "type": "number", "enum": [number_json(n.value)] }),
                 TsLit::Bool(b) => json!({ "type": "boolean", "enum": [b.value] }),
                 // A template literal type is a string whose pattern is not kept.
                 TsLit::Tpl(_) => {
@@ -236,12 +236,36 @@ impl<'a> SchemaCtx<'a> {
                 "items": self.ts_type_to_schema(file, elem_type),
             }),
             TsType::TsTupleType(t) => {
-                let items: Vec<Value> = t
-                    .elem_types
+                let (rest, fixed) = match t.elem_types.split_last() {
+                    Some((last, fixed)) if matches!(*last.ty, TsType::TsRestType(_)) => {
+                        (Some(last), fixed)
+                    }
+                    _ => (None, t.elem_types.as_slice()),
+                };
+                if fixed.iter().any(|e| matches!(*e.ty, TsType::TsRestType(_))) {
+                    let mut schema = self.unsupported(file, ty, "tuple");
+                    schema["type"] = json!("array");
+                    return schema;
+                }
+                let items: Vec<Value> = fixed
                     .iter()
                     .map(|e| self.ts_type_to_schema(file, &e.ty))
                     .collect();
-                json!({ "type": "array", "prefixItems": items, "items": false })
+                // `[A, ...B[]]` stays open: the rest element types every
+                // position past the fixed ones.
+                let tail = match rest.map(|r| &*r.ty) {
+                    Some(TsType::TsRestType(r)) => {
+                        let rest = self.ts_type_to_schema(file, &r.type_ann);
+                        match rest.get("items") {
+                            Some(items) if rest.get("type") == Some(&json!("array")) => {
+                                items.clone()
+                            }
+                            _ => json!({}),
+                        }
+                    }
+                    _ => Value::Bool(false),
+                };
+                json!({ "type": "array", "prefixItems": items, "items": tail })
             }
             // `[a, b?]`: positions are never required, so `b?` is just `b`.
             TsType::TsOptionalType(o) => self.ts_type_to_schema(file, &o.type_ann),
@@ -450,7 +474,7 @@ impl<'a> SchemaCtx<'a> {
         }
         // Built-in generic handling
         match name.as_str() {
-            "Promise" | "Observable" => {
+            "Promise" | "Observable" | "Awaited" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
@@ -479,11 +503,40 @@ impl<'a> SchemaCtx<'a> {
                     return self.reshape_object(base, &edit);
                 }
             }
-            "Readonly" | "NonNullable" => {
+            "Readonly" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
                     return self.ts_type_to_schema(file, first);
+                }
+            }
+            "NonNullable" => {
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    let schema = self.ts_type_to_schema(file, first);
+                    return strip_null(&self.components.schemas, schema);
+                }
+            }
+            "Set" | "ReadonlySet" => {
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    return json!({
+                        "type": "array",
+                        "items": self.ts_type_to_schema(file, first),
+                        "uniqueItems": true,
+                    });
+                }
+            }
+            "Map" | "ReadonlyMap" => {
+                if let Some(args) = &r.type_params
+                    && let Some(value_t) = args.params.get(1)
+                {
+                    return json!({
+                        "type": "object",
+                        "additionalProperties": self.ts_type_to_schema(file, value_t),
+                    });
                 }
             }
             "Omit" | "Pick" => {
@@ -523,11 +576,21 @@ impl<'a> SchemaCtx<'a> {
             }
             "Record" => {
                 if let Some(args) = &r.type_params
-                    && let Some(value_t) = args.params.get(1)
+                    && let [key_t, value_t] = args.params.as_slice()
                 {
+                    let value = self.ts_type_to_schema(file, value_t);
+                    if let Some(keys) = self.string_union_keys(file, key_t, 0) {
+                        let props: Map<String, Value> =
+                            keys.iter().map(|k| (k.clone(), value.clone())).collect();
+                        return json!({
+                            "type": "object",
+                            "properties": props,
+                            "required": keys,
+                        });
+                    }
                     return json!({
                         "type": "object",
-                        "additionalProperties": self.ts_type_to_schema(file, value_t),
+                        "additionalProperties": value,
                     });
                 }
                 return json!({ "type": "object" });
@@ -903,16 +966,15 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
-    /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
-    /// inlining it first so inherited properties are edited too. An operand
-    /// that is a component still being lowered (a recursive `Partial<Node>`
-    /// inside `Node`) cannot be inlined yet, so the edit is registered as its
-    /// own component and applied by `ComponentSchemas::resolve_deferred`. Any
-    /// other schema that cannot be flattened, such as a union, is returned
-    /// unchanged.
+    /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema
+    /// (see `reshape`). An operand that is a component still being lowered (a
+    /// recursive `Partial<Node>` inside `Node`) cannot be inlined yet, so the
+    /// edit is registered as its own component and applied by
+    /// `ComponentSchemas::resolve_deferred`. Any other schema that cannot be
+    /// flattened, such as a union, is returned unchanged.
     fn reshape_object(&mut self, schema: Value, edit: &ObjectEdit) -> Value {
-        if let Some(obj) = flatten_object(&self.components.schemas, &schema, 0) {
-            return apply_edit(obj, edit);
+        if let Some(edited) = reshape(&self.components.schemas, &schema, edit) {
+            return edited;
         }
         let Some(base) = self.components.pending_ref(&schema) else {
             return schema;
@@ -1373,6 +1435,63 @@ impl ObjectEdit {
     }
 }
 
+/// Apply a property-set edit to `schema`, inlined into one object first so
+/// inherited properties are edited too. A parent nestoa could not resolve
+/// (`x-unresolved`) cannot be inlined: it is kept as an `allOf` branch beside
+/// the edited remainder, so the gap stays visible. `None` when `schema` is not
+/// object-shaped.
+fn reshape(schemas: &IndexMap<String, Value>, schema: &Value, edit: &ObjectEdit) -> Option<Value> {
+    if let Some(obj) = flatten_object(schemas, schema, 0) {
+        return Some(apply_edit(obj, edit));
+    }
+    let mut unresolved = Vec::new();
+    let mut resolvable = Vec::new();
+    split_unresolved(schemas, schema, &mut unresolved, &mut resolvable, 0)?;
+    if unresolved.is_empty() || resolvable.is_empty() {
+        return None;
+    }
+    let obj = flatten_object(schemas, &json!({ "allOf": resolvable }), 0)?;
+    unresolved.push(apply_edit(obj, edit));
+    Some(json!({ "allOf": unresolved }))
+}
+
+/// Split an object schema into its `x-unresolved` parents and the branches
+/// that flatten, following `$ref`s and `allOf`s. `None` if any other part
+/// cannot be flattened.
+fn split_unresolved(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    unresolved: &mut Vec<Value>,
+    resolvable: &mut Vec<Value>,
+    depth: usize,
+) -> Option<()> {
+    const MAX_DEPTH: usize = 32;
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    if flatten_object(schemas, schema, depth).is_some() {
+        resolvable.push(schema.clone());
+        return Some(());
+    }
+    let map = schema.as_object()?;
+    if map.contains_key("x-unresolved") {
+        unresolved.push(schema.clone());
+        return Some(());
+    }
+    if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+        let target = schemas.get(target.strip_prefix("#/components/schemas/")?)?;
+        return split_unresolved(schemas, target, unresolved, resolvable, depth + 1);
+    }
+    let branches = map.get("allOf")?.as_array()?;
+    if map.keys().any(|k| k != "allOf" && !is_annotation(k)) {
+        return None;
+    }
+    for branch in branches {
+        split_unresolved(schemas, branch, unresolved, resolvable, depth + 1)?;
+    }
+    Some(())
+}
+
 /// Edit the property set of a flattened object schema.
 fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
     let keys: Vec<String> = match obj.get("properties") {
@@ -1624,6 +1743,62 @@ fn callee_name(e: &Expr) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// `NonNullable<T>`: `schema` without its `null` member. A `$ref` to a
+/// nullable component is inlined, since the component itself must stay as is.
+fn strip_null(schemas: &IndexMap<String, Value>, schema: Value) -> Value {
+    strip_null_at(schemas, schema, 0)
+}
+
+fn strip_null_at(schemas: &IndexMap<String, Value>, schema: Value, depth: usize) -> Value {
+    const MAX_DEPTH: usize = 16;
+    let Value::Object(mut m) = schema else {
+        return schema;
+    };
+    if let Some(target) = m
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .and_then(|name| schemas.get(name))
+        && depth < MAX_DEPTH
+    {
+        let stripped = strip_null_at(schemas, target.clone(), depth + 1);
+        return if stripped == *target {
+            Value::Object(m)
+        } else {
+            stripped
+        };
+    }
+    match m.get("type").cloned() {
+        Some(Value::String(t)) if t == "null" => return json!({ "not": {} }),
+        Some(Value::Array(types)) => {
+            let kept: Vec<Value> = types
+                .into_iter()
+                .filter(|t| t.as_str() != Some("null"))
+                .collect();
+            let kept = match <[Value; 1]>::try_from(kept) {
+                Ok([single]) => single,
+                Err(kept) => Value::Array(kept),
+            };
+            m.insert("type".into(), kept);
+        }
+        _ => {}
+    }
+    if let Some(Value::Array(values)) = m.get_mut("enum") {
+        values.retain(|v| !v.is_null());
+    }
+    let only_key = m.len() == 1;
+    for key in ["anyOf", "oneOf"] {
+        let Some(Value::Array(branches)) = m.get_mut(key) else {
+            continue;
+        };
+        branches.retain(|b| b.get("type").and_then(Value::as_str) != Some("null"));
+        if branches.len() == 1 && only_key {
+            return branches.pop().expect("one branch");
+        }
+    }
+    Value::Object(m)
 }
 
 /// Encode "may also be null" the OpenAPI 3.1 way.
@@ -2988,6 +3163,138 @@ mod tests {
     }
 
     #[test]
+    fn utility_types_edit_the_resolvable_part_of_an_unresolved_parent() {
+        let [partial, pick, omit] = lower_all(
+            "import { External } from '@acme/missing';\n\
+             export class Mid extends External { title: string; }\n\
+             export class Book extends Mid { pages: number; }",
+            "import { Book } from './dto';\n\
+             export type A = Partial<Book>;\n\
+             export type B = Pick<Book, 'title'>;\n\
+             export type C = Omit<Book, 'title'>;",
+            &["A", "B", "C"],
+        )
+        .try_into()
+        .unwrap();
+        let unresolved = json!({"x-unresolved": "External"});
+        assert_eq!(partial["allOf"][0], unresolved, "got {partial}");
+        assert_eq!(prop_names(&partial["allOf"][1]), ["title", "pages"]);
+        assert!(
+            partial["allOf"][1].get("required").is_none(),
+            "got {partial}"
+        );
+        assert_eq!(pick["allOf"][0], unresolved);
+        assert_eq!(prop_names(&pick["allOf"][1]), ["title"]);
+        assert_eq!(required_names(&pick["allOf"][1]), ["title"]);
+        assert_eq!(prop_names(&omit["allOf"][1]), ["pages"]);
+        assert_eq!(required_names(&omit["allOf"][1]), ["pages"]);
+    }
+
+    #[test]
+    fn non_nullable_strips_null() {
+        let [holder] = lower_all(
+            "export type MaybeTitle = string | null;",
+            "import { MaybeTitle } from './dto';\n\
+             export interface Holder {\n\
+               a: NonNullable<string | null>;\n\
+               b: NonNullable<'x' | 'y' | null>;\n\
+               c: NonNullable<Holder | null>;\n\
+               d: NonNullable<MaybeTitle>;\n\
+               e: NonNullable<string | number | null>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"], json!({"type": "string"}));
+        assert_eq!(p["b"], json!({"type": "string", "enum": ["x", "y"]}));
+        assert_eq!(p["c"], json!({"$ref": "#/components/schemas/Holder"}));
+        assert_eq!(p["d"], json!({"type": "string"}));
+        assert_eq!(
+            p["e"],
+            json!({"anyOf": [{"type": "string"}, {"type": "number"}]})
+        );
+    }
+
+    #[test]
+    fn record_with_literal_keys_lists_its_properties() {
+        let [holder] = lower_all(
+            "export type Slot = 'am' | 'pm';",
+            "import { Slot } from './dto';\n\
+             export interface Holder {\n\
+               a: Record<'x' | 'y', number>;\n\
+               b: Partial<Record<Slot, string>>;\n\
+               c: Record<string, number>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({
+                "type": "object",
+                "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                "required": ["x", "y"]
+            })
+        );
+        assert_eq!(
+            p["b"],
+            json!({
+                "type": "object",
+                "properties": {"am": {"type": "string"}, "pm": {"type": "string"}}
+            })
+        );
+        assert_eq!(
+            p["c"],
+            json!({"type": "object", "additionalProperties": {"type": "number"}})
+        );
+    }
+
+    #[test]
+    fn tuple_rest_element_becomes_the_open_items() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: [string, ...number[]];\n\
+               b: [string, ...Array<boolean>];\n\
+               c: [...string[], number];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"type": "array", "prefixItems": [{"type": "string"}], "items": {"type": "number"}})
+        );
+        assert_eq!(p["b"]["items"], json!({"type": "boolean"}));
+        assert_eq!(
+            p["c"],
+            json!({"type": "array", "x-unresolved": "[...string[], number]"})
+        );
+    }
+
+    #[test]
+    fn whole_number_literal_types_are_integers() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { a: 42; b: -1; c: 1.5; d: 1 | 2; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"], json!({"type": "number", "enum": [42]}));
+        assert_eq!(p["b"], json!({"type": "number", "enum": [-1]}));
+        assert_eq!(p["c"], json!({"type": "number", "enum": [1.5]}));
+        assert_eq!(p["d"], json!({"type": "number", "enum": [1, 2]}));
+    }
+
+    #[test]
     fn enum_members_computed_from_siblings_are_evaluated() {
         let [flags, aliases] = lower_all(
             "",
@@ -3000,5 +3307,34 @@ mod tests {
         assert_eq!(flags["enum"], json!([0, 1, 2, 3, 4, -1]));
         assert_eq!(aliases["type"], json!(["string", "number"]));
         assert_eq!(aliases["enum"], json!(["first", "first", 3, 4]));
+    }
+
+    #[test]
+    fn awaited_set_and_map_are_lowered() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Awaited<Promise<string>>;\n\
+               b: Set<number>;\n\
+               c: ReadonlySet<string>;\n\
+               d: Map<string, boolean>;\n\
+               e: ReadonlyMap<string, number>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"], json!({"type": "string"}));
+        assert_eq!(
+            p["b"],
+            json!({"type": "array", "items": {"type": "number"}, "uniqueItems": true})
+        );
+        assert_eq!(p["c"]["uniqueItems"], json!(true));
+        assert_eq!(
+            p["d"],
+            json!({"type": "object", "additionalProperties": {"type": "boolean"}})
+        );
+        assert_eq!(p["e"]["additionalProperties"], json!({"type": "number"}));
     }
 }
