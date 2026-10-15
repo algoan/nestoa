@@ -21,6 +21,8 @@
 //! | `type: "null"` on its own                | unconstrained — the type is lost   |
 //! | `type: [A, B]` (multi-type)              | `anyOf: [{type: A}, {type: B}]`    |
 //! | `const: v`                               | `enum: [v]`                        |
+//! | `exclusiveMinimum: n`                    | `minimum: n` + `exclusiveMinimum: true` |
+//! | `examples: [a, …]` on a schema           | `example: a`                       |
 //!
 //! The nullable-union and standalone-null rows are real losses, and
 //! unavoidable rather than shortcuts:
@@ -41,10 +43,10 @@
 //! its schema downgraded (`is_name_keyed_map`).
 //!
 //! Tuples degrade rather than disappear. `[A, B]` lowers to `prefixItems` +
-//! `items: false` in 3.1; 3.0.3 arrays are homogeneous, so the element schemas
-//! are merged into a single `items` and the closed length becomes `maxItems`.
-//! Element *order* is what gets lost. Only that closed shape is converted —
-//! see `downgrade_tuple` for why an open tuple is left alone.
+//! `items: false` in 3.1, and `[A, ...B[]]` to `prefixItems` + `items: B`;
+//! 3.0.3 arrays are homogeneous, so the element schemas are merged into a
+//! single `items` and a closed length becomes `maxItems`. Element *order* is
+//! what gets lost.
 
 use serde_json::{Map, Value, json};
 
@@ -65,6 +67,9 @@ pub fn downgrade_to_30(doc: &mut Value) {
             downgrade_null_enum(map);
             downgrade_standalone_null(map);
             downgrade_const(map);
+            downgrade_exclusive_bound(map, "exclusiveMinimum", "minimum");
+            downgrade_exclusive_bound(map, "exclusiveMaximum", "maximum");
+            downgrade_examples(map);
             for (key, value) in map.iter_mut() {
                 if is_name_keyed_map(key) {
                     // `properties`, `paths`, `content`, … are keyed by names
@@ -142,6 +147,12 @@ fn downgrade_null_enum(map: &mut Map<String, Value>) {
         return;
     }
     let kept: Vec<Value> = values.iter().filter(|v| !v.is_null()).cloned().collect();
+    // `enum: [null]` is a null-only schema, which 3.0.3 cannot express, and an
+    // empty `enum` is invalid: drop the constraint, as for `type: "null"`.
+    if kept.is_empty() {
+        map.remove("enum");
+        return;
+    }
     map.insert("enum".into(), Value::Array(kept));
     if map.contains_key("type") {
         map.insert("nullable".into(), Value::Bool(true));
@@ -244,19 +255,13 @@ fn downgrade_standalone_null(map: &mut Map<String, Value>) {
     }
 }
 
-/// A closed `prefixItems` tuple -> a homogeneous array approximating it.
+/// A `prefixItems` tuple -> a homogeneous array approximating it.
 ///
-/// Only the shape `schema.rs` emits is handled: `prefixItems` alongside
-/// `items: false`. 3.0.3 arrays have one element schema, so the per-position
-/// schemas are merged into a single `items` and the closed length becomes
-/// `maxItems`. Element order is what gets lost.
-///
-/// An *open* tuple (`items` absent, `true`, or a tail schema) is left exactly
-/// as it is. Approximating one means guessing how to fold a tail into the
-/// element schema and what bounds to invent, and nothing in the analyser
-/// produces one — only a hand-written `interceptors[].response.schema` could,
-/// and its author is better placed than this pass to decide what it should
-/// become in 3.0.3.
+/// 3.0.3 arrays have one element schema, so the per-position schemas, and the
+/// tail schema of an open tuple (`[A, ...B[]]` lowers to `items: B`), are
+/// merged into a single `items`. Element order is what gets lost. A closed
+/// tuple (`items: false`) caps the length with `maxItems`; an open one has no
+/// upper bound.
 ///
 /// Note what is *not* synthesized: `prefixItems` constrains the positions an
 /// array happens to have, it does not require them, so a shorter array is
@@ -265,22 +270,31 @@ fn downgrade_standalone_null(map: &mut Map<String, Value>) {
 /// contracts. (That the 3.1 lowering is itself looser than the TypeScript
 /// tuple it comes from is a `schema.rs` question, not one for the downgrade.)
 fn downgrade_tuple(map: &mut Map<String, Value>) {
-    if map.get("items") != Some(&Value::Bool(false)) {
-        return;
-    }
     let Some(Value::Array(prefix)) = map.remove("prefixItems") else {
         return;
     };
-    map.remove("items");
     let arity = prefix.len();
+    let mut elements = prefix;
+    let closed = match map.remove("items") {
+        Some(Value::Bool(false)) => true,
+        // Absent or `true`: every position past the prefix admits anything.
+        None | Some(Value::Bool(true)) => {
+            elements.push(json!({}));
+            false
+        }
+        Some(tail) => {
+            elements.push(tail);
+            false
+        }
+    };
 
     // A position accepting anything (`true`, or `{}`) makes the whole
     // homogeneous approximation unconstrained — no single element schema
     // admits it while still narrowing the others.
     let constrains = |e: &Value| e.as_object().is_some_and(|m| !m.is_empty());
-    if prefix.iter().all(constrains) {
+    if elements.iter().all(constrains) {
         let mut distinct: Vec<Value> = Vec::new();
-        for element in prefix {
+        for element in elements {
             if !distinct.contains(&element) {
                 distinct.push(element);
             }
@@ -297,6 +311,9 @@ fn downgrade_tuple(map: &mut Map<String, Value>) {
         }
     }
 
+    if !closed {
+        return;
+    }
     // A closed tuple caps the length. Intersect rather than overwrite, so an
     // existing tighter bound survives.
     let capped = match map.get("maxItems").and_then(Value::as_u64) {
@@ -304,6 +321,47 @@ fn downgrade_tuple(map: &mut Map<String, Value>) {
         None => arity as u64,
     };
     map.insert("maxItems".into(), json!(capped));
+}
+
+/// A numeric `exclusiveMinimum: n` (2020-12) -> `minimum: n` +
+/// `exclusiveMinimum: true` (3.0.3, where the keyword is a flag on the bound),
+/// and likewise for the maximum. An inclusive bound already tighter than `n`
+/// is kept on its own.
+fn downgrade_exclusive_bound(map: &mut Map<String, Value>, exclusive: &str, bound: &str) {
+    let Some(limit) = map.get(exclusive).filter(|v| v.is_number()).cloned() else {
+        return;
+    };
+    let (Some(n), existing) = (limit.as_f64(), map.get(bound).and_then(Value::as_f64)) else {
+        return;
+    };
+    let tighter = match existing {
+        Some(b) if exclusive == "exclusiveMinimum" => b > n,
+        Some(b) => b < n,
+        None => false,
+    };
+    if tighter {
+        map.remove(exclusive);
+    } else {
+        map.insert(bound.into(), limit);
+        map.insert(exclusive.into(), Value::Bool(true));
+    }
+}
+
+/// A schema's `examples: [a, …]` (2020-12) -> `example: a`. 3.0.3 schemas only
+/// have the single `example`; an `examples` map (on a parameter or a media
+/// type) is valid 3.0.3 and is left alone.
+fn downgrade_examples(map: &mut Map<String, Value>) {
+    if !map.get("examples").is_some_and(Value::is_array) {
+        return;
+    }
+    let Some(Value::Array(examples)) = map.remove("examples") else {
+        return;
+    };
+    if !map.contains_key("example")
+        && let Some(first) = examples.into_iter().next()
+    {
+        map.insert("example".into(), first);
+    }
 }
 
 /// `const: v` -> `enum: [v]`, the 3.0.3 way to pin a single value.
@@ -578,17 +636,71 @@ mod tests {
     }
 
     #[test]
-    fn leaves_an_open_tuple_alone() {
-        // Only the closed shape the analyser emits is converted. An open
-        // tuple would need invented bounds and a guessed element merge, so it
-        // is passed through for its author to deal with.
-        for tail in [json!({"type": "number"}), json!(true), Value::Null] {
+    fn merges_an_open_tuple_with_its_tail_and_leaves_it_uncapped() {
+        assert_eq!(
+            down(json!({
+                "type": "array",
+                "prefixItems": [{"type": "string"}],
+                "items": {"type": "number"}
+            })),
+            json!({
+                "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "number"}]}
+            })
+        );
+        // A tail that admits anything leaves every element unconstrained.
+        for tail in [json!(true), Value::Null] {
             let mut doc = json!({"type": "array", "prefixItems": [{"type": "string"}]});
             if !tail.is_null() {
                 doc["items"] = tail;
             }
-            assert_eq!(down(doc.clone()), doc);
+            assert_eq!(down(doc), json!({"type": "array"}));
         }
+    }
+
+    #[test]
+    fn rewrites_numeric_exclusive_bounds_as_boolean_flags() {
+        assert_eq!(
+            down(json!({"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 10})),
+            json!({
+                "type": "number",
+                "minimum": 0,
+                "exclusiveMinimum": true,
+                "maximum": 10,
+                "exclusiveMaximum": true
+            })
+        );
+        // An inclusive bound that is already tighter wins.
+        assert_eq!(
+            down(json!({"type": "number", "minimum": 5, "exclusiveMinimum": 0})),
+            json!({"type": "number", "minimum": 5})
+        );
+        // Already 3.0.
+        let flagged = json!({"type": "number", "minimum": 0, "exclusiveMinimum": true});
+        assert_eq!(down(flagged.clone()), flagged);
+    }
+
+    #[test]
+    fn keeps_the_first_of_a_schema_examples_array_as_its_example() {
+        assert_eq!(
+            down(json!({"type": "string", "examples": ["a", "b"]})),
+            json!({"type": "string", "example": "a"})
+        );
+        assert_eq!(
+            down(json!({"type": "string", "example": "x", "examples": ["a"]})),
+            json!({"type": "string", "example": "x"})
+        );
+        // A media type's `examples` map is valid 3.0.3.
+        let media = json!({"examples": {"one": {"value": 1}}});
+        assert_eq!(down(media.clone()), media);
+    }
+
+    #[test]
+    fn a_null_only_enum_becomes_unconstrained() {
+        assert_eq!(
+            down(json!({"enum": [null], "description": "d"})),
+            json!({"description": "d"})
+        );
     }
 
     #[test]
