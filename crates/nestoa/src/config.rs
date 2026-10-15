@@ -45,7 +45,7 @@ pub struct Config {
     pub info: Info,
 
     /// Resolve TypeScript `compilerOptions.paths` aliases (e.g. workspace
-    /// packages like `@algoan/core` that map to in-repo `libs/*/src`). Reads the
+    /// packages like `@acme/core` that map to in-repo `libs/*/src`). Reads the
     /// project's `tsconfig.json`, following `extends`. Defaults to true.
     #[serde(default = "default_true")]
     pub resolve_tsconfig_paths: bool,
@@ -57,8 +57,8 @@ pub struct Config {
 
     /// node_modules package names (glob patterns) whose TypeScript declarations
     /// should be parsed so their exported types resolve to real schemas instead
-    /// of `x-unresolved`. For example `["@algoan/*"]` pulls in the typings of
-    /// every `@algoan` package referenced by a route. Empty by default, so no
+    /// of `x-unresolved`. For example `["@acme/*"]` pulls in the typings of
+    /// every `@acme` package referenced by a route. Empty by default, so no
     /// third-party packages are inlined unless explicitly opted in.
     #[serde(default)]
     pub resolve_packages: Vec<String>,
@@ -98,7 +98,7 @@ pub struct Config {
 /// Configuration for automatic error-response generation. Recovers the
 /// `400`/`401`/`403`/`404`/`409`/`413`/`422` responses NestJS produces but that
 /// never appear in a handler's return type. Every field defaults to a value
-/// grounded in the surveyed `@algoan` services, so an empty `errorResponses`
+/// grounded in common NestJS setups, so an empty `errorResponses`
 /// (or none at all) still auto-emits the deterministic set: `401` for guarded
 /// routes, `403` for `@Roles`, `400` for validated bodies, and the pipe-mapped
 /// `404`/`400`. The map only *tunes* names/scope and *adds* the service-thrown
@@ -148,8 +148,8 @@ pub struct ErrorResponses {
     pub scan_throws: bool,
 
     /// Pipe class name -> the status it throws on invalid input, applied to
-    /// pipes on `@Param`/`@Query`. Defaults cover the `@algoan` pipes (which
-    /// throw `404`, not `400`) and Nest's built-in parse pipes.
+    /// pipes on `@Param`/`@Query`. Defaults cover the common id/date parsing
+    /// pipes (which throw `404`, not `400`) and Nest's built-in parse pipes.
     #[serde(default = "default_pipes")]
     pub pipes: indexmap::IndexMap<String, u16>,
 
@@ -215,15 +215,15 @@ pub struct GlobalError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RouteErrors {
-    /// Match routes whose full path ends with this suffix (e.g. `/aggregate`).
+    /// Match routes whose full path ends with this suffix (e.g. `/publish`).
     #[serde(default)]
     pub when_path_ends_with: Option<String>,
     /// Match the route whose full path equals this exactly.
     #[serde(default)]
     pub path: Option<String>,
     /// Restrict the match to a single HTTP method (e.g. `post`), so sibling
-    /// routes sharing a path — `POST /customers` (which `409`/`422`s) vs
-    /// `GET /customers` (which doesn't) — can be targeted independently. Matched
+    /// routes sharing a path — `POST /owners` (which `409`/`422`s) vs
+    /// `GET /owners` (which doesn't) — can be targeted independently. Matched
     /// case-insensitively. When omitted, every method on the path matches.
     #[serde(default)]
     pub method: Option<String>,
@@ -245,9 +245,9 @@ pub struct InterceptorConfig {
     /// Response-body override for interceptors whose wire shape cannot be
     /// recovered from `NestInterceptor<In, Out>` — typically because the
     /// transform is runtime control flow (e.g. signing the body only when the
-    /// request path ends in `/jws`). The supplied schema replaces the route's
+    /// request path ends in `/signed`). The supplied schema replaces the route's
     /// response, optionally gated on a path suffix so sibling routes that share
-    /// the same interceptor (array-valued `@Get([':id', ':id/jws'])`) keep their
+    /// the same interceptor (array-valued `@Get([':id', ':id/signed'])`) keep their
     /// untransformed shape.
     #[serde(default)]
     pub response: Option<ResponseOverride>,
@@ -258,7 +258,7 @@ pub struct InterceptorConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResponseOverride {
     /// Only apply the override to routes whose path ends with this suffix (e.g.
-    /// `/jws`). When omitted, the override applies to every route carrying the
+    /// `/signed`). When omitted, the override applies to every route carrying the
     /// interceptor.
     #[serde(default)]
     pub when_path_ends_with: Option<String>,
@@ -377,7 +377,7 @@ fn default_role_decorators() -> Vec<String> {
     vec!["Roles".into()]
 }
 
-/// Pipe -> rejection status. The `@algoan` `ParseObjectIdPipe`/`ParseDatePipe`
+/// Pipe -> rejection status. `ParseObjectIdPipe`/`ParseDatePipe` conventionally
 /// throw `404` (not the conventional `400`); Nest's built-in parse pipes and
 /// `ValidationPipe` throw `400`.
 fn default_pipes() -> indexmap::IndexMap<String, u16> {
@@ -548,20 +548,20 @@ mod tests {
     fn parses_response_override() {
         let cfg: Config = serde_json::from_str(
             r#"{ "interceptors": {
-                "SignResponseInterceptor": {
+                "SigningInterceptor": {
                     "response": {
-                        "whenPathEndsWith": "/jws",
+                        "whenPathEndsWith": "/signed",
                         "schema": { "type": "object", "properties": { "signature": { "type": "string" } } }
                     }
                 }
             } }"#,
         )
         .expect("valid response override config parses");
-        let ov = cfg.interceptors["SignResponseInterceptor"]
+        let ov = cfg.interceptors["SigningInterceptor"]
             .response
             .as_ref()
             .expect("response override present");
-        assert_eq!(ov.when_path_ends_with.as_deref(), Some("/jws"));
+        assert_eq!(ov.when_path_ends_with.as_deref(), Some("/signed"));
         assert_eq!(ov.schema["type"], "object");
     }
 
@@ -569,7 +569,7 @@ mod tests {
     fn merge_value_overrides_scalars_and_merges_objects() {
         let mut base = serde_json::json!({
             "output": "openapi.yaml",
-            "resolvePackages": ["@algoan/*"],
+            "resolvePackages": ["@acme/*"],
             "info": { "title": "Base", "version": "1.0" }
         });
         merge_value(
@@ -577,7 +577,7 @@ mod tests {
             serde_json::json!({ "info": { "title": "Child" } }),
         );
         assert_eq!(base["output"], "openapi.yaml");
-        assert_eq!(base["resolvePackages"][0], "@algoan/*");
+        assert_eq!(base["resolvePackages"][0], "@acme/*");
         assert_eq!(base["info"]["title"], "Child"); // child overrides
         assert_eq!(base["info"]["version"], "1.0"); // sibling inherited
     }
@@ -596,7 +596,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("services/svc")).unwrap();
         std::fs::write(
             dir.join("nestoa.base.json"),
-            r#"{ "output": "openapi.yaml", "resolvePackages": ["@algoan/*"] }"#,
+            r#"{ "output": "openapi.yaml", "resolvePackages": ["@acme/*"] }"#,
         )
         .unwrap();
         std::fs::write(
@@ -612,7 +612,7 @@ mod tests {
         .expect("config with extends loads");
         assert_eq!(cfg.info.title, "Svc"); // from child
         assert_eq!(cfg.info.version, "2.0"); // from child
-        assert_eq!(cfg.resolve_packages, vec!["@algoan/*".to_string()]); // from base
+        assert_eq!(cfg.resolve_packages, vec!["@acme/*".to_string()]); // from base
         assert_eq!(cfg.output, PathBuf::from("openapi.yaml")); // from base
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -690,7 +690,7 @@ mod tests {
             r#"{ "errorResponses": {
                 "auth": "per-controller",
                 "pipes": { "ParseObjectIdPipe": 400 },
-                "routes": [ { "whenPathEndsWith": "/aggregate", "add": [409] } ],
+                "routes": [ { "whenPathEndsWith": "/publish", "add": [409] } ],
                 "global": [ { "status": 413, "whenPathEndsWith": "/logo" } ]
             } }"#,
         )
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(er.routes[0].add, vec![409]);
         assert_eq!(
             er.routes[0].when_path_ends_with.as_deref(),
-            Some("/aggregate")
+            Some("/publish")
         );
         assert_eq!(er.global[0].status, 413);
     }

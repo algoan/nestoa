@@ -341,7 +341,7 @@ impl<'a> Extractor<'a> {
             if name == "HttpCode" {
                 // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
                 // where the argument names a numeric `const` (possibly
-                // imported from another module, e.g. `@algoan/multi-status`).
+                // imported from another module, e.g. a shared constants package).
                 http_code = numeric_arg(d)
                     .or_else(|| {
                         ident_arg(d)
@@ -580,7 +580,7 @@ impl<'a> Extractor<'a> {
 
         // Per-path response is filled in below: an interceptor may override
         // it for only some of the route's sibling paths (e.g. a signing
-        // interceptor that rewrites the body solely on the `/jws` variant).
+        // interceptor that rewrites the body solely on the `/signed` variant).
         let template = Route {
             method: HttpMethod::Get,
             path: String::new(),
@@ -1728,8 +1728,8 @@ pub(crate) fn openapi_params(path: &str) -> String {
 }
 
 /// Whether an OpenAPI path matches a `@route-mapping` key. The key names a
-/// trailing portion of the path (usually the last segment, e.g. `incomes`, but
-/// possibly several, e.g. `incomes/start`); it matches when the path equals it
+/// trailing portion of the path (usually the last segment, e.g. `chapters`, but
+/// possibly several, e.g. `chapters/start`); it matches when the path equals it
 /// or ends with `/<suffix>`. Leading/trailing slashes on the key are ignored.
 fn path_matches_suffix(path: &str, suffix: &str) -> bool {
     let suffix = suffix.trim_matches('/');
@@ -2217,8 +2217,8 @@ mod tests {
     #[test]
     fn http_code_resolves_imported_numeric_const() {
         // `@HttpCode(MULTI_STATUS)` where the constant is declared in one module
-        // and re-exported through a barrel (`export *`) — mirrors folder-manager
-        // importing `MULTI_STATUS` from `@algoan/multi-status`.
+        // and re-exported through a barrel (`export *`) — as when a service
+        // imports `MULTI_STATUS` from a shared constants package.
         let controller = r#"
             import { MULTI_STATUS } from './lib';
 
@@ -2260,9 +2260,9 @@ mod tests {
                 @Unprotected()
                 public async create(@Body() dto: CreateDto): Promise<string> {}
 
-                @Get(':id/scores')
+                @Get(':id/reviews')
                 @Roles({ roles: ['reader'] })
-                public async scores(@Param('id', new ParseObjectIdPipe()) id: string): Promise<string> {
+                public async reviews(@Param('id', new ParseObjectIdPipe()) id: string): Promise<string> {
                     if (disabled) {
                         throw new UnprocessableEntityException('product disabled');
                     }
@@ -2291,11 +2291,14 @@ mod tests {
         // @Unprotected suppresses 401; no @Roles; a @Body DTO yields 400.
         assert_eq!(post.errors.keys().copied().collect::<Vec<_>>(), vec![400]);
 
-        // The scores route throws UnprocessableEntityException in its body → 422
+        // The reviews route throws UnprocessableEntityException in its body → 422
         // is detected on top of auth (401), role (403), and pipe (404).
-        let scores = routes.iter().find(|r| r.path.ends_with("/scores")).unwrap();
+        let reviews = routes
+            .iter()
+            .find(|r| r.path.ends_with("/reviews"))
+            .unwrap();
         assert_eq!(
-            scores.errors.keys().copied().collect::<Vec<_>>(),
+            reviews.errors.keys().copied().collect::<Vec<_>>(),
             vec![401, 403, 404, 422]
         );
 
@@ -2460,25 +2463,39 @@ mod tests {
             "multi",
             r#"
             @Controller([
-                'organizations/:organizationId/service-accounts',
-                'organizations/:organizationId/projects/:projectId/service-accounts',
+                'organizations/:organizationId/libraries',
+                'organizations/:organizationId/projects/:projectId/libraries',
             ])
             export class ServiceAccountsController {
-                @Get([':analysisId/incomes', ':analysisId/expenses'])
+                @Get([':bookId/chapters', ':bookId/reviews'])
                 findAll() {}
             }
             "#,
         );
         let paths: Vec<String> = routes.iter().map(|(_, p)| p.clone()).collect();
         assert_eq!(paths.len(), 4, "2 base paths x 2 sub paths");
-        assert!(paths.contains(
-            &"/organizations/{organizationId}/service-accounts/{analysisId}/incomes".to_string()
-        ));
-        assert!(paths.contains(
-            &"/organizations/{organizationId}/service-accounts/{analysisId}/expenses".to_string()
-        ));
-        assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/incomes".to_string()));
-        assert!(paths.contains(&"/organizations/{organizationId}/projects/{projectId}/service-accounts/{analysisId}/expenses".to_string()));
+        assert!(
+            paths.contains(
+                &"/organizations/{organizationId}/libraries/{bookId}/chapters".to_string()
+            )
+        );
+        assert!(
+            paths.contains(
+                &"/organizations/{organizationId}/libraries/{bookId}/reviews".to_string()
+            )
+        );
+        assert!(
+            paths.contains(
+                &"/organizations/{organizationId}/projects/{projectId}/libraries/{bookId}/chapters"
+                    .to_string()
+            )
+        );
+        assert!(
+            paths.contains(
+                &"/organizations/{organizationId}/projects/{projectId}/libraries/{bookId}/reviews"
+                    .to_string()
+            )
+        );
     }
 
     /// Extract the routes of a single in-memory controller file.
@@ -3030,7 +3047,7 @@ mod tests {
                      const SHORT = 'short';\n\
                      const NESTED = { DEEP: 'deep' };\n\
                      export const ROUTES = { LIST: 'list', ITEM: { ONE: ':id' }, SHORT, NESTED } as const;\n\
-                     export enum Alias { LINXO = 'linxo' }\n\
+                     export enum Alias { CAT = 'cat' }\n\
                      export const BOTH = ['a', 'b'];\n\
                      export const ALIAS = BOTH;\n\
                      export const GROUPS = { PAIR: ['c', 'd'] };",
@@ -3049,7 +3066,7 @@ mod tests {
                         @Get(ROUTES.ITEM.ONE) one() {}
                         @Get(ROUTES.SHORT) short() {}
                         @Get(ROUTES.NESTED.DEEP) deep() {}
-                        @Get(`redirect/${Alias.LINXO}`) linxo() {}
+                        @Get(`redirect/${Alias.CAT}`) cat() {}
                         @Get(LOCAL + '/x') local() {}
                         @Get(`v${1 + 1}`) sum() {}
                         @Get(BOTH) both() {}
@@ -3078,7 +3095,7 @@ mod tests {
                 "/things/deep",
                 "/things/list",
                 "/things/local/x",
-                "/things/redirect/linxo",
+                "/things/redirect/cat",
                 "/things/short",
                 "/things/short/ns",
                 "/things/v2",

@@ -163,7 +163,7 @@ fn main() -> Result<()> {
     }
 
     // Load tsconfig `paths` aliases so workspace package imports (e.g.
-    // `@algoan/core` -> `libs/core/src`) resolve to in-repo source.
+    // `@acme/core` -> `libs/core/src`) resolve to in-repo source.
     if cfg.resolve_tsconfig_paths {
         project.tsconfig_paths =
             tsconfig::load_tsconfig_paths(&project_root, cfg.tsconfig.as_deref());

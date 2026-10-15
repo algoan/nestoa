@@ -339,13 +339,13 @@ mod tests {
 
     #[test]
     fn parses_throws_tag_variants() {
-        let raw = "\n * Trigger the thing\n * @throws 409 Conflict when already aggregated\n * @throws {422} product disabled\n * @throws 404\n * @exception {ConflictException} no numeric code, skipped\n ";
+        let raw = "\n * Trigger the thing\n * @throws 409 Conflict when already published\n * @throws {422} author disabled\n * @throws 404\n * @exception {ConflictException} no numeric code, skipped\n ";
         let doc = JsDoc::parse(raw);
         assert_eq!(
             doc.throws,
             vec![
-                (409, Some("Conflict when already aggregated".to_string())),
-                (422, Some("product disabled".to_string())),
+                (409, Some("Conflict when already published".to_string())),
+                (422, Some("author disabled".to_string())),
                 (404, None),
             ]
         );

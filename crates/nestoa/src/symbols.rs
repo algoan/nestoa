@@ -203,7 +203,7 @@ pub struct Project {
     pub files: HashMap<PathBuf, ParsedFile>,
     pub symbols: HashMap<PathBuf, FileSymbols>,
     /// TypeScript `compilerOptions.paths` aliases, used to resolve workspace
-    /// package imports (e.g. `@algoan/core`) to in-repo source.
+    /// package imports (e.g. `@acme/core`) to in-repo source.
     pub tsconfig_paths: Option<crate::tsconfig::TsPaths>,
     pub resolver: Resolver,
 }
@@ -1071,7 +1071,7 @@ fn existing(path: PathBuf) -> Option<PathBuf> {
 }
 
 /// Split a bare module specifier into `(package_name, subpath)`.
-/// `"@algoan/aggregator-raw-data/budget-insight"` -> `("@algoan/aggregator-raw-data", "budget-insight")`.
+/// `"@acme/shared-dto/books"` -> `("@acme/shared-dto", "books")`.
 /// `"lodash"` -> `("lodash", "")`.
 pub fn split_package_specifier(specifier: &str) -> (String, String) {
     let parts: Vec<&str> = specifier
@@ -1092,7 +1092,7 @@ pub fn split_package_specifier(specifier: &str) -> (String, String) {
     }
 }
 
-/// The package name portion of a bare specifier (e.g. `@algoan/foo/bar` -> `@algoan/foo`).
+/// The package name portion of a bare specifier (e.g. `@acme/foo/bar` -> `@acme/foo`).
 pub fn package_name(specifier: &str) -> String {
     split_package_specifier(specifier).0
 }
@@ -1348,15 +1348,12 @@ mod tests {
     #[test]
     fn splits_scoped_and_plain_specifiers() {
         assert_eq!(
-            split_package_specifier("@algoan/aggregator-raw-data/budget-insight"),
-            (
-                "@algoan/aggregator-raw-data".to_string(),
-                "budget-insight".to_string()
-            )
+            split_package_specifier("@acme/shared-dto/books"),
+            ("@acme/shared-dto".to_string(), "books".to_string())
         );
         assert_eq!(
-            split_package_specifier("@algoan/aggregator-raw-data"),
-            ("@algoan/aggregator-raw-data".to_string(), String::new())
+            split_package_specifier("@acme/shared-dto"),
+            ("@acme/shared-dto".to_string(), String::new())
         );
         assert_eq!(
             split_package_specifier("lodash/fp"),
