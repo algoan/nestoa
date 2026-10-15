@@ -29,7 +29,7 @@ Every key is optional, and an unknown key is an error.
 | `output` | `openapi.json` | [output](output.md) |
 | `format` | from the `output` extension | [format](format.md) |
 | `openapiVersion` | `3.1.0` | [openapiVersion](openapi-version.md) |
-| `info` | empty title and version | [info](info.md) |
+| `info` | `API` / `0.0.0` (see page) | [info](info.md) |
 
 ## Paths
 

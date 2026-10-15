@@ -12,7 +12,7 @@ cargo build --release                  # → target/release/nestoa
 To run the npm shim against a local build without publishing:
 
 ```sh
-NESTOA_BINARY=$PWD/target/debug/nestoa node npm/nestoa/bin/nestoa.js . -o /tmp/out.json
+NESTOA_BINARY=$PWD/target/release/nestoa node npm/nestoa/bin/nestoa.js . -o /tmp/out.json
 ```
 
 ## Tests

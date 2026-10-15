@@ -30,6 +30,11 @@ Error:
     status: { type: integer }
 ```
 
+This is the body of a custom global exception filter, **not** NestJS's stock
+error body (`{ statusCode, message, error }`). nestoa does not read your
+application's filter. If your app keeps Nest's default filter, the documented
+error bodies will not match what it serves.
+
 `500` is never added by default: it is a failure, not a documented outcome.
 
 ## Fields

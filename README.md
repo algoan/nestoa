@@ -58,12 +58,19 @@ components:
 
 ## Install
 
-nestoa is published on the GitHub Packages npm registry. Point the `@algoan`
-scope at it once, in the project's `.npmrc`:
+nestoa is published on the GitHub Packages npm registry, which requires a token
+even to install. Create a personal access token (classic) with the
+`read:packages` scope, export it as `GITHUB_TOKEN`, and point the `@algoan`
+scope at the registry in the project's `.npmrc`:
 
 ```ini
 @algoan:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
 ```
+
+The `.npmrc` only references the variable, so it is safe to commit. Never commit
+the token itself. In GitHub Actions, the workflow's own `GITHUB_TOKEN` works
+when the job has `packages: read` permission.
 
 Then install it as a dev dependency:
 

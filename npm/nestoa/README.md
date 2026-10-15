@@ -8,9 +8,13 @@ code always gives the same document.
 
 ## Install
 
+GitHub Packages requires a token even to install: a personal access token
+(classic) with `read:packages`, exported as `GITHUB_TOKEN` (never committed).
+
 ```ini
 # .npmrc
 @algoan:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
 ```
 
 ```sh

@@ -3,12 +3,13 @@
 The document's `info` object.
 
 - **Type:** object
-- **Default:** empty `title` and `version` when `info` is absent
+- **Default:** `{ "title": "API", "version": "0.0.0" }`, except when a config
+  file exists without an `info` key (see below)
 
 | Field | Type | Default |
 | --- | --- | --- |
-| `title` | string | `"API"` when `info` is set without it |
-| `version` | string | `"0.0.0"` when `info` is set without it |
+| `title` | string | `"API"` |
+| `version` | string | `"0.0.0"` |
 | `description` | string | none |
 
 ```json
@@ -23,5 +24,10 @@ The document's `info` object.
 
 The fields are copied to the output as they are. Other `info` fields are rejected.
 
-Without an `info` key, both `title` and `version` are empty strings, which
-OpenAPI validators reject. Always set `info`.
+| Situation | `title` / `version` |
+| --- | --- |
+| No config file | `"API"` / `"0.0.0"` |
+| Config file with `info`, field missing | `"API"` / `"0.0.0"` |
+| Config file **without** an `info` key | empty strings, which OpenAPI validators reject |
+
+Whenever you have a config file, set `info`.
