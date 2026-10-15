@@ -60,10 +60,16 @@ The code is organised so that most changes touch one file. See
 
 ## Release
 
-Each release builds the binary for every target listed in
-`npm/build-platform-packages.js`. It then runs that script once per target to
-create the `@nestoa/<tag>` packages, and publishes `nestoa` and every
-`@nestoa/<tag>` at the same version. `npm/prepare-github-publish.js` renames
-them for the GitHub Packages registry (`@algoan/nestoa`,
-`@algoan/nestoa-<tag>`). A user only ever downloads the platform package that
-matches their machine.
+The release workflow (`.github/workflows/release.yml`) builds the binary for
+each target in its matrix: currently `linux-x64-gnu`, `linux-arm64-gnu`,
+`darwin-x64` and `darwin-arm64`. It runs `npm/build-platform-packages.js`
+once per target to create the `@nestoa/<tag>` packages. That script also
+knows `linux-*-musl` and `win32-x64-msvc`, but those are not built until they
+are added to the matrix.
+
+`npm/prepare-github-publish.js` then renames the packages for the GitHub
+Packages registry (`@algoan/nestoa`, `@algoan/nestoa-<tag>`). It also keeps
+only the platform packages that were actually built in the main package's
+`optionalDependencies`, and publishes them all at the same version. A user
+only downloads the platform package that matches their machine. On a platform
+with no package, the install has no binary to run.
