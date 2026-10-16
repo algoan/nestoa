@@ -1129,10 +1129,23 @@ impl<'a> SchemaCtx<'a> {
                 .types
                 .iter()
                 .any(|t| self.admits_undefined(file, t, depth)),
+            // `unknown`/`any` leave the other constituents' values as they are.
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsIntersectionType(i)) => {
-                i.types
+                let constraining: Vec<&TsType> = i
+                    .types
                     .iter()
-                    .all(|t| self.admits_undefined(file, t, depth))
+                    .map(|t| &**t)
+                    .filter(|t| {
+                        !matches!(t, TsType::TsKeywordType(k) if matches!(
+                            k.kind,
+                            TsKeywordTypeKind::TsUnknownKeyword | TsKeywordTypeKind::TsAnyKeyword
+                        ))
+                    })
+                    .collect();
+                !constraining.is_empty()
+                    && constraining
+                        .iter()
+                        .all(|t| self.admits_undefined(file, t, depth))
             }
             TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
                 // A bound type parameter, checked where its type was written
@@ -1898,10 +1911,9 @@ fn inherited_object(
     if let Some(obj) = flatten_object(schemas, schema, 0) {
         return Some(obj);
     }
-    let mut unresolved = Vec::new();
-    let mut resolvable = Vec::new();
-    split_unresolved(schemas, schema, &mut unresolved, &mut resolvable, 0)?;
-    flatten_object(schemas, &json!({ "allOf": resolvable }), 0)
+    let mut split = Split::default();
+    split_unresolved(schemas, schema, &mut split, 0)?;
+    flatten_object(schemas, &json!({ "allOf": split.resolvable }), 0)
 }
 
 /// Apply a property-set edit to `schema`, inlined into one object first so
@@ -1913,15 +1925,26 @@ fn reshape(schemas: &IndexMap<String, Value>, schema: &Value, edit: &ObjectEdit)
     if let Some(obj) = flatten_object(schemas, schema, 0) {
         return Some(apply_edit(obj, edit));
     }
-    let mut unresolved = Vec::new();
-    let mut resolvable = Vec::new();
-    split_unresolved(schemas, schema, &mut unresolved, &mut resolvable, 0)?;
-    if unresolved.is_empty() || resolvable.is_empty() {
+    let mut split = Split::default();
+    split_unresolved(schemas, schema, &mut split, 0)?;
+    if split.unresolved.is_empty() || split.resolvable.is_empty() {
         return None;
     }
-    let obj = flatten_object(schemas, &json!({ "allOf": resolvable }), 0)?;
-    unresolved.push(apply_edit(obj, edit));
-    Some(json!({ "allOf": unresolved }))
+    let obj = flatten_object(schemas, &json!({ "allOf": split.resolvable }), 0)?;
+    split.unresolved.push(apply_edit(obj, edit));
+    let mut out = split.annotations;
+    out.insert("allOf".into(), Value::Array(split.unresolved));
+    Some(Value::Object(out))
+}
+
+/// An object schema split by `split_unresolved`.
+#[derive(Default)]
+struct Split {
+    unresolved: Vec<Value>,
+    resolvable: Vec<Value>,
+    /// Annotations (`description`, …) of the `allOf` wrappers walked through,
+    /// the outermost kept on a clash.
+    annotations: Map<String, Value>,
 }
 
 /// Split an object schema into its `x-unresolved` parents and the branches
@@ -1930,8 +1953,7 @@ fn reshape(schemas: &IndexMap<String, Value>, schema: &Value, edit: &ObjectEdit)
 fn split_unresolved(
     schemas: &IndexMap<String, Value>,
     schema: &Value,
-    unresolved: &mut Vec<Value>,
-    resolvable: &mut Vec<Value>,
+    split: &mut Split,
     depth: usize,
 ) -> Option<()> {
     const MAX_DEPTH: usize = 32;
@@ -1939,24 +1961,33 @@ fn split_unresolved(
         return None;
     }
     if flatten_object(schemas, schema, depth).is_some() {
-        resolvable.push(schema.clone());
+        split.resolvable.push(schema.clone());
         return Some(());
     }
     let map = schema.as_object()?;
     if map.contains_key("x-unresolved") {
-        unresolved.push(schema.clone());
+        split.unresolved.push(schema.clone());
         return Some(());
     }
     if let Some(target) = map.get("$ref").and_then(Value::as_str) {
         let target = schemas.get(target.strip_prefix("#/components/schemas/")?)?;
-        return split_unresolved(schemas, target, unresolved, resolvable, depth + 1);
+        return split_unresolved(schemas, target, split, depth + 1);
     }
     let branches = map.get("allOf")?.as_array()?;
-    if map.keys().any(|k| k != "allOf" && !is_annotation(k)) {
-        return None;
+    for (k, v) in map {
+        if k == "allOf" {
+            continue;
+        }
+        if !is_annotation(k) {
+            return None;
+        }
+        split
+            .annotations
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
     }
     for branch in branches {
-        split_unresolved(schemas, branch, unresolved, resolvable, depth + 1)?;
+        split_unresolved(schemas, branch, split, depth + 1)?;
     }
     Some(())
 }
@@ -4621,5 +4652,41 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(e["enum"], json!([0, 8]));
+    }
+
+    #[test]
+    fn unknown_is_neutral_in_an_optional_intersection() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { a: (string | undefined) & unknown; b: unknown; c: unknown & unknown; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["b", "c"]);
+    }
+
+    #[test]
+    fn editing_past_an_unresolved_parent_keeps_the_annotations() {
+        let [pick] = lower_all(
+            "import { External } from '@acme/missing';\n\
+             /**\n * Book metadata.\n * @deprecated\n */\n\
+             export class Book extends External { title: string; pages: number; }",
+            "import { Book } from './dto';\nexport type P = Pick<Book, 'title'>;",
+            &["P"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(pick["description"], json!("Book metadata."), "got {pick}");
+        assert_eq!(pick["deprecated"], json!(true));
+        assert_eq!(prop_names(&pick["allOf"][1]), ["title"]);
+    }
+
+    #[test]
+    fn exponentiation_by_nan_follows_javascript() {
+        let [e] = lower_all("", "export enum E { A = 1 ** (0 / 0) }", &["E"])
+            .try_into()
+            .unwrap();
+        assert_eq!(e, json!({"x-unresolved": "E"}));
     }
 }
