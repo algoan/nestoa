@@ -499,8 +499,13 @@ impl<'a> SchemaCtx<'a> {
         {
             return self.ts_type_to_schema(file, first);
         }
-        // Built-in generic handling
-        match name.as_str() {
+        // Built-in generic handling. The newer built-ins give way to a project
+        // declaration of the same name (`class Set<T>`).
+        let shadowed = matches!(
+            name.as_str(),
+            "Awaited" | "Set" | "ReadonlySet" | "Map" | "ReadonlyMap"
+        ) && self.project.resolve(file, &name).is_some();
+        match if shadowed { "" } else { name.as_str() } {
             "Promise" | "Observable" | "Awaited" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
@@ -1171,6 +1176,7 @@ impl<'a> SchemaCtx<'a> {
                 // never `undefined`; only `Awaited` looks through one.
                 if let TsEntityName::Ident(id) = &r.type_name
                     && matches!(id.sym.as_ref(), "Awaited" | "Readonly")
+                    && (id.sym != "Awaited" || self.project.resolve(file, "Awaited").is_none())
                     && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
                 {
                     return if id.sym == "Awaited" {
@@ -1604,11 +1610,14 @@ fn decorator_base_name(d: &swc_ecma_ast::Decorator) -> String {
 
 /// `@Exclude()` (class-transformer) and `@ApiHideProperty()` (`@nestjs/swagger`)
 /// keep a property off the wire, except `@Exclude({ toClassOnly: true })`,
-/// which only drops it from incoming payloads.
+/// which only drops it from incoming payloads (unless `toPlainOnly` is set too).
 fn hides_property(d: &swc_ecma_ast::Decorator) -> bool {
     match decorator_base_name(d).as_str() {
         "ApiHideProperty" => true,
-        "Exclude" => decorator_option_bool(d, "toClassOnly") != Some(true),
+        "Exclude" => {
+            decorator_option_bool(d, "toClassOnly") != Some(true)
+                || decorator_option_bool(d, "toPlainOnly") == Some(true)
+        }
         _ => false,
     }
 }
@@ -4688,5 +4697,42 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(e, json!({"x-unresolved": "E"}));
+    }
+
+    #[test]
+    fn project_types_shadow_the_new_built_ins() {
+        let [holder] = lower_with(
+            &[("lib.ts", "export class Set<T> { label: string; }\nexport interface Awaited { value: string; }")],
+            "import { Set, Awaited } from './lib';\n\
+             export class Map<K, V> { size: number; }\n\
+             export interface Holder { a: Set<number>; b: Awaited; c: Map<string, number>; d: Awaited | undefined; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"$ref": "#/components/schemas/Set"}),
+            "got {holder}"
+        );
+        assert_eq!(p["b"], json!({"$ref": "#/components/schemas/Awaited"}));
+        assert_eq!(p["c"], json!({"$ref": "#/components/schemas/Map"}));
+        assert_eq!(required_names(&holder), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn exclude_in_both_directions_hides_the_property() {
+        let [user] = lower_all(
+            "",
+            "export class User {\n\
+               @Exclude({ toClassOnly: true, toPlainOnly: true }) secret: string;\n\
+               @Exclude({ toClassOnly: true }) input: string;\n\
+             }",
+            &["User"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&user), ["input"]);
     }
 }
