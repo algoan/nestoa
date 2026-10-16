@@ -1127,10 +1127,19 @@ impl<'a> SchemaCtx<'a> {
                         self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1)
                     });
                 }
+                // Transparent wrappers. A bare `Promise` property is a promise,
+                // never `undefined`; only `Awaited` looks through one.
                 if let TsEntityName::Ident(id) = &r.type_name
-                    && id.sym == "Awaited"
-                    && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
+                    && matches!(id.sym.as_ref(), "Awaited" | "Readonly")
+                    && let Some(mut first) = r.type_params.as_ref().and_then(|a| a.params.first())
                 {
+                    while id.sym == "Awaited"
+                        && let TsType::TsTypeRef(inner) = &**first
+                        && matches!(&inner.type_name, TsEntityName::Ident(p) if p.sym == "Promise")
+                        && let Some(arg) = inner.type_params.as_ref().and_then(|a| a.params.first())
+                    {
+                        first = arg;
+                    }
                     return self.admits_undefined(file, first, depth + 1);
                 }
                 let resolved = match &r.type_name {
@@ -2085,7 +2094,13 @@ fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> Option<(Ve
         Some(Value::Array(p)) => p.clone(),
         _ => Vec::new(),
     };
-    let tail = rest.get("items").cloned().unwrap_or_else(|| json!({}));
+    let tail = match rest.get("items") {
+        None => json!({}),
+        // `never[]`, whose elements `keyword_schema` lowers to JSON `null`:
+        // no position past the prefix is allowed.
+        Some(Value::Null) => Value::Bool(false),
+        Some(items) => items.clone(),
+    };
     Some((prefix, tail))
 }
 
@@ -4200,5 +4215,42 @@ mod tests {
         let mut down = c.clone();
         crate::dialect::downgrade_to_30(&mut down);
         assert_eq!(down["items"], json!({}));
+    }
+
+    #[test]
+    fn awaited_promises_and_readonly_keep_optionality() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Awaited<Promise<string | undefined>>;\n\
+               b: Readonly<string | undefined>;\n\
+               c: Promise<string | undefined>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["c"]);
+    }
+
+    #[test]
+    fn a_never_rest_closes_the_tuple() {
+        let [holder] = lower_all(
+            "export type Never = never[];",
+            "import { Never } from './dto';\n\
+             export interface Holder { a: [string, ...never[]]; b: [string, ...Never]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let closed = json!({"type": "array", "prefixItems": [{"type": "string"}], "items": false});
+        assert_eq!(holder["properties"]["a"], closed);
+        assert_eq!(holder["properties"]["b"], closed);
+        let mut down = closed.clone();
+        crate::dialect::downgrade_to_30(&mut down);
+        assert_eq!(
+            down,
+            json!({"type": "array", "items": {"type": "string"}, "maxItems": 1})
+        );
     }
 }
