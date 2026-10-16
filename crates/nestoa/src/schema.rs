@@ -132,6 +132,9 @@ pub struct TypeBinding {
     /// `Omit<T, ...>` is lowered under the *outer* env before it shadows the
     /// parameter it binds, so the resolved shape is captured eagerly.
     pub resolved: Option<Value>,
+    /// Whether the bound type admits `undefined`, decided where the argument
+    /// was written. Set alongside `resolved`, whose schema drops `undefined`.
+    pub admits_undefined: Option<bool>,
 }
 
 /// Map of type-parameter name -> bound concrete type.
@@ -159,9 +162,12 @@ fn instantiation_key(
     params: &[String],
     env: &TypeEnv,
 ) -> InstantiationKey {
-    let sig: Vec<&Value> = params
+    let sig: Vec<(&Value, Option<bool>)> = params
         .iter()
-        .filter_map(|p| env.get(p)?.resolved.as_ref())
+        .filter_map(|p| {
+            let binding = env.get(p)?;
+            Some((binding.resolved.as_ref()?, binding.admits_undefined))
+        })
         .collect();
     (
         decl_file.to_path_buf(),
@@ -266,6 +272,7 @@ impl<'a> SchemaCtx<'a> {
                         TsType::TsRestType(_) => {
                             let mut schema = self.unsupported(file, ty, "tuple");
                             schema["type"] = json!("array");
+                            schema["items"] = json!({});
                             return schema;
                         }
                         elem => prefix.push(self.ts_type_to_schema(file, elem)),
@@ -741,12 +748,14 @@ impl<'a> SchemaCtx<'a> {
         let mut new_env: TypeEnv = HashMap::new();
         for (param, arg) in params.iter().zip(args.params.iter()) {
             let resolved = self.ts_type_to_schema(file, arg);
+            let admits_undefined = self.admits_undefined(file, arg, 0);
             new_env.insert(
                 param.clone(),
                 TypeBinding {
                     origin_file: file.to_path_buf(),
                     ty: (**arg).clone(),
                     resolved: Some(resolved),
+                    admits_undefined: Some(admits_undefined),
                 },
             );
         }
@@ -1114,7 +1123,15 @@ impl<'a> SchemaCtx<'a> {
                         .as_ref()
                         .and_then(|env| env.get(id.sym.as_ref()))
                 {
-                    return self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1);
+                    return binding.admits_undefined.unwrap_or_else(|| {
+                        self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1)
+                    });
+                }
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && id.sym == "Awaited"
+                    && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
+                {
+                    return self.admits_undefined(file, first, depth + 1);
                 }
                 let resolved = match &r.type_name {
                     TsEntityName::Ident(id) => self.project.resolve(file, id.sym.as_ref()),
@@ -3719,7 +3736,7 @@ mod tests {
         assert_eq!(p["b"]["items"], json!({"type": "boolean"}));
         assert_eq!(
             p["c"],
-            json!({"type": "array", "x-unresolved": "[...string[], number]"})
+            json!({"type": "array", "items": {}, "x-unresolved": "[...string[], number]"})
         );
     }
 
@@ -4054,6 +4071,7 @@ mod tests {
                 origin_file: file.clone(),
                 ty: (*bound.type_ann).clone(),
                 resolved: None,
+                admits_undefined: None,
             },
         )]);
         let mut components = ComponentSchemas::default();
@@ -4069,5 +4087,118 @@ mod tests {
         let wrap = ctx.symbol_to_schema(&decl_file, &sym);
         assert_eq!(wrap["properties"]["first"], json!({"type": "string"}));
         assert_eq!(required_names(&wrap), ["count"]);
+    }
+
+    /// Lower `name` from `dto.ts` with the interceptor env `T -> Bound`, the
+    /// way `interceptors.rs` does, returning the schema and the components.
+    fn lower_under_env(dto: &str, name: &str) -> (Value, IndexMap<String, Value>) {
+        let (project, dir) = project_from(&[("dto.ts", dto)]);
+        let file = dir.join("dto.ts");
+        let mut env = TypeEnv::new();
+        if let Some((_, Symbol::TypeAlias(bound))) = project.resolve(&file, "Bound") {
+            env.insert(
+                "T".to_string(),
+                TypeBinding {
+                    origin_file: file.clone(),
+                    ty: (*bound.type_ann).clone(),
+                    resolved: None,
+                    admits_undefined: None,
+                },
+            );
+        }
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: Some(env),
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&file, name).unwrap();
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        (schema, components.schemas)
+    }
+
+    #[test]
+    fn a_nested_binding_keeps_the_callers_optionality() {
+        let (outer, _) = lower_under_env(
+            "export type Bound = string | undefined;\n\
+             export interface Envelope<T> { value: T; tag: string; }\n\
+             export interface Outer<T> { e: Envelope<T>; }",
+            "Outer",
+        );
+        assert_eq!(
+            required_names(&outer["properties"]["e"]),
+            ["tag"],
+            "got {outer}"
+        );
+    }
+
+    #[test]
+    fn instantiations_differing_only_in_optionality_are_distinct() {
+        for order in [["a", "b"], ["b", "a"]] {
+            let fields = order.map(|f| match f {
+                "a" => "a: Box<string>;",
+                _ => "b: Box<string | undefined>;",
+            });
+            let (out, schemas) = lower_under_env(
+                &format!(
+                    "export interface Box<T> {{ value: T; next?: Box<T>; }}\n\
+                     export interface Out {{ {} {} }}",
+                    fields[0], fields[1]
+                ),
+                "Out",
+            );
+            let component = |p: &str| {
+                let name = out["properties"][p]["$ref"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap();
+                schemas[name].clone()
+            };
+            assert_eq!(
+                required_names(&component("a")),
+                ["value"],
+                "order {order:?}: {out}"
+            );
+            assert!(
+                component("b").get("required").is_none(),
+                "order {order:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn awaited_admitting_undefined_is_optional() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { value: Awaited<string | undefined>; id: string; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["id"]);
+    }
+
+    #[test]
+    fn a_non_final_rest_tuple_keeps_an_items_schema() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { c: [...string[], number]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let c = &holder["properties"]["c"];
+        assert_eq!(
+            *c,
+            json!({"type": "array", "items": {}, "x-unresolved": "[...string[], number]"})
+        );
+        let mut down = c.clone();
+        crate::dialect::downgrade_to_30(&mut down);
+        assert_eq!(down["items"], json!({}));
     }
 }

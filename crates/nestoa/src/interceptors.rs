@@ -293,6 +293,7 @@ fn unify(
                 origin_file: concrete_file.to_path_buf(),
                 ty: concrete.clone(),
                 resolved: None,
+                admits_undefined: None,
             },
         );
         return true;
