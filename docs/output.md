@@ -63,7 +63,8 @@ A class's properties are its fields and its constructor parameter properties
 (`constructor(public name: string)`). Static members are never part of a
 schema, and neither is a property marked `@internal`/`@private` in
 [JSDoc](jsdoc.md), `@ApiHideProperty()`, or class-transformer's `@Exclude()`
-(unless `toClassOnly: true`, which only drops it from incoming payloads). A
+(unless `toClassOnly: true` without `toPlainOnly: true`, which only drops it
+from incoming payloads). A
 subclass hiding a property this way hides the inherited one too. A
 field without a type annotation takes the type of its initialiser
 (`count = 0` is a `number`, `at = new Date()` a date-time string); one nestoa
