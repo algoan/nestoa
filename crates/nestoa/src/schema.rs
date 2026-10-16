@@ -588,11 +588,11 @@ impl<'a> SchemaCtx<'a> {
                     if let Some(keys) = self.string_union_keys(file, key_t, 0) {
                         let props: Map<String, Value> =
                             keys.iter().map(|k| (k.clone(), value.clone())).collect();
-                        return json!({
-                            "type": "object",
-                            "properties": props,
-                            "required": keys,
-                        });
+                        let mut record = json!({ "type": "object", "properties": props });
+                        if !self.admits_undefined(file, value_t, 0) {
+                            record["required"] = json!(keys);
+                        }
+                        return record;
                     }
                     return json!({
                         "type": "object",
@@ -1105,6 +1105,17 @@ impl<'a> SchemaCtx<'a> {
                 .iter()
                 .any(|t| self.admits_undefined(file, t, depth)),
             TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
+                // A bound type parameter, checked where its type was written
+                // (see `type_ref_schema`).
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && r.type_params.is_none()
+                    && let Some(binding) = self
+                        .type_env
+                        .as_ref()
+                        .and_then(|env| env.get(id.sym.as_ref()))
+                {
+                    return self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1);
+                }
                 let resolved = match &r.type_name {
                     TsEntityName::Ident(id) => self.project.resolve(file, id.sym.as_ref()),
                     TsEntityName::TsQualifiedName(q) => self.project.resolve_namespace_member(
@@ -4010,5 +4021,53 @@ mod tests {
             json!({"allOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]})
         );
         assert_eq!(p["b"], json!({"allOf": [{"type": "string"}, {"not": {}}]}));
+    }
+
+    #[test]
+    fn a_record_value_admitting_undefined_leaves_its_keys_optional() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { r: Record<'a' | 'b', string | undefined>; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let r = &holder["properties"]["r"];
+        assert_eq!(prop_names(r), ["a", "b"]);
+        assert!(r.get("required").is_none(), "got {r}");
+    }
+
+    #[test]
+    fn a_bound_type_parameter_admitting_undefined_is_optional() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            "export type Bound = string | undefined;\n\
+             export interface Wrap<T> { first: T; count: number; }",
+        )]);
+        let file = dir.join("dto.ts");
+        let (_, Symbol::TypeAlias(bound)) = project.resolve(&file, "Bound").unwrap() else {
+            panic!("Bound is an alias");
+        };
+        let env: TypeEnv = HashMap::from([(
+            "T".to_string(),
+            TypeBinding {
+                origin_file: file.clone(),
+                ty: (*bound.type_ann).clone(),
+                resolved: None,
+            },
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: Some(env),
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&file, "Wrap").unwrap();
+        let wrap = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(wrap["properties"]["first"], json!({"type": "string"}));
+        assert_eq!(required_names(&wrap), ["count"]);
     }
 }
