@@ -1179,10 +1179,7 @@ impl<'a> SchemaCtx<'a> {
     /// and the other two serialize as `null` or not at all.
     fn element_schema(&mut self, file: &Path, ty: &TsType) -> Value {
         match self.ts_type_to_schema(file, ty) {
-            Value::Null if matches!(ty, TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNeverKeyword) =>
-            {
-                json!({ "not": {} })
-            }
+            Value::Null if is_never(ty) => json!({ "not": {} }),
             Value::Null => json!({}),
             schema => schema,
         }
@@ -1239,7 +1236,6 @@ impl<'a> SchemaCtx<'a> {
     /// directly or through an alias.
     fn is_never_array(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
         const MAX_ALIAS_DEPTH: usize = 8;
-        let is_never = |t: &TsType| matches!(t, TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNeverKeyword);
         match ty {
             TsType::TsArrayType(a) => is_never(&a.elem_type),
             TsType::TsParenthesizedType(p) => self.is_never_array(file, &p.type_ann, depth),
@@ -1503,6 +1499,15 @@ impl<'a> SchemaCtx<'a> {
                 schema
             }
         }
+    }
+}
+
+/// Whether `ty` is `never`, possibly parenthesized.
+fn is_never(ty: &TsType) -> bool {
+    match ty {
+        TsType::TsKeywordType(k) => k.kind == TsKeywordTypeKind::TsNeverKeyword,
+        TsType::TsParenthesizedType(p) => is_never(&p.type_ann),
+        _ => false,
     }
 }
 
@@ -4501,5 +4506,24 @@ mod tests {
         ] {
             assert_eq!(js_number_key(n), key, "{n}");
         }
+    }
+
+    #[test]
+    fn parenthesized_never_is_never() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Set<(never)>; b: Map<string, (never)>;\n\
+               c: [string, ...(never)[]]; d: [string, ...Array<(never)>];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"]["items"], json!({"not": {}}));
+        assert_eq!(p["b"]["additionalProperties"], json!({"not": {}}));
+        assert_eq!(p["c"]["items"], json!(false));
+        assert_eq!(p["d"]["items"], json!(false));
     }
 }
