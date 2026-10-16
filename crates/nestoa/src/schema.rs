@@ -52,9 +52,9 @@ impl ComponentSchemas {
         loop {
             let before = pending.len();
             pending.retain(
-                |(name, base, edit)| match flatten_object(&self.schemas, base, 0) {
-                    Some(obj) => {
-                        self.schemas.insert(name.clone(), apply_edit(obj, edit));
+                |(name, base, edit)| match reshape(&self.schemas, base, edit) {
+                    Some(edited) => {
+                        self.schemas.insert(name.clone(), edited);
                         false
                     }
                     None => true,
@@ -132,6 +132,9 @@ pub struct TypeBinding {
     /// `Omit<T, ...>` is lowered under the *outer* env before it shadows the
     /// parameter it binds, so the resolved shape is captured eagerly.
     pub resolved: Option<Value>,
+    /// Whether the bound type admits `undefined`, decided where the argument
+    /// was written. Set alongside `resolved`, whose schema drops `undefined`.
+    pub admits_undefined: Option<bool>,
 }
 
 /// Map of type-parameter name -> bound concrete type.
@@ -159,9 +162,12 @@ fn instantiation_key(
     params: &[String],
     env: &TypeEnv,
 ) -> InstantiationKey {
-    let sig: Vec<&Value> = params
+    let sig: Vec<(&Value, Option<bool>)> = params
         .iter()
-        .filter_map(|p| env.get(p)?.resolved.as_ref())
+        .filter_map(|p| {
+            let binding = env.get(p)?;
+            Some((binding.resolved.as_ref()?, binding.admits_undefined))
+        })
         .collect();
     (
         decl_file.to_path_buf(),
@@ -182,6 +188,17 @@ fn instantiation_suffix(params: &[String], env: &TypeEnv) -> String {
             Some(sanitize_name(name))
         })
         .collect()
+}
+
+/// What `SchemaCtx::class_member` reads off a class field or a constructor
+/// parameter property.
+struct ClassMember<'a> {
+    span: Span,
+    decorators: &'a [swc_ecma_ast::Decorator],
+    type_ann: Option<&'a swc_ecma_ast::TsTypeAnn>,
+    init: Option<&'a Expr>,
+    /// Declared with `?`.
+    optional: bool,
 }
 
 pub struct SchemaCtx<'a> {
@@ -221,7 +238,7 @@ impl<'a> SchemaCtx<'a> {
                 TsLit::Str(s) => {
                     json!({ "type": "string", "enum": [s.value.to_string_lossy().into_owned()] })
                 }
-                TsLit::Number(n) => json!({ "type": "number", "enum": [n.value] }),
+                TsLit::Number(n) => json!({ "type": "number", "enum": [number_json(n.value)] }),
                 TsLit::Bool(b) => json!({ "type": "boolean", "enum": [b.value] }),
                 // A template literal type is a string whose pattern is not kept.
                 TsLit::Tpl(_) => {
@@ -236,12 +253,46 @@ impl<'a> SchemaCtx<'a> {
                 "items": self.ts_type_to_schema(file, elem_type),
             }),
             TsType::TsTupleType(t) => {
-                let items: Vec<Value> = t
-                    .elem_types
-                    .iter()
-                    .map(|e| self.ts_type_to_schema(file, &e.ty))
-                    .collect();
-                json!({ "type": "array", "prefixItems": items, "items": false })
+                let mut prefix = Vec::new();
+                let mut tail = Value::Bool(false);
+                for (i, e) in t.elem_types.iter().enumerate() {
+                    // `...R`, or `...name: R` where swc puts the rest on the label.
+                    let rest = match (&*e.ty, &e.label) {
+                        (TsType::TsRestType(r), _) => Some(&*r.type_ann),
+                        (ty, Some(swc_ecma_ast::Pat::Rest(_))) => Some(ty),
+                        _ => None,
+                    };
+                    match rest {
+                        Some(operand) if i + 1 == t.elem_types.len() => {
+                            let lowered = self.ts_type_to_schema(file, operand);
+                            let (more, rest_tail) = spread_elements(
+                                &self.components.schemas,
+                                lowered,
+                            )
+                            .unwrap_or_else(|| {
+                                (Vec::new(), self.unsupported(file, operand, "rest element"))
+                            });
+                            prefix.extend(more);
+                            // `never`, `undefined` and `void` elements all lower
+                            // to JSON `null`; only `never` forbids the positions.
+                            tail = match rest_tail {
+                                Value::Null if self.is_never_array(file, operand, 0) => {
+                                    Value::Bool(false)
+                                }
+                                Value::Null => json!({}),
+                                tail => tail,
+                            };
+                        }
+                        Some(_) => {
+                            let mut schema = self.unsupported(file, ty, "tuple");
+                            schema["type"] = json!("array");
+                            schema["items"] = json!({});
+                            return schema;
+                        }
+                        None => prefix.push(self.ts_type_to_schema(file, &e.ty)),
+                    }
+                }
+                tuple_schema(prefix, tail)
             }
             // `[a, b?]`: positions are never required, so `b?` is just `b`.
             TsType::TsOptionalType(o) => self.ts_type_to_schema(file, &o.type_ann),
@@ -448,9 +499,14 @@ impl<'a> SchemaCtx<'a> {
         {
             return self.ts_type_to_schema(file, first);
         }
-        // Built-in generic handling
-        match name.as_str() {
-            "Promise" | "Observable" => {
+        // Built-in generic handling. The newer built-ins give way to a project
+        // declaration of the same name (`class Set<T>`).
+        let shadowed = matches!(
+            name.as_str(),
+            "Awaited" | "Set" | "ReadonlySet" | "Map" | "ReadonlyMap"
+        ) && self.project.resolve(file, &name).is_some();
+        match if shadowed { "" } else { name.as_str() } {
+            "Promise" | "Observable" | "Awaited" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
@@ -479,11 +535,40 @@ impl<'a> SchemaCtx<'a> {
                     return self.reshape_object(base, &edit);
                 }
             }
-            "Readonly" | "NonNullable" => {
+            "Readonly" => {
                 if let Some(args) = &r.type_params
                     && let Some(first) = args.params.first()
                 {
                     return self.ts_type_to_schema(file, first);
+                }
+            }
+            "NonNullable" => {
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    let schema = self.ts_type_to_schema(file, first);
+                    return strip_null(&self.components.schemas, schema);
+                }
+            }
+            "Set" | "ReadonlySet" => {
+                if let Some(args) = &r.type_params
+                    && let Some(first) = args.params.first()
+                {
+                    return json!({
+                        "type": "array",
+                        "items": self.element_schema(file, first),
+                        "uniqueItems": true,
+                    });
+                }
+            }
+            "Map" | "ReadonlyMap" => {
+                if let Some(args) = &r.type_params
+                    && let Some(value_t) = args.params.get(1)
+                {
+                    return json!({
+                        "type": "object",
+                        "additionalProperties": self.element_schema(file, value_t),
+                    });
                 }
             }
             "Omit" | "Pick" => {
@@ -523,11 +608,21 @@ impl<'a> SchemaCtx<'a> {
             }
             "Record" => {
                 if let Some(args) = &r.type_params
-                    && let Some(value_t) = args.params.get(1)
+                    && let [key_t, value_t] = args.params.as_slice()
                 {
+                    let value = self.ts_type_to_schema(file, value_t);
+                    if let Some(keys) = self.string_union_keys(file, key_t, 0) {
+                        let props: Map<String, Value> =
+                            keys.iter().map(|k| (k.clone(), value.clone())).collect();
+                        let mut record = json!({ "type": "object", "properties": props });
+                        if !self.admits_undefined(file, value_t, 0) {
+                            record["required"] = json!(keys);
+                        }
+                        return record;
+                    }
                     return json!({
                         "type": "object",
-                        "additionalProperties": self.ts_type_to_schema(file, value_t),
+                        "additionalProperties": value,
                     });
                 }
                 return json!({ "type": "object" });
@@ -672,12 +767,14 @@ impl<'a> SchemaCtx<'a> {
         let mut new_env: TypeEnv = HashMap::new();
         for (param, arg) in params.iter().zip(args.params.iter()) {
             let resolved = self.ts_type_to_schema(file, arg);
+            let admits_undefined = self.admits_undefined(file, arg, 0);
             new_env.insert(
                 param.clone(),
                 TypeBinding {
                     origin_file: file.to_path_buf(),
                     ty: (**arg).clone(),
                     resolved: Some(resolved),
+                    admits_undefined: Some(admits_undefined),
                 },
             );
         }
@@ -761,10 +858,8 @@ impl<'a> SchemaCtx<'a> {
         let mut required: Vec<String> = Vec::new();
         for el in &lit.members {
             if let TsTypeElement::TsPropertySignature(p) = el {
-                let name = match &*p.key {
-                    Expr::Ident(i) => i.sym.to_string(),
-                    Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
-                    _ => continue,
+                let Some(name) = property_key(&p.key) else {
+                    continue;
                 };
                 // `@internal`/`@private` members never reach the wire.
                 if self.jsdoc(file, p.span).is_some_and(|d| d.internal) {
@@ -776,7 +871,12 @@ impl<'a> SchemaCtx<'a> {
                     .map(|t| self.ts_type_to_schema(file, &t.type_ann))
                     .unwrap_or_else(|| json!({}));
                 props.insert(name.clone(), schema);
-                if !p.optional {
+                if !p.optional
+                    && !p
+                        .type_ann
+                        .as_ref()
+                        .is_some_and(|t| self.admits_undefined(file, &t.type_ann, 0))
+                {
                     required.push(name);
                 }
             }
@@ -881,9 +981,13 @@ impl<'a> SchemaCtx<'a> {
                 _ => None,
             },
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
-                let mut keys = Vec::new();
+                let mut keys: Vec<String> = Vec::new();
                 for t in &u.types {
-                    keys.extend(self.string_union_keys(file, t, depth)?);
+                    for key in self.string_union_keys(file, t, depth)? {
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
                 }
                 Some(keys)
             }
@@ -903,16 +1007,15 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
-    /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema,
-    /// inlining it first so inherited properties are edited too. An operand
-    /// that is a component still being lowered (a recursive `Partial<Node>`
-    /// inside `Node`) cannot be inlined yet, so the edit is registered as its
-    /// own component and applied by `ComponentSchemas::resolve_deferred`. Any
-    /// other schema that cannot be flattened, such as a union, is returned
-    /// unchanged.
+    /// Apply a property-set edit (`Partial`, `Omit`, …) to an object schema
+    /// (see `reshape`). An operand that is a component still being lowered (a
+    /// recursive `Partial<Node>` inside `Node`) cannot be inlined yet, so the
+    /// edit is registered as its own component and applied by
+    /// `ComponentSchemas::resolve_deferred`. Any other schema that cannot be
+    /// flattened, such as a union, is returned unchanged.
     fn reshape_object(&mut self, schema: Value, edit: &ObjectEdit) -> Value {
-        if let Some(obj) = flatten_object(&self.components.schemas, &schema, 0) {
-            return apply_edit(obj, edit);
+        if let Some(edited) = reshape(&self.components.schemas, &schema, edit) {
+            return edited;
         }
         let Some(base) = self.components.pending_ref(&schema) else {
             return schema;
@@ -925,6 +1028,301 @@ impl<'a> SchemaCtx<'a> {
             .deferred
             .push((name.clone(), schema, edit.clone()));
         ref_value(&name)
+    }
+
+    /// A class field as `(name, schema, optional)`, or nothing when it never
+    /// reaches the wire. A `static` member lives on the constructor, never on
+    /// an instance, and routinely holds internals (a logger, a cache).
+    /// Accessibility is deliberately *not* considered: TypeScript erases
+    /// `private`, so such a field is still serialized.
+    fn class_prop(
+        &mut self,
+        file: &Path,
+        p: &swc_ecma_ast::ClassProp,
+        hidden: &mut Vec<String>,
+    ) -> Vec<(String, Value, bool)> {
+        if p.is_static {
+            return Vec::new();
+        }
+        let Some(name) = prop_name_key(&p.key) else {
+            return Vec::new();
+        };
+        let member = ClassMember {
+            span: p.span,
+            decorators: &p.decorators,
+            type_ann: p.type_ann.as_deref(),
+            init: p.value.as_deref(),
+            optional: p.is_optional,
+        };
+        self.class_member(file, name, member, hidden)
+            .into_iter()
+            .collect()
+    }
+
+    /// A constructor parameter property (`constructor(public name: string)`),
+    /// which declares a field like a class property does.
+    fn param_prop(
+        &mut self,
+        file: &Path,
+        pp: &swc_ecma_ast::TsParamProp,
+        hidden: &mut Vec<String>,
+    ) -> Option<(String, Value, bool)> {
+        let (binding, init) = match &pp.param {
+            swc_ecma_ast::TsParamPropParam::Ident(b) => (b, None),
+            swc_ecma_ast::TsParamPropParam::Assign(a) => match &*a.left {
+                swc_ecma_ast::Pat::Ident(b) => (b, Some(&*a.right)),
+                _ => return None,
+            },
+        };
+        let member = ClassMember {
+            span: pp.span,
+            decorators: &pp.decorators,
+            type_ann: binding.type_ann.as_deref(),
+            init,
+            optional: binding.id.optional,
+        };
+        self.class_member(file, binding.id.sym.to_string(), member, hidden)
+    }
+
+    /// Lower a class member as `(name, schema, optional)`, or nothing when
+    /// its JSDoc or decorators keep it off the wire. That is decided before
+    /// its type is lowered, so a hidden member's types never become components.
+    /// A hidden member's name is pushed to `hidden`.
+    fn class_member(
+        &mut self,
+        file: &Path,
+        name: String,
+        member: ClassMember,
+        hidden: &mut Vec<String>,
+    ) -> Option<(String, Value, bool)> {
+        let doc = self.jsdoc(file, member.span);
+        // `@internal`/`@private` members never reach the wire.
+        if doc.as_ref().is_some_and(|d| d.internal) || member.decorators.iter().any(hides_property)
+        {
+            hidden.push(name);
+            return None;
+        }
+        let mut schema = match (member.type_ann, member.init) {
+            (Some(t), _) => self.ts_type_to_schema(file, &t.type_ann),
+            (None, Some(init)) => self.initializer_schema(file, init),
+            (None, None) => json!({}),
+        };
+        if let Some(doc) = &doc {
+            attach_doc(&mut schema, doc);
+        }
+        let optional = member.optional
+            || match (member.type_ann, member.init) {
+                (Some(t), _) => self.admits_undefined(file, &t.type_ann, 0),
+                (None, Some(init)) => self.asserted_undefined(file, init),
+                (None, None) => false,
+            }
+            || member.decorators.iter().any(marks_optional);
+        Some((name, schema, optional))
+    }
+
+    /// Whether a property's declared type admits `undefined`, directly or
+    /// through type aliases, which makes it optional on the wire like a `?`.
+    fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        match ty {
+            TsType::TsKeywordType(k) => matches!(
+                k.kind,
+                TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsVoidKeyword
+            ),
+            TsType::TsParenthesizedType(p) => self.admits_undefined(file, &p.type_ann, depth),
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => u
+                .types
+                .iter()
+                .any(|t| self.admits_undefined(file, t, depth)),
+            // `unknown`/`any` leave the other constituents' values as they are.
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsIntersectionType(i)) => {
+                let constraining: Vec<&TsType> = i
+                    .types
+                    .iter()
+                    .map(|t| &**t)
+                    .filter(|t| {
+                        !matches!(t, TsType::TsKeywordType(k) if matches!(
+                            k.kind,
+                            TsKeywordTypeKind::TsUnknownKeyword | TsKeywordTypeKind::TsAnyKeyword
+                        ))
+                    })
+                    .collect();
+                !constraining.is_empty()
+                    && constraining
+                        .iter()
+                        .all(|t| self.admits_undefined(file, t, depth))
+            }
+            TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
+                // A bound type parameter, checked where its type was written
+                // (see `type_ref_schema`).
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && r.type_params.is_none()
+                    && let Some(binding) = self
+                        .type_env
+                        .as_ref()
+                        .and_then(|env| env.get(id.sym.as_ref()))
+                {
+                    return binding.admits_undefined.unwrap_or_else(|| {
+                        self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1)
+                    });
+                }
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && self.passthrough_types.iter().any(|t| id.sym == *t)
+                    && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
+                {
+                    return self.admits_undefined(file, first, depth + 1);
+                }
+                // Transparent wrappers. A bare `Promise` property is a promise,
+                // never `undefined`; only `Awaited` looks through one.
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && matches!(id.sym.as_ref(), "Awaited" | "Readonly")
+                    && (id.sym != "Awaited" || self.project.resolve(file, "Awaited").is_none())
+                    && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
+                {
+                    return if id.sym == "Awaited" {
+                        self.awaited_admits_undefined(file, first, depth + 1)
+                    } else {
+                        self.admits_undefined(file, first, depth + 1)
+                    };
+                }
+                let resolved = match &r.type_name {
+                    TsEntityName::Ident(id) => self.project.resolve(file, id.sym.as_ref()),
+                    TsEntityName::TsQualifiedName(q) => self.project.resolve_namespace_member(
+                        file,
+                        &entity_name(&q.left),
+                        q.right.sym.as_ref(),
+                    ),
+                };
+                match resolved {
+                    Some((decl_file, Symbol::TypeAlias(alias))) => {
+                        self.admits_undefined(&decl_file, &alias.type_ann, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// A collection's element schema. `never`, `undefined` and `void` lower to
+    /// a JSON `null` placeholder, which is no schema: `never` admits nothing,
+    /// and the other two serialize as `null` or not at all.
+    fn element_schema(&mut self, file: &Path, ty: &TsType) -> Value {
+        match self.ts_type_to_schema(file, ty) {
+            Value::Null if is_never(ty) => json!({ "not": {} }),
+            Value::Null => json!({}),
+            schema => schema,
+        }
+    }
+
+    /// `admits_undefined` for `Awaited<T>`: a `Promise` in `T`, written
+    /// directly, in a union or through an alias, is unwrapped first.
+    fn awaited_admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        if depth >= MAX_ALIAS_DEPTH {
+            return false;
+        }
+        match ty {
+            TsType::TsParenthesizedType(p) => {
+                self.awaited_admits_undefined(file, &p.type_ann, depth)
+            }
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => u
+                .types
+                .iter()
+                .any(|t| self.awaited_admits_undefined(file, t, depth)),
+            TsType::TsTypeRef(r) => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return self.admits_undefined(file, ty, depth);
+                };
+                if id.sym == "Promise" {
+                    return r
+                        .type_params
+                        .as_ref()
+                        .and_then(|a| a.params.first())
+                        .is_some_and(|arg| self.awaited_admits_undefined(file, arg, depth + 1));
+                }
+                match self.project.resolve(file, id.sym.as_ref()) {
+                    Some((decl_file, Symbol::TypeAlias(alias))) if r.type_params.is_none() => {
+                        self.awaited_admits_undefined(&decl_file, &alias.type_ann, depth + 1)
+                    }
+                    _ => self.admits_undefined(file, ty, depth),
+                }
+            }
+            _ => self.admits_undefined(file, ty, depth),
+        }
+    }
+
+    /// Whether an unannotated field's initialiser asserts a type admitting
+    /// `undefined` (`x = undefined as string | undefined`).
+    fn asserted_undefined(&self, file: &Path, init: &Expr) -> bool {
+        match init {
+            Expr::TsAs(a) => self.admits_undefined(file, &a.type_ann, 0),
+            Expr::Paren(p) => self.asserted_undefined(file, &p.expr),
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` is an array of `never` (`never[]`, `Array<never>`),
+    /// directly or through an alias.
+    fn is_never_array(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        match ty {
+            TsType::TsArrayType(a) => is_never(&a.elem_type),
+            TsType::TsParenthesizedType(p) => self.is_never_array(file, &p.type_ann, depth),
+            TsType::TsTypeOperator(op) if op.op == TsTypeOperatorOp::ReadOnly => {
+                self.is_never_array(file, &op.type_ann, depth)
+            }
+            TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return false;
+                };
+                if matches!(id.sym.as_ref(), "Array" | "ReadonlyArray") {
+                    return r
+                        .type_params
+                        .as_ref()
+                        .and_then(|a| a.params.first())
+                        .is_some_and(|t| is_never(t));
+                }
+                match self.project.resolve(file, id.sym.as_ref()) {
+                    Some((decl_file, Symbol::TypeAlias(alias))) => {
+                        self.is_never_array(&decl_file, &alias.type_ann, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The type TypeScript infers for an unannotated field from its
+    /// initialiser, widened as for a mutable field (`a = 1` is a `number`).
+    fn initializer_schema(&mut self, file: &Path, init: &Expr) -> Value {
+        match init {
+            Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) => json!({ "type": "string" }),
+            Expr::Lit(Lit::Num(_)) => json!({ "type": "number" }),
+            Expr::Lit(Lit::Bool(_)) => json!({ "type": "boolean" }),
+            Expr::Unary(u)
+                if matches!(
+                    u.op,
+                    swc_ecma_ast::UnaryOp::Minus | swc_ecma_ast::UnaryOp::Plus
+                ) && matches!(*u.arg, Expr::Lit(Lit::Num(_))) =>
+            {
+                json!({ "type": "number" })
+            }
+            Expr::New(n) if matches!(&*n.callee, Expr::Ident(id) if id.sym == "Date") => {
+                json!({ "type": "string", "format": "date-time" })
+            }
+            Expr::TsAs(a) => self.ts_type_to_schema(file, &a.type_ann),
+            Expr::Paren(p) => self.initializer_schema(file, &p.expr),
+            _ => {
+                let text = self
+                    .project
+                    .files
+                    .get(file)
+                    .and_then(|f| f.text(init.span()));
+                json!({ "x-unresolved": text.unwrap_or_else(|| "initializer".to_string()) })
+            }
+        }
     }
 
     pub fn symbol_to_schema(&mut self, file: &Path, sym: &Symbol) -> Value {
@@ -943,10 +1341,8 @@ impl<'a> SchemaCtx<'a> {
                 }
                 for el in i.decls().flat_map(|d| &d.body.body) {
                     if let TsTypeElement::TsPropertySignature(p) = el {
-                        let name = match &*p.key {
-                            Expr::Ident(i) => i.sym.to_string(),
-                            Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
-                            _ => continue,
+                        let Some(name) = property_key(&p.key) else {
+                            continue;
                         };
                         let doc = self.jsdoc(file, p.span);
                         // `@internal`/`@private` members never reach the wire.
@@ -961,8 +1357,12 @@ impl<'a> SchemaCtx<'a> {
                         if let Some(doc) = &doc {
                             attach_doc(&mut schema, doc);
                         }
+                        let optional = p.optional
+                            || p.type_ann
+                                .as_ref()
+                                .is_some_and(|t| self.admits_undefined(file, &t.type_ann, 0));
                         props.insert(name.clone(), schema);
-                        if !p.optional && !required.contains(&name) {
+                        if !optional && !required.contains(&name) {
                             required.push(name);
                         }
                     }
@@ -1048,49 +1448,60 @@ impl<'a> SchemaCtx<'a> {
                         .unwrap_or_else(|| json!({ "x-unresolved": heritage_label(super_expr) }));
                     all_of.push(parent);
                 }
+                let mut hidden: Vec<String> = Vec::new();
+                let mut optional_names: Vec<String> = Vec::new();
                 for member in &c.body {
-                    if let swc_ecma_ast::ClassMember::ClassProp(p) = member {
-                        // A `static` member lives on the constructor, never on
-                        // an instance, so it is never part of the serialized
-                        // body — and it routinely holds internals (a logger, a
-                        // cache) whose types would otherwise be dragged into the
-                        // components. Accessibility is deliberately *not*
-                        // considered: TypeScript erases `private`, so such a
-                        // field is still serialized and still belongs on the
-                        // wire. Use the `@internal`/`@private` JSDoc tag to drop
-                        // one on purpose.
-                        if p.is_static {
-                            continue;
+                    let lowered = match member {
+                        swc_ecma_ast::ClassMember::ClassProp(p) => {
+                            self.class_prop(file, p, &mut hidden)
                         }
-                        let name = match &p.key {
-                            swc_ecma_ast::PropName::Ident(i) => i.sym.to_string(),
-                            swc_ecma_ast::PropName::Str(s) => {
-                                s.value.to_string_lossy().into_owned()
-                            }
-                            _ => continue,
-                        };
-                        let doc = self.jsdoc(file, p.span);
-                        // `@internal`/`@private` members never reach the wire.
-                        if doc.as_ref().is_some_and(|d| d.internal) {
-                            continue;
-                        }
-                        let mut schema = p
-                            .type_ann
-                            .as_ref()
-                            .map(|t| self.ts_type_to_schema(file, &t.type_ann))
-                            .unwrap_or_else(|| json!({}));
-                        if let Some(doc) = &doc {
-                            attach_doc(&mut schema, doc);
-                        }
-                        // class-validator `@IsOptional()` decorator implies optional.
-                        let has_is_optional = p
-                            .decorators
+                        swc_ecma_ast::ClassMember::Constructor(ctor) => ctor
+                            .params
                             .iter()
-                            .any(|d| decorator_name(d) == "IsOptional");
+                            .filter_map(|param| match param {
+                                swc_ecma_ast::ParamOrTsParamProp::TsParamProp(pp) => {
+                                    self.param_prop(file, pp, &mut hidden)
+                                }
+                                swc_ecma_ast::ParamOrTsParamProp::Param(_) => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for (name, schema, optional) in lowered {
                         props.insert(name.clone(), schema);
-                        if !p.is_optional && !has_is_optional {
+                        if optional {
+                            optional_names.push(name);
+                        } else {
                             required.push(name);
                         }
+                    }
+                }
+                // A hidden or optional override hides or relaxes the inherited
+                // property too. The parent is inlined only when it declares such
+                // a property, so the shared component stays untouched and other
+                // subclasses keep their `$ref`.
+                if let Some(parent) = all_of.first_mut()
+                    && let Some(inherited) = inherited_object(&self.components.schemas, parent)
+                {
+                    let declares = |k: &String| {
+                        inherited
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|p| p.contains_key(k))
+                    };
+                    let requires = |k: &String| {
+                        inherited
+                            .get("required")
+                            .and_then(Value::as_array)
+                            .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(k)))
+                    };
+                    let hide: Vec<String> = hidden.into_iter().filter(declares).collect();
+                    let relax: Vec<String> = optional_names.into_iter().filter(requires).collect();
+                    if !hide.is_empty() {
+                        *parent = self.reshape_object(parent.take(), &ObjectEdit::Omit(hide));
+                    }
+                    if !relax.is_empty() {
+                        *parent = self.reshape_object(parent.take(), &ObjectEdit::Relax(relax));
                     }
                 }
                 let mut obj = Map::new();
@@ -1119,6 +1530,130 @@ impl<'a> SchemaCtx<'a> {
             }
         }
     }
+}
+
+/// Whether `ty` is `never`, possibly parenthesized.
+fn is_never(ty: &TsType) -> bool {
+    match ty {
+        TsType::TsKeywordType(k) => k.kind == TsKeywordTypeKind::TsNeverKeyword,
+        TsType::TsParenthesizedType(p) => is_never(&p.type_ann),
+        _ => false,
+    }
+}
+
+/// A numeric property key as JavaScript spells it once it becomes a string
+/// (`0x10` -> `16`, `1e21` -> `1e+21`): ECMAScript's `Number::toString`, built
+/// on the shortest round-tripping digits, which Rust's `{:e}` also produces.
+fn js_number_key(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    let sign = if n < 0.0 { "-" } else { "" };
+    let sci = format!("{:e}", n.abs());
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let k = digits.len() as i64;
+    // The decimal point sits after `point` digits: value = 0.digits × 10^point.
+    let point = exp.parse::<i64>().unwrap_or(0) + 1;
+    let body = if k <= point && point <= 21 {
+        format!("{digits}{}", "0".repeat((point - k) as usize))
+    } else if 0 < point && point <= 21 {
+        let (int, frac) = digits.split_at(point as usize);
+        format!("{int}.{frac}")
+    } else if -6 < point && point <= 0 {
+        format!("0.{}{digits}", "0".repeat(-point as usize))
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let power = point - 1;
+        let sign = if power < 0 { '-' } else { '+' };
+        let rest = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(".{rest}")
+        };
+        format!("{first}{rest}e{sign}{}", power.abs())
+    };
+    format!("{sign}{body}")
+}
+
+/// The name of an interface or type-literal member, `None` for a computed key.
+fn property_key(key: &Expr) -> Option<String> {
+    match key {
+        Expr::Ident(i) => Some(i.sym.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+        Expr::Lit(Lit::Num(n)) => Some(js_number_key(n.value)),
+        _ => None,
+    }
+}
+
+/// The name of a class member, `None` for a computed or private (`#x`) key.
+fn prop_name_key(key: &swc_ecma_ast::PropName) -> Option<String> {
+    match key {
+        swc_ecma_ast::PropName::Ident(i) => Some(i.sym.to_string()),
+        swc_ecma_ast::PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
+        swc_ecma_ast::PropName::Num(n) => Some(js_number_key(n.value)),
+        _ => None,
+    }
+}
+
+/// The decorator's own name, without a namespace (`@ns.Exclude()` -> `Exclude`).
+fn decorator_base_name(d: &swc_ecma_ast::Decorator) -> String {
+    let name = decorator_name(d);
+    name.rsplit('.').next().unwrap_or_default().to_string()
+}
+
+/// `@Exclude()` (class-transformer) and `@ApiHideProperty()` (`@nestjs/swagger`)
+/// keep a property off the wire, except `@Exclude({ toClassOnly: true })`,
+/// which only drops it from incoming payloads (unless `toPlainOnly` is set too).
+fn hides_property(d: &swc_ecma_ast::Decorator) -> bool {
+    match decorator_base_name(d).as_str() {
+        "ApiHideProperty" => true,
+        "Exclude" => {
+            decorator_option_bool(d, "toClassOnly") != Some(true)
+                || decorator_option_bool(d, "toPlainOnly") == Some(true)
+        }
+        _ => false,
+    }
+}
+
+/// `@IsOptional()`, `@ApiPropertyOptional()` and `@ApiProperty({ required: false })`.
+fn marks_optional(d: &swc_ecma_ast::Decorator) -> bool {
+    match decorator_base_name(d).as_str() {
+        "IsOptional" | "ApiPropertyOptional" => true,
+        "ApiProperty" => decorator_option_bool(d, "required") == Some(false),
+        _ => false,
+    }
+}
+
+/// A boolean literal option of a decorator's first-argument object literal.
+fn decorator_option_bool(d: &swc_ecma_ast::Decorator, key: &str) -> Option<bool> {
+    let Expr::Call(call) = &*d.expr else {
+        return None;
+    };
+    let Expr::Object(obj) = &*call.args.first()?.expr else {
+        return None;
+    };
+    obj.props.iter().find_map(|p| {
+        let swc_ecma_ast::PropOrSpread::Prop(p) = p else {
+            return None;
+        };
+        let swc_ecma_ast::Prop::KeyValue(kv) = &**p else {
+            return None;
+        };
+        if prop_name_key(&kv.key).as_deref() != Some(key) {
+            return None;
+        }
+        match &*kv.value {
+            Expr::Lit(Lit::Bool(b)) => Some(b.value),
+            _ => None,
+        }
+    })
 }
 
 fn enum_value_type(v: &EnumValue) -> &'static str {
@@ -1359,6 +1894,8 @@ enum ObjectEdit {
     AllRequired,
     Omit(Vec<String>),
     Pick(Vec<String>),
+    /// Make these properties optional.
+    Relax(Vec<String>),
 }
 
 impl ObjectEdit {
@@ -1369,8 +1906,99 @@ impl ObjectEdit {
             Self::AllRequired => "Required",
             Self::Omit(_) => "Omit",
             Self::Pick(_) => "Pick",
+            Self::Relax(_) => "Optional",
         }
     }
+}
+
+/// The object `schema` flattens to, or, past an unresolved ancestor, the one
+/// the branches beside it flatten to.
+fn inherited_object(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+) -> Option<Map<String, Value>> {
+    if let Some(obj) = flatten_object(schemas, schema, 0) {
+        return Some(obj);
+    }
+    let mut split = Split::default();
+    split_unresolved(schemas, schema, &mut split, 0)?;
+    flatten_object(schemas, &json!({ "allOf": split.resolvable }), 0)
+}
+
+/// Apply a property-set edit to `schema`, inlined into one object first so
+/// inherited properties are edited too. A parent nestoa could not resolve
+/// (`x-unresolved`) cannot be inlined: it is kept as an `allOf` branch beside
+/// the edited remainder, so the gap stays visible. `None` when `schema` is not
+/// object-shaped.
+fn reshape(schemas: &IndexMap<String, Value>, schema: &Value, edit: &ObjectEdit) -> Option<Value> {
+    if let Some(obj) = flatten_object(schemas, schema, 0) {
+        return Some(apply_edit(obj, edit));
+    }
+    let mut split = Split::default();
+    split_unresolved(schemas, schema, &mut split, 0)?;
+    if split.unresolved.is_empty() || split.resolvable.is_empty() {
+        return None;
+    }
+    let obj = flatten_object(schemas, &json!({ "allOf": split.resolvable }), 0)?;
+    split.unresolved.push(apply_edit(obj, edit));
+    let mut out = split.annotations;
+    out.insert("allOf".into(), Value::Array(split.unresolved));
+    Some(Value::Object(out))
+}
+
+/// An object schema split by `split_unresolved`.
+#[derive(Default)]
+struct Split {
+    unresolved: Vec<Value>,
+    resolvable: Vec<Value>,
+    /// Annotations (`description`, …) of the `allOf` wrappers walked through,
+    /// the outermost kept on a clash.
+    annotations: Map<String, Value>,
+}
+
+/// Split an object schema into its `x-unresolved` parents and the branches
+/// that flatten, following `$ref`s and `allOf`s. `None` if any other part
+/// cannot be flattened.
+fn split_unresolved(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    split: &mut Split,
+    depth: usize,
+) -> Option<()> {
+    const MAX_DEPTH: usize = 32;
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    if flatten_object(schemas, schema, depth).is_some() {
+        split.resolvable.push(schema.clone());
+        return Some(());
+    }
+    let map = schema.as_object()?;
+    if map.contains_key("x-unresolved") {
+        split.unresolved.push(schema.clone());
+        return Some(());
+    }
+    if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+        let target = schemas.get(target.strip_prefix("#/components/schemas/")?)?;
+        return split_unresolved(schemas, target, split, depth + 1);
+    }
+    let branches = map.get("allOf")?.as_array()?;
+    for (k, v) in map {
+        if k == "allOf" {
+            continue;
+        }
+        if !is_annotation(k) {
+            return None;
+        }
+        split
+            .annotations
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+    for branch in branches {
+        split_unresolved(schemas, branch, split, depth + 1)?;
+    }
+    Some(())
 }
 
 /// Edit the property set of a flattened object schema.
@@ -1388,6 +2016,7 @@ fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
     };
     match edit {
         ObjectEdit::AllOptional => required.clear(),
+        ObjectEdit::Relax(keys) => required.retain(|k| !keys.contains(k)),
         ObjectEdit::AllRequired => required = keys,
         ObjectEdit::Omit(drop) | ObjectEdit::Pick(drop) => {
             let keep = |k: &str| drop.iter().any(|d| d == k) == matches!(edit, ObjectEdit::Pick(_));
@@ -1624,6 +2253,121 @@ fn callee_name(e: &Expr) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// A tuple from its fixed positions and the schema of every later one
+/// (`false` for a closed tuple). `prefixItems` must not be empty, so a tuple
+/// without fixed positions is a plain array, and `[]` admits no element.
+fn tuple_schema(prefix: Vec<Value>, tail: Value) -> Value {
+    match (prefix.is_empty(), tail) {
+        (true, Value::Bool(false)) => json!({ "type": "array", "items": {}, "maxItems": 0 }),
+        (true, tail) => json!({ "type": "array", "items": tail }),
+        (false, tail) => json!({ "type": "array", "prefixItems": prefix, "items": tail }),
+    }
+}
+
+/// What a tuple's rest element `...R` adds: the fixed positions of a spread
+/// tuple, and the schema of the positions after them. An `x-unresolved` rest
+/// is kept as that schema so the gap stays visible; `None` for a rest that is
+/// not an array, such as a union of them.
+fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> Option<(Vec<Value>, Value)> {
+    const MAX_DEPTH: usize = 16;
+    let mut rest = rest;
+    for _ in 0..MAX_DEPTH {
+        match rest
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/components/schemas/"))
+            .and_then(|name| schemas.get(name))
+        {
+            Some(target) => rest = target.clone(),
+            None => break,
+        }
+    }
+    // Only the marker: a spread unresolved tuple's own `type: array` would
+    // otherwise require every remaining element to be an array.
+    if let Some(marker) = rest.get("x-unresolved") {
+        return Some((Vec::new(), json!({ "x-unresolved": marker })));
+    }
+    if rest.get("type") != Some(&json!("array")) {
+        return None;
+    }
+    // `[]`, which `tuple_schema` writes with `maxItems: 0` rather than `items`.
+    if rest.get("maxItems") == Some(&json!(0)) {
+        return Some((Vec::new(), Value::Bool(false)));
+    }
+    let prefix = match rest.get("prefixItems") {
+        Some(Value::Array(p)) => p.clone(),
+        _ => Vec::new(),
+    };
+    let tail = rest.get("items").cloned().unwrap_or_else(|| json!({}));
+    Some((prefix, tail))
+}
+
+/// `NonNullable<T>`: `schema` without its `null` member. A `$ref` to a
+/// nullable component is inlined, since the component itself must stay as is.
+fn strip_null(schemas: &IndexMap<String, Value>, schema: Value) -> Value {
+    strip_null_at(schemas, schema, 0)
+}
+
+fn strip_null_at(schemas: &IndexMap<String, Value>, schema: Value, depth: usize) -> Value {
+    const MAX_DEPTH: usize = 16;
+    let Value::Object(mut m) = schema else {
+        return schema;
+    };
+    if let Some(target) = m
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .and_then(|name| schemas.get(name))
+        && depth < MAX_DEPTH
+    {
+        let stripped = strip_null_at(schemas, target.clone(), depth + 1);
+        return if stripped == *target {
+            Value::Object(m)
+        } else {
+            stripped
+        };
+    }
+    match m.get("type").cloned() {
+        Some(Value::String(t)) if t == "null" => return json!({ "not": {} }),
+        Some(Value::Array(types)) => {
+            let kept: Vec<Value> = types
+                .into_iter()
+                .filter(|t| t.as_str() != Some("null"))
+                .collect();
+            let kept = match <[Value; 1]>::try_from(kept) {
+                Ok([single]) => single,
+                Err(kept) => Value::Array(kept),
+            };
+            m.insert("type".into(), kept);
+        }
+        _ => {}
+    }
+    if let Some(Value::Array(values)) = m.get_mut("enum") {
+        values.retain(|v| !v.is_null());
+    }
+    // Every conjunct must admit the value, so each loses its null; a null-only
+    // one becomes unsatisfiable rather than being dropped.
+    if let Some(Value::Array(conjuncts)) = m.get_mut("allOf") {
+        for conjunct in conjuncts.iter_mut() {
+            *conjunct = strip_null_at(schemas, conjunct.take(), depth + 1);
+        }
+    }
+    let only_key = m.len() == 1;
+    for key in ["anyOf", "oneOf"] {
+        let Some(Value::Array(branches)) = m.get_mut(key) else {
+            continue;
+        };
+        branches.retain(|b| b.get("type").and_then(Value::as_str) != Some("null"));
+        for branch in branches.iter_mut() {
+            *branch = strip_null_at(schemas, branch.take(), depth + 1);
+        }
+        if branches.len() == 1 && only_key {
+            return branches.pop().expect("one branch");
+        }
+    }
+    Value::Object(m)
 }
 
 /// Encode "may also be null" the OpenAPI 3.1 way.
@@ -1879,7 +2623,15 @@ mod tests {
 
     #[test]
     fn enums_follow_typescript_member_values() {
-        let [level, neg, strings, mixed, computed, member, unknown_member] = lower_all(
+        let [
+            level,
+            neg,
+            strings,
+            mixed,
+            computed,
+            member,
+            implicit_member,
+        ] = lower_all(
             "export enum Level { A = 1, B, C }\n\
              export enum Neg { A = -1, B }\n\
              export enum S { X = 'x', Y = 'y' }\n\
@@ -1899,9 +2651,9 @@ mod tests {
             mixed,
             json!({ "type": ["string", "number"], "enum": ["a", 2] })
         );
-        assert_eq!(computed, json!({ "x-unresolved": "Computed" }));
+        assert_eq!(computed, json!({ "type": "number", "enum": [2, 3] }));
         assert_eq!(member, json!({ "type": "number", "enum": [3] }));
-        assert_eq!(unknown_member, json!({ "x-unresolved": "Computed.B" }));
+        assert_eq!(implicit_member, json!({ "type": "number", "enum": [3] }));
     }
 
     #[test]
@@ -2977,5 +3729,1010 @@ mod tests {
             "got {}",
             props.get("maybe").unwrap()
         );
+    }
+
+    #[test]
+    fn constructor_parameter_properties_are_lowered() {
+        let [pet] = lower_all(
+            "",
+            "export class Pet {\n\
+               species = 'cat';\n\
+               constructor(public name: string, private age?: number, readonly tag = 1, plain: boolean) {}\n\
+             }",
+            &["Pet"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&pet), ["species", "name", "age", "tag"]);
+        assert_eq!(pet["properties"]["age"], json!({"type": "number"}));
+        assert_eq!(pet["properties"]["tag"], json!({"type": "number"}));
+        assert_eq!(required_names(&pet), ["species", "name", "tag"]);
+    }
+
+    #[test]
+    fn a_union_with_undefined_makes_a_property_optional() {
+        let [class, iface, alias] = lower_all(
+            "",
+            "export class Book { a: string | undefined; b: (number | void); c: string; }\n\
+             export interface Author { a: string | undefined; c: string; }\n\
+             export type Order = { a: undefined | string; c: string };",
+            &["Book", "Author", "Order"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&class), ["c"]);
+        assert_eq!(class["properties"]["a"], json!({"type": "string"}));
+        assert_eq!(required_names(&iface), ["c"]);
+        assert_eq!(required_names(&alias), ["c"]);
+    }
+
+    #[test]
+    fn serialization_decorators_hide_or_relax_properties() {
+        let [user] = lower_all(
+            "",
+            "export class User {\n\
+               @Exclude() password: string;\n\
+               @ApiHideProperty() internal: string;\n\
+               @Exclude({ toClassOnly: true }) computed: string;\n\
+               @ApiPropertyOptional() nickname: string;\n\
+               @ApiProperty({ required: false, description: 'd' }) bio: string;\n\
+               @ApiProperty({ required: true }) email: string;\n\
+               @Transformer.Exclude() token: string;\n\
+             }",
+            &["User"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&user), ["computed", "nickname", "bio", "email"]);
+        assert_eq!(required_names(&user), ["computed", "email"]);
+    }
+
+    #[test]
+    fn a_hidden_property_type_never_becomes_a_component() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            "export class Secret { value: string; }\n\
+             export class Internal { value: string; }\n\
+             export class User {\n\
+               @Exclude() secret: Secret;\n\
+               /** @internal */ internal: Internal;\n\
+               name: string;\n\
+             }",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&dir.join("dto.ts"), "User").unwrap();
+        let user = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(prop_names(&user), ["name"]);
+        assert!(components.schemas.is_empty());
+        assert!(components.allocated.is_empty());
+    }
+
+    #[test]
+    fn untyped_fields_are_inferred_from_their_initialiser() {
+        let [widget] = lower_all(
+            "",
+            "export class Widget {\n\
+               a = 1; b = 'x'; c = true; d = -2; e = new Date(); f = `t`;\n\
+               g = 0 as number; h = compute(); i;\n\
+             }",
+            &["Widget"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &widget["properties"];
+        assert_eq!(p["a"], json!({"type": "number"}));
+        assert_eq!(p["b"], json!({"type": "string"}));
+        assert_eq!(p["c"], json!({"type": "boolean"}));
+        assert_eq!(p["d"], json!({"type": "number"}));
+        assert_eq!(p["e"], json!({"type": "string", "format": "date-time"}));
+        assert_eq!(p["f"], json!({"type": "string"}));
+        assert_eq!(p["g"], json!({"type": "number"}));
+        assert_eq!(p["h"], json!({"x-unresolved": "compute()"}));
+        assert_eq!(p["i"], json!({}));
+    }
+
+    #[test]
+    fn utility_types_edit_the_resolvable_part_of_an_unresolved_parent() {
+        let [partial, pick, omit] = lower_all(
+            "import { External } from '@acme/missing';\n\
+             export class Mid extends External { title: string; }\n\
+             export class Book extends Mid { pages: number; }",
+            "import { Book } from './dto';\n\
+             export type A = Partial<Book>;\n\
+             export type B = Pick<Book, 'title'>;\n\
+             export type C = Omit<Book, 'title'>;",
+            &["A", "B", "C"],
+        )
+        .try_into()
+        .unwrap();
+        let unresolved = json!({"x-unresolved": "External"});
+        assert_eq!(partial["allOf"][0], unresolved, "got {partial}");
+        assert_eq!(prop_names(&partial["allOf"][1]), ["title", "pages"]);
+        assert!(
+            partial["allOf"][1].get("required").is_none(),
+            "got {partial}"
+        );
+        assert_eq!(pick["allOf"][0], unresolved);
+        assert_eq!(prop_names(&pick["allOf"][1]), ["title"]);
+        assert_eq!(required_names(&pick["allOf"][1]), ["title"]);
+        assert_eq!(prop_names(&omit["allOf"][1]), ["pages"]);
+        assert_eq!(required_names(&omit["allOf"][1]), ["pages"]);
+    }
+
+    #[test]
+    fn non_nullable_strips_null() {
+        let [holder] = lower_all(
+            "export type MaybeTitle = string | null;",
+            "import { MaybeTitle } from './dto';\n\
+             export interface Holder {\n\
+               a: NonNullable<string | null>;\n\
+               b: NonNullable<'x' | 'y' | null>;\n\
+               c: NonNullable<Holder | null>;\n\
+               d: NonNullable<MaybeTitle>;\n\
+               e: NonNullable<string | number | null>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"], json!({"type": "string"}));
+        assert_eq!(p["b"], json!({"type": "string", "enum": ["x", "y"]}));
+        assert_eq!(p["c"], json!({"$ref": "#/components/schemas/Holder"}));
+        assert_eq!(p["d"], json!({"type": "string"}));
+        assert_eq!(
+            p["e"],
+            json!({"anyOf": [{"type": "string"}, {"type": "number"}]})
+        );
+    }
+
+    #[test]
+    fn record_with_literal_keys_lists_its_properties() {
+        let [holder] = lower_all(
+            "export type Slot = 'am' | 'pm';",
+            "import { Slot } from './dto';\n\
+             export interface Holder {\n\
+               a: Record<'x' | 'y', number>;\n\
+               b: Partial<Record<Slot, string>>;\n\
+               c: Record<string, number>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({
+                "type": "object",
+                "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                "required": ["x", "y"]
+            })
+        );
+        assert_eq!(
+            p["b"],
+            json!({
+                "type": "object",
+                "properties": {"am": {"type": "string"}, "pm": {"type": "string"}}
+            })
+        );
+        assert_eq!(
+            p["c"],
+            json!({"type": "object", "additionalProperties": {"type": "number"}})
+        );
+    }
+
+    #[test]
+    fn tuple_rest_element_becomes_the_open_items() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: [string, ...number[]];\n\
+               b: [string, ...Array<boolean>];\n\
+               c: [...string[], number];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"type": "array", "prefixItems": [{"type": "string"}], "items": {"type": "number"}})
+        );
+        assert_eq!(p["b"]["items"], json!({"type": "boolean"}));
+        assert_eq!(
+            p["c"],
+            json!({"type": "array", "items": {}, "x-unresolved": "[...string[], number]"})
+        );
+    }
+
+    #[test]
+    fn whole_number_literal_types_are_integers() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { a: 42; b: -1; c: 1.5; d: 1 | 2; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"], json!({"type": "number", "enum": [42]}));
+        assert_eq!(p["b"], json!({"type": "number", "enum": [-1]}));
+        assert_eq!(p["c"], json!({"type": "number", "enum": [1.5]}));
+        assert_eq!(p["d"], json!({"type": "number", "enum": [1, 2]}));
+    }
+
+    #[test]
+    fn enum_members_computed_from_siblings_are_evaluated() {
+        let [flags, aliases] = lower_all(
+            "",
+            "export enum Flags { None = 0, A = 1 << 0, B = 1 << 1, AB = A | B, C = Flags.AB + 1, D = ~0 }\n\
+             export enum Aliases { First = 'first', Same = First, Next = 3, After }",
+            &["Flags", "Aliases"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(flags["enum"], json!([0, 1, 2, 3, 4, -1]));
+        assert_eq!(aliases["type"], json!(["string", "number"]));
+        assert_eq!(aliases["enum"], json!(["first", "first", 3, 4]));
+    }
+
+    #[test]
+    fn awaited_set_and_map_are_lowered() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Awaited<Promise<string>>;\n\
+               b: Set<number>;\n\
+               c: ReadonlySet<string>;\n\
+               d: Map<string, boolean>;\n\
+               e: ReadonlyMap<string, number>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"], json!({"type": "string"}));
+        assert_eq!(
+            p["b"],
+            json!({"type": "array", "items": {"type": "number"}, "uniqueItems": true})
+        );
+        assert_eq!(p["c"]["uniqueItems"], json!(true));
+        assert_eq!(
+            p["d"],
+            json!({"type": "object", "additionalProperties": {"type": "boolean"}})
+        );
+        assert_eq!(p["e"]["additionalProperties"], json!({"type": "number"}));
+    }
+
+    #[test]
+    fn numeric_property_keys_are_kept() {
+        let [iface, class, lit] = lower_all(
+            "",
+            "export interface Pair { 0: string; 1?: number; }\n\
+             export class Grid { 0: string; }\n\
+             export type Cell = { 2: boolean };",
+            &["Pair", "Grid", "Cell"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&iface), ["0", "1"]);
+        assert_eq!(required_names(&iface), ["0"]);
+        assert_eq!(prop_names(&class), ["0"]);
+        assert_eq!(prop_names(&lit), ["2"]);
+    }
+
+    #[test]
+    fn tuple_rest_operands_resolve_through_aliases_and_spreads() {
+        let [holder] = lower_all(
+            "export type Tail = number[];",
+            "import { Tail } from './dto';\n\
+             export interface Holder {\n\
+               a: [string, ...Tail];\n\
+               b: [string, ...[number, boolean]];\n\
+               c: [string, ...Missing];\n\
+               d: [...number[]];\n\
+               e: [];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"]["items"], json!({"type": "number"}));
+        assert_eq!(
+            p["b"],
+            json!({
+                "type": "array",
+                "prefixItems": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}],
+                "items": false
+            })
+        );
+        assert_eq!(p["c"]["items"], json!({"x-unresolved": "Missing"}));
+        assert_eq!(
+            p["d"],
+            json!({"type": "array", "items": {"type": "number"}})
+        );
+        assert_eq!(p["e"], json!({"type": "array", "items": {}, "maxItems": 0}));
+    }
+
+    #[test]
+    fn spreading_an_empty_tuple_closes_the_tuple() {
+        let [holder] = lower_all(
+            "export type Nothing = [];",
+            "import { Nothing } from './dto';
+             export interface Holder { a: [string, ...[]]; b: [...[]]; c: [string, ...Nothing]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        let closed = json!({"type": "array", "prefixItems": [{"type": "string"}], "items": false});
+        assert_eq!(p["a"], closed);
+        assert_eq!(p["b"], json!({"type": "array", "items": {}, "maxItems": 0}));
+        assert_eq!(p["c"], closed);
+    }
+
+    #[test]
+    fn record_keys_are_deduplicated() {
+        let [holder] = lower_all(
+            "export type A = 'a' | 'b';\nexport type B = 'b' | 'c';",
+            "import { A, B } from './dto';\n\
+             export interface Holder { r: Record<A | B, number>; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["r"]["required"],
+            json!(["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn an_alias_admitting_undefined_makes_a_property_optional() {
+        let [book, author] = lower_all(
+            "export type Maybe = string | undefined;\n\
+             export type Opt<T> = T | undefined;\n\
+             export type Loop = Loop | string;",
+            "import { Maybe, Opt, Loop } from './dto';\n\
+             export interface Book { title: Maybe; pages: Opt<number>; loop: Loop; isbn: string; }\n\
+             export class Author { name: Maybe; }",
+            &["Book", "Author"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&book), ["loop", "isbn"]);
+        assert!(author.get("required").is_none(), "got {author}");
+    }
+
+    #[test]
+    fn non_nullable_strips_null_inside_union_branches() {
+        let [holder] = lower_all(
+            "export type Maybe = string | null;",
+            "import { Maybe } from './dto';\n\
+             export interface Holder { r: NonNullable<Maybe | number>; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["r"],
+            json!({"anyOf": [{"type": "string"}, {"type": "number"}]})
+        );
+    }
+
+    #[test]
+    fn a_hidden_override_hides_the_inherited_property() {
+        let [user, base, plain] = lower_all(
+            "",
+            "export class Base { password = ''; name: string; }\n\
+             export class User extends Base { @Exclude() password = ''; }\n\
+             export class Plain extends Base { extra: string; }",
+            &["User", "Base", "Plain"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&user["allOf"][0]), ["name"], "got {user}");
+        assert_eq!(required_names(&user["allOf"][0]), ["name"]);
+        assert_eq!(prop_names(&base), ["password", "name"]);
+        assert_eq!(
+            plain["allOf"][0],
+            json!({"$ref": "#/components/schemas/Base"})
+        );
+    }
+
+    #[test]
+    fn non_finite_enum_members_are_unknown() {
+        let [div, overflow] = lower_all(
+            "",
+            "export enum Div { A = 1 / 0 }\nexport enum Overflow { A = 10 ** 400, B = 0 / 0 }",
+            &["Div", "Overflow"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(div, json!({"x-unresolved": "Div"}));
+        assert_eq!(overflow, json!({"x-unresolved": "Overflow"}));
+    }
+
+    #[test]
+    fn a_hidden_override_hides_a_property_beside_an_unresolved_ancestor() {
+        let [user, base] = lower_all(
+            "import { External } from '@acme/missing';\n\
+             export class Base extends External { password: string; name: string; }",
+            "import { Base } from './dto';\n\
+             export class User extends Base { @Exclude() password: string; }\n\
+             export { Base };",
+            &["User", "Base"],
+        )
+        .try_into()
+        .unwrap();
+        let parent = &user["allOf"][0];
+        assert_eq!(
+            parent["allOf"][0],
+            json!({"x-unresolved": "External"}),
+            "got {user}"
+        );
+        assert_eq!(prop_names(&parent["allOf"][1]), ["name"]);
+        assert_eq!(prop_names(&base["allOf"][1]), ["password", "name"]);
+    }
+
+    #[test]
+    fn a_namespace_qualified_alias_admitting_undefined_is_optional() {
+        let [book] = lower_with(
+            &[("types.ts", "export type Maybe = string | undefined;")],
+            "import * as Types from './types';\n\
+             export interface Book { title: Types.Maybe; isbn: string; }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&book), ["isbn"]);
+    }
+
+    #[test]
+    fn an_optional_override_relaxes_the_inherited_property() {
+        let [book, base] = lower_all(
+            "",
+            "export class Base { name: string; isbn: string; }\n\
+             export class Book extends Base { @ApiPropertyOptional() name: string; }",
+            &["Book", "Base"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            prop_names(&book["allOf"][0]),
+            ["name", "isbn"],
+            "got {book}"
+        );
+        assert_eq!(required_names(&book["allOf"][0]), ["isbn"]);
+        assert_eq!(required_names(&base), ["name", "isbn"]);
+    }
+
+    #[test]
+    fn a_rest_operand_that_is_not_an_array_stays_unresolved() {
+        let [holder] = lower_all(
+            "export type Tail = number[] | string[];",
+            "import { Tail } from './dto';\n\
+             export interface Holder { row: [boolean, ...Tail]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["row"]["items"],
+            json!({"x-unresolved": "Tail"})
+        );
+    }
+
+    #[test]
+    fn non_nullable_strips_null_inside_intersections() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: NonNullable<(string | null) & ('x' | null)>;\n\
+               b: NonNullable<string & null>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"allOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]})
+        );
+        assert_eq!(p["b"], json!({"allOf": [{"type": "string"}, {"not": {}}]}));
+    }
+
+    #[test]
+    fn a_record_value_admitting_undefined_leaves_its_keys_optional() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { r: Record<'a' | 'b', string | undefined>; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let r = &holder["properties"]["r"];
+        assert_eq!(prop_names(r), ["a", "b"]);
+        assert!(r.get("required").is_none(), "got {r}");
+    }
+
+    #[test]
+    fn a_bound_type_parameter_admitting_undefined_is_optional() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            "export type Bound = string | undefined;\n\
+             export interface Wrap<T> { first: T; count: number; }",
+        )]);
+        let file = dir.join("dto.ts");
+        let (_, Symbol::TypeAlias(bound)) = project.resolve(&file, "Bound").unwrap() else {
+            panic!("Bound is an alias");
+        };
+        let env: TypeEnv = HashMap::from([(
+            "T".to_string(),
+            TypeBinding {
+                origin_file: file.clone(),
+                ty: (*bound.type_ann).clone(),
+                resolved: None,
+                admits_undefined: None,
+            },
+        )]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: Some(env),
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&file, "Wrap").unwrap();
+        let wrap = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(wrap["properties"]["first"], json!({"type": "string"}));
+        assert_eq!(required_names(&wrap), ["count"]);
+    }
+
+    /// Lower `name` from `dto.ts` with the interceptor env `T -> Bound`, the
+    /// way `interceptors.rs` does, returning the schema and the components.
+    fn lower_under_env(dto: &str, name: &str) -> (Value, IndexMap<String, Value>) {
+        let (project, dir) = project_from(&[("dto.ts", dto)]);
+        let file = dir.join("dto.ts");
+        let mut env = TypeEnv::new();
+        if let Some((_, Symbol::TypeAlias(bound))) = project.resolve(&file, "Bound") {
+            env.insert(
+                "T".to_string(),
+                TypeBinding {
+                    origin_file: file.clone(),
+                    ty: (*bound.type_ann).clone(),
+                    resolved: None,
+                    admits_undefined: None,
+                },
+            );
+        }
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: Some(env),
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&file, name).unwrap();
+        let schema = ctx.symbol_to_schema(&decl_file, &sym);
+        (schema, components.schemas)
+    }
+
+    #[test]
+    fn a_nested_binding_keeps_the_callers_optionality() {
+        let (outer, _) = lower_under_env(
+            "export type Bound = string | undefined;\n\
+             export interface Envelope<T> { value: T; tag: string; }\n\
+             export interface Outer<T> { e: Envelope<T>; }",
+            "Outer",
+        );
+        assert_eq!(
+            required_names(&outer["properties"]["e"]),
+            ["tag"],
+            "got {outer}"
+        );
+    }
+
+    #[test]
+    fn instantiations_differing_only_in_optionality_are_distinct() {
+        for order in [["a", "b"], ["b", "a"]] {
+            let fields = order.map(|f| match f {
+                "a" => "a: Box<string>;",
+                _ => "b: Box<string | undefined>;",
+            });
+            let (out, schemas) = lower_under_env(
+                &format!(
+                    "export interface Box<T> {{ value: T; next?: Box<T>; }}\n\
+                     export interface Out {{ {} {} }}",
+                    fields[0], fields[1]
+                ),
+                "Out",
+            );
+            let component = |p: &str| {
+                let name = out["properties"][p]["$ref"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap();
+                schemas[name].clone()
+            };
+            assert_eq!(
+                required_names(&component("a")),
+                ["value"],
+                "order {order:?}: {out}"
+            );
+            assert!(
+                component("b").get("required").is_none(),
+                "order {order:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn awaited_admitting_undefined_is_optional() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { value: Awaited<string | undefined>; id: string; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["id"]);
+    }
+
+    #[test]
+    fn a_non_final_rest_tuple_keeps_an_items_schema() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { c: [...string[], number]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let c = &holder["properties"]["c"];
+        assert_eq!(
+            *c,
+            json!({"type": "array", "items": {}, "x-unresolved": "[...string[], number]"})
+        );
+        let mut down = c.clone();
+        crate::dialect::downgrade_to_30(&mut down);
+        assert_eq!(down["items"], json!({}));
+    }
+
+    #[test]
+    fn awaited_promises_and_readonly_keep_optionality() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Awaited<Promise<string | undefined>>;\n\
+               b: Readonly<string | undefined>;\n\
+               c: Promise<string | undefined>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["c"]);
+    }
+
+    #[test]
+    fn a_never_rest_closes_the_tuple() {
+        let [holder] = lower_all(
+            "export type Never = never[];",
+            "import { Never } from './dto';\n\
+             export interface Holder { a: [string, ...never[]]; b: [string, ...Never]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let closed = json!({"type": "array", "prefixItems": [{"type": "string"}], "items": false});
+        assert_eq!(holder["properties"]["a"], closed);
+        assert_eq!(holder["properties"]["b"], closed);
+        let mut down = closed.clone();
+        crate::dialect::downgrade_to_30(&mut down);
+        assert_eq!(
+            down,
+            json!({"type": "array", "items": {"type": "string"}, "maxItems": 1})
+        );
+    }
+
+    #[test]
+    fn an_undefined_rest_keeps_the_tuple_open() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { a: [string, ...undefined[]]; b: [string, ...void[]]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        for f in ["a", "b"] {
+            assert_eq!(holder["properties"][f]["items"], json!({}), "{f}: {holder}");
+        }
+    }
+
+    #[test]
+    fn labelled_rest_elements_are_rests() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: [head: string, ...tail: number[]];\n\
+               b: [...init: string[], last: number];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"type": "array", "prefixItems": [{"type": "string"}], "items": {"type": "number"}})
+        );
+        assert_eq!(p["b"]["items"], json!({}));
+        assert!(p["b"].get("x-unresolved").is_some(), "got {}", p["b"]);
+    }
+
+    #[test]
+    fn an_asserted_initialiser_admitting_undefined_is_optional() {
+        let [book] = lower_all(
+            "",
+            "export class Book {\n\
+               title = undefined as string | undefined;\n\
+               subtitle = (undefined as string | undefined);\n\
+               isbn = '';\n\
+               constructor(public note = undefined as string | undefined) {}\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&book), ["isbn"]);
+    }
+
+    #[test]
+    fn awaited_follows_promise_aliases() {
+        let [holder] = lower_all(
+            "export type Pending = Promise<string | undefined>;",
+            "import { Pending } from './dto';\n\
+             export interface Holder { value: Awaited<Pending>; plain: Pending; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["plain"]);
+    }
+
+    #[test]
+    fn numeric_keys_use_javascript_spelling() {
+        let [grid] = lower_all(
+            "",
+            "export interface Grid { 9007199254740992: string; 1e21: string; 1.5: string; 0x10: string; }",
+            &["Grid"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            prop_names(&grid),
+            ["9007199254740992", "1e+21", "1.5", "16"]
+        );
+    }
+
+    #[test]
+    fn collections_of_never_or_undefined_emit_valid_schemas() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Set<never>; b: Set<undefined>; c: Map<string, never>; d: ReadonlyMap<string, void>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"]["items"], json!({"not": {}}));
+        assert_eq!(p["b"]["items"], json!({}));
+        assert_eq!(p["c"]["additionalProperties"], json!({"not": {}}));
+        assert_eq!(p["d"]["additionalProperties"], json!({}));
+    }
+
+    #[test]
+    fn numeric_keys_follow_ecmascript_number_to_string() {
+        for (n, key) in [
+            (1e-7, "1e-7"),
+            (1e-6, "0.000001"),
+            (1000000000000000100.0, "1000000000000000100"),
+            (1e21, "1e+21"),
+            (123e-20, "1.23e-18"),
+            (-0.5, "-0.5"),
+            (100.0, "100"),
+        ] {
+            assert_eq!(js_number_key(n), key, "{n}");
+        }
+    }
+
+    #[test]
+    fn parenthesized_never_is_never() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Set<(never)>; b: Map<string, (never)>;\n\
+               c: [string, ...(never)[]]; d: [string, ...Array<(never)>];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"]["items"], json!({"not": {}}));
+        assert_eq!(p["b"]["additionalProperties"], json!({"not": {}}));
+        assert_eq!(p["c"]["items"], json!(false));
+        assert_eq!(p["d"]["items"], json!(false));
+    }
+
+    #[test]
+    fn spreading_an_unresolved_tuple_keeps_only_its_marker() {
+        let [holder] = lower_all(
+            "export type Tail = [...string[], number];",
+            "import { Tail } from './dto';\n\
+             export interface Holder { row: [boolean, ...Tail]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["row"]["items"],
+            json!({"x-unresolved": "[...string[], number]"})
+        );
+    }
+
+    #[test]
+    fn a_passthrough_wrapper_keeps_optionality() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            "export interface Holder { value: Lazy<string | undefined>; id: string; }",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let passthrough = ["Lazy".to_string()];
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &passthrough,
+        };
+        let (decl_file, sym) = project.resolve(&dir.join("dto.ts"), "Holder").unwrap();
+        let holder = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(holder["properties"]["value"], json!({"type": "string"}));
+        assert_eq!(required_names(&holder), ["id"]);
+    }
+
+    #[test]
+    fn an_intersection_admitting_undefined_is_optional() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { value: (string | undefined) & ('x' | undefined); id: string & {}; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["id"]);
+    }
+
+    #[test]
+    fn non_finite_numeric_keys_use_javascript_spelling() {
+        assert_eq!(js_number_key(f64::INFINITY), "Infinity");
+        assert_eq!(js_number_key(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(js_number_key(f64::NAN), "NaN");
+        let [grid] = lower_all(
+            "",
+            "export interface Grid { 0: string; 1e400: number; }",
+            &["Grid"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&grid), ["0", "Infinity"]);
+    }
+
+    #[test]
+    fn exponentiation_of_one_by_infinity_follows_javascript() {
+        let [e] = lower_all(
+            "",
+            "export enum E { A = (1 ** (1 / 0)) | 0, B = 2 ** 3 }",
+            &["E"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(e["enum"], json!([0, 8]));
+    }
+
+    #[test]
+    fn unknown_is_neutral_in_an_optional_intersection() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { a: (string | undefined) & unknown; b: unknown; c: unknown & unknown; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["b", "c"]);
+    }
+
+    #[test]
+    fn editing_past_an_unresolved_parent_keeps_the_annotations() {
+        let [pick] = lower_all(
+            "import { External } from '@acme/missing';\n\
+             /**\n * Book metadata.\n * @deprecated\n */\n\
+             export class Book extends External { title: string; pages: number; }",
+            "import { Book } from './dto';\nexport type P = Pick<Book, 'title'>;",
+            &["P"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(pick["description"], json!("Book metadata."), "got {pick}");
+        assert_eq!(pick["deprecated"], json!(true));
+        assert_eq!(prop_names(&pick["allOf"][1]), ["title"]);
+    }
+
+    #[test]
+    fn exponentiation_by_nan_follows_javascript() {
+        let [e] = lower_all("", "export enum E { A = 1 ** (0 / 0) }", &["E"])
+            .try_into()
+            .unwrap();
+        assert_eq!(e, json!({"x-unresolved": "E"}));
+    }
+
+    #[test]
+    fn project_types_shadow_the_new_built_ins() {
+        let [holder] = lower_with(
+            &[("lib.ts", "export class Set<T> { label: string; }\nexport interface Awaited { value: string; }")],
+            "import { Set, Awaited } from './lib';\n\
+             export class Map<K, V> { size: number; }\n\
+             export interface Holder { a: Set<number>; b: Awaited; c: Map<string, number>; d: Awaited | undefined; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"$ref": "#/components/schemas/Set"}),
+            "got {holder}"
+        );
+        assert_eq!(p["b"], json!({"$ref": "#/components/schemas/Awaited"}));
+        assert_eq!(p["c"], json!({"$ref": "#/components/schemas/Map"}));
+        assert_eq!(required_names(&holder), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn exclude_in_both_directions_hides_the_property() {
+        let [user] = lower_all(
+            "",
+            "export class User {\n\
+               @Exclude({ toClassOnly: true, toPlainOnly: true }) secret: string;\n\
+               @Exclude({ toClassOnly: true }) input: string;\n\
+             }",
+            &["User"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&user), ["input"]);
     }
 }

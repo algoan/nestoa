@@ -848,15 +848,17 @@ pub enum EnumValue {
 }
 
 /// Each member of an enum with its value, following TypeScript: a string or
-/// (possibly negative) numeric initializer is taken as written, and a member
-/// without one continues from the previous numeric member, starting at 0.
-/// `None` for a computed initializer, and for an implicit member after one
+/// (possibly negative) numeric initializer is taken as written, one computed
+/// from literals and earlier members is evaluated (see `enum_init_value`), and
+/// a member without one continues from the previous numeric member, starting
+/// at 0. `None` for any other initializer, and for an implicit member after one
 /// or after a string member, whose value nestoa cannot know. In an ambient
 /// (`declare`) non-const enum TypeScript treats every implicit member as
 /// computed, so those are `None` too.
 pub fn enum_member_values(e: &TsEnumDecl) -> Vec<(String, Option<EnumValue>)> {
     let implicit_known = !e.declare || e.is_const;
     let mut next = implicit_known.then_some(0.0);
+    let mut known: HashMap<String, EnumValue> = HashMap::new();
     e.members
         .iter()
         .map(|m| {
@@ -865,19 +867,97 @@ pub fn enum_member_values(e: &TsEnumDecl) -> Vec<(String, Option<EnumValue>)> {
                 swc_ecma_ast::TsEnumMemberId::Str(s) => s.value.to_string_lossy().into_owned(),
             };
             let value = match m.init.as_deref() {
-                Some(swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(s))) => {
-                    Some(EnumValue::Str(s.value.to_string_lossy().into_owned()))
-                }
-                Some(init) => numeric_expr(init).map(EnumValue::Num),
+                Some(init) => enum_init_value(init, e.id.sym.as_ref(), &known),
                 None => next.map(EnumValue::Num),
-            };
+            }
+            // `1 / 0` or an overflow has no JSON spelling.
+            .filter(|v| !matches!(v, EnumValue::Num(n) if !n.is_finite()));
             next = match &value {
                 Some(EnumValue::Num(v)) if implicit_known => Some(v + 1.0),
                 _ => None,
             };
+            if let Some(v) = &value {
+                known.insert(name.clone(), v.clone());
+            }
             (name, value)
         })
         .collect()
+}
+
+/// The value of an enum member initialiser: a literal, an earlier member
+/// (`B = A`, `C = Flags.A`), or arithmetic and bitwise operations on them
+/// (`1 << 2`, `A | B`), evaluated with JavaScript's semantics.
+fn enum_init_value(
+    expr: &swc_ecma_ast::Expr,
+    enum_name: &str,
+    known: &HashMap<String, EnumValue>,
+) -> Option<EnumValue> {
+    use swc_ecma_ast::{BinaryOp, Expr, Lit, MemberProp, UnaryOp};
+    let num = |e: &Expr| match enum_init_value(e, enum_name, known)? {
+        EnumValue::Num(n) => Some(n),
+        EnumValue::Str(_) => None,
+    };
+    match expr {
+        Expr::Lit(Lit::Str(s)) => Some(EnumValue::Str(s.value.to_string_lossy().into_owned())),
+        Expr::Lit(Lit::Num(n)) => Some(EnumValue::Num(n.value)),
+        Expr::Paren(p) => enum_init_value(&p.expr, enum_name, known),
+        Expr::Ident(id) => known.get(id.sym.as_ref()).cloned(),
+        Expr::Member(m) => match (&*m.obj, &m.prop) {
+            (Expr::Ident(obj), MemberProp::Ident(prop)) if obj.sym == enum_name => {
+                known.get(prop.sym.as_ref()).cloned()
+            }
+            _ => None,
+        },
+        Expr::Unary(u) => {
+            let v = num(&u.arg)?;
+            match u.op {
+                UnaryOp::Minus => Some(EnumValue::Num(-v)),
+                UnaryOp::Plus => Some(EnumValue::Num(v)),
+                UnaryOp::Tilde => Some(EnumValue::Num(f64::from(!to_int32(v)))),
+                _ => None,
+            }
+        }
+        Expr::Bin(b) => {
+            let left = enum_init_value(&b.left, enum_name, known)?;
+            let right = enum_init_value(&b.right, enum_name, known)?;
+            let (l, r) = match (left, right) {
+                (EnumValue::Str(l), EnumValue::Str(r)) if b.op == BinaryOp::Add => {
+                    return Some(EnumValue::Str(format!("{l}{r}")));
+                }
+                (EnumValue::Num(l), EnumValue::Num(r)) => (l, r),
+                _ => return None,
+            };
+            let shift = (to_int32(r) as u32) & 31;
+            let value = match b.op {
+                BinaryOp::Add => l + r,
+                BinaryOp::Sub => l - r,
+                BinaryOp::Mul => l * r,
+                BinaryOp::Div => l / r,
+                BinaryOp::Mod => l % r,
+                // JavaScript: `x ** NaN` and `(±1) ** ±Infinity` are NaN, where
+                // `powf` gives 1.
+                BinaryOp::Exp if r.is_nan() || (l.abs() == 1.0 && r.is_infinite()) => f64::NAN,
+                BinaryOp::Exp => l.powf(r),
+                BinaryOp::BitOr => f64::from(to_int32(l) | to_int32(r)),
+                BinaryOp::BitAnd => f64::from(to_int32(l) & to_int32(r)),
+                BinaryOp::BitXor => f64::from(to_int32(l) ^ to_int32(r)),
+                BinaryOp::LShift => f64::from(to_int32(l).wrapping_shl(shift)),
+                BinaryOp::RShift => f64::from(to_int32(l) >> shift),
+                BinaryOp::ZeroFillRShift => f64::from((to_int32(l) as u32) >> shift),
+                _ => return None,
+            };
+            Some(EnumValue::Num(value))
+        }
+        _ => None,
+    }
+}
+
+/// JavaScript's `ToInt32`, which bitwise operators apply to their operands.
+fn to_int32(v: f64) -> i32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    (v.trunc() % 4_294_967_296.0) as i64 as u32 as i32
 }
 
 /// The numeric value of an expression that is a number literal, optionally
