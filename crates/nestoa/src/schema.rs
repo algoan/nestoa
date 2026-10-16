@@ -3809,4 +3809,17 @@ mod tests {
             json!({"anyOf": [{"type": "string"}, {"type": "number"}]})
         );
     }
+
+    #[test]
+    fn non_finite_enum_members_are_unknown() {
+        let [div, overflow] = lower_all(
+            "",
+            "export enum Div { A = 1 / 0 }\nexport enum Overflow { A = 10 ** 400, B = 0 / 0 }",
+            &["Div", "Overflow"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(div, json!({"x-unresolved": "Div"}));
+        assert_eq!(overflow, json!({"x-unresolved": "Overflow"}));
+    }
 }

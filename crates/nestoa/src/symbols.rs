@@ -869,7 +869,9 @@ pub fn enum_member_values(e: &TsEnumDecl) -> Vec<(String, Option<EnumValue>)> {
             let value = match m.init.as_deref() {
                 Some(init) => enum_init_value(init, e.id.sym.as_ref(), &known),
                 None => next.map(EnumValue::Num),
-            };
+            }
+            // `1 / 0` or an overflow has no JSON spelling.
+            .filter(|v| !matches!(v, EnumValue::Num(n) if !n.is_finite()));
             next = match &value {
                 Some(EnumValue::Num(v)) if implicit_known => Some(v + 1.0),
                 _ => None,
