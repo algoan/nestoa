@@ -1651,14 +1651,23 @@ impl ObjectEdit {
     }
 }
 
-/// Whether the object `schema` flattens to declares any of `names`.
+/// Whether the object `schema` flattens to declares any of `names`, looking
+/// past an unresolved ancestor at the branches beside it.
 fn inherits_any(schemas: &IndexMap<String, Value>, schema: &Value, names: &[String]) -> bool {
-    flatten_object(schemas, schema, 0)
-        .and_then(|obj| {
-            let props = obj.get("properties")?.as_object()?;
-            Some(names.iter().any(|n| props.contains_key(n)))
-        })
-        .unwrap_or(false)
+    let declares = |obj: Map<String, Value>| {
+        obj.get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|props| names.iter().any(|n| props.contains_key(n)))
+    };
+    if let Some(obj) = flatten_object(schemas, schema, 0) {
+        return declares(obj);
+    }
+    let mut unresolved = Vec::new();
+    let mut resolvable = Vec::new();
+    if split_unresolved(schemas, schema, &mut unresolved, &mut resolvable, 0).is_none() {
+        return false;
+    }
+    flatten_object(schemas, &json!({ "allOf": resolvable }), 0).is_some_and(declares)
 }
 
 /// Apply a property-set edit to `schema`, inlined into one object first so
@@ -3869,5 +3878,27 @@ mod tests {
         .unwrap();
         assert_eq!(div, json!({"x-unresolved": "Div"}));
         assert_eq!(overflow, json!({"x-unresolved": "Overflow"}));
+    }
+
+    #[test]
+    fn a_hidden_override_hides_a_property_beside_an_unresolved_ancestor() {
+        let [user, base] = lower_all(
+            "import { External } from '@acme/missing';\n\
+             export class Base extends External { password: string; name: string; }",
+            "import { Base } from './dto';\n\
+             export class User extends Base { @Exclude() password: string; }\n\
+             export { Base };",
+            &["User", "Base"],
+        )
+        .try_into()
+        .unwrap();
+        let parent = &user["allOf"][0];
+        assert_eq!(
+            parent["allOf"][0],
+            json!({"x-unresolved": "External"}),
+            "got {user}"
+        );
+        assert_eq!(prop_names(&parent["allOf"][1]), ["name"]);
+        assert_eq!(prop_names(&base["allOf"][1]), ["password", "name"]);
     }
 }
