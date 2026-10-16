@@ -551,7 +551,7 @@ impl<'a> SchemaCtx<'a> {
                 {
                     return json!({
                         "type": "array",
-                        "items": self.ts_type_to_schema(file, first),
+                        "items": self.element_schema(file, first),
                         "uniqueItems": true,
                     });
                 }
@@ -562,7 +562,7 @@ impl<'a> SchemaCtx<'a> {
                 {
                     return json!({
                         "type": "object",
-                        "additionalProperties": self.ts_type_to_schema(file, value_t),
+                        "additionalProperties": self.element_schema(file, value_t),
                     });
                 }
             }
@@ -1174,6 +1174,20 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
+    /// A collection's element schema. `never`, `undefined` and `void` lower to
+    /// a JSON `null` placeholder, which is no schema: `never` admits nothing,
+    /// and the other two serialize as `null` or not at all.
+    fn element_schema(&mut self, file: &Path, ty: &TsType) -> Value {
+        match self.ts_type_to_schema(file, ty) {
+            Value::Null if matches!(ty, TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNeverKeyword) =>
+            {
+                json!({ "not": {} })
+            }
+            Value::Null => json!({}),
+            schema => schema,
+        }
+    }
+
     /// `admits_undefined` for `Awaited<T>`: a `Promise` in `T`, written
     /// directly, in a union or through an alias, is unwrapped first.
     fn awaited_admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
@@ -1493,24 +1507,38 @@ impl<'a> SchemaCtx<'a> {
 }
 
 /// A numeric property key as JavaScript spells it once it becomes a string
-/// (`0x10` -> `16`, `1e21` -> `1e+21`).
+/// (`0x10` -> `16`, `1e21` -> `1e+21`): ECMAScript's `Number::toString`, built
+/// on the shortest round-tripping digits, which Rust's `{:e}` also produces.
 fn js_number_key(n: f64) -> String {
-    let abs = n.abs();
     if n == 0.0 {
         return "0".to_string();
     }
-    if (1e-7..1e21).contains(&abs) {
-        return if n.fract() == 0.0 {
-            format!("{n:.0}")
+    let sign = if n < 0.0 { "-" } else { "" };
+    let sci = format!("{:e}", n.abs());
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let k = digits.len() as i64;
+    // The decimal point sits after `point` digits: value = 0.digits × 10^point.
+    let point = exp.parse::<i64>().unwrap_or(0) + 1;
+    let body = if k <= point && point <= 21 {
+        format!("{digits}{}", "0".repeat((point - k) as usize))
+    } else if 0 < point && point <= 21 {
+        let (int, frac) = digits.split_at(point as usize);
+        format!("{int}.{frac}")
+    } else if -6 < point && point <= 0 {
+        format!("0.{}{digits}", "0".repeat(-point as usize))
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let power = point - 1;
+        let sign = if power < 0 { '-' } else { '+' };
+        let rest = if rest.is_empty() {
+            String::new()
         } else {
-            n.to_string()
+            format!(".{rest}")
         };
-    }
-    let exp = format!("{n:e}");
-    match exp.split_once('e') {
-        Some((mantissa, power)) if !power.starts_with('-') => format!("{mantissa}e+{power}"),
-        _ => exp,
-    }
+        format!("{first}{rest}e{sign}{}", power.abs())
+    };
+    format!("{sign}{body}")
 }
 
 /// The name of an interface or type-literal member, `None` for a computed key.
@@ -4440,5 +4468,38 @@ mod tests {
             prop_names(&grid),
             ["9007199254740992", "1e+21", "1.5", "16"]
         );
+    }
+
+    #[test]
+    fn collections_of_never_or_undefined_emit_valid_schemas() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: Set<never>; b: Set<undefined>; c: Map<string, never>; d: ReadonlyMap<string, void>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"]["items"], json!({"not": {}}));
+        assert_eq!(p["b"]["items"], json!({}));
+        assert_eq!(p["c"]["additionalProperties"], json!({"not": {}}));
+        assert_eq!(p["d"]["additionalProperties"], json!({}));
+    }
+
+    #[test]
+    fn numeric_keys_follow_ecmascript_number_to_string() {
+        for (n, key) in [
+            (1e-7, "1e-7"),
+            (1e-6, "0.000001"),
+            (1000000000000000100.0, "1000000000000000100"),
+            (1e21, "1e+21"),
+            (123e-20, "1.23e-18"),
+            (-0.5, "-0.5"),
+            (100.0, "100"),
+        ] {
+            assert_eq!(js_number_key(n), key, "{n}");
+        }
     }
 }
