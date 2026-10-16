@@ -64,12 +64,14 @@ A class's properties are its fields and its constructor parameter properties
 schema, and neither is a property marked `@internal`/`@private` in
 [JSDoc](jsdoc.md), `@ApiHideProperty()`, or class-transformer's `@Exclude()`
 (unless `toClassOnly: true`, which only drops it from incoming payloads). A
+subclass hiding a property this way hides the inherited one too. A
 field without a type annotation takes the type of its initialiser
 (`count = 0` is a `number`, `at = new Date()` a date-time string); one nestoa
 cannot infer is `x-unresolved`.
 
 A property is left out of `required` when it is declared with `?`, when its
-type admits `undefined` (`string | undefined`), or when it carries
+type admits `undefined` (`string | undefined`, directly or through a type
+alias), or when it carries
 `@IsOptional()`, `@ApiPropertyOptional()` or `@ApiProperty({ required: false })`.
 
 `Partial`, `Pick`, `Omit` and the `@nestjs/*` helpers edit inherited
