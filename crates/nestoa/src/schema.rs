@@ -1977,6 +1977,10 @@ fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> (Vec<Value
     if rest.get("type") != Some(&json!("array")) {
         return (Vec::new(), json!({}));
     }
+    // `[]`, which `tuple_schema` writes with `maxItems: 0` rather than `items`.
+    if rest.get("maxItems") == Some(&json!(0)) {
+        return (Vec::new(), Value::Bool(false));
+    }
     let prefix = match rest.get("prefixItems") {
         Some(Value::Array(p)) => p.clone(),
         _ => Vec::new(),
@@ -3738,6 +3742,23 @@ mod tests {
             json!({"type": "array", "items": {"type": "number"}})
         );
         assert_eq!(p["e"], json!({"type": "array", "items": {}, "maxItems": 0}));
+    }
+
+    #[test]
+    fn spreading_an_empty_tuple_closes_the_tuple() {
+        let [holder] = lower_all(
+            "export type Nothing = [];",
+            "import { Nothing } from './dto';
+             export interface Holder { a: [string, ...[]]; b: [...[]]; c: [string, ...Nothing]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        let closed = json!({"type": "array", "prefixItems": [{"type": "string"}], "items": false});
+        assert_eq!(p["a"], closed);
+        assert_eq!(p["b"], json!({"type": "array", "items": {}, "maxItems": 0}));
+        assert_eq!(p["c"], closed);
     }
 
     #[test]
