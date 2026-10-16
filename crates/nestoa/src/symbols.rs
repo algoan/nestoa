@@ -934,6 +934,8 @@ fn enum_init_value(
                 BinaryOp::Mul => l * r,
                 BinaryOp::Div => l / r,
                 BinaryOp::Mod => l % r,
+                // JavaScript: `(±1) ** ±Infinity` is NaN, where `powf` gives 1.
+                BinaryOp::Exp if l.abs() == 1.0 && r.is_infinite() => f64::NAN,
                 BinaryOp::Exp => l.powf(r),
                 BinaryOp::BitOr => f64::from(to_int32(l) | to_int32(r)),
                 BinaryOp::BitAnd => f64::from(to_int32(l) & to_int32(r)),

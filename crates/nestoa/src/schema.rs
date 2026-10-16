@@ -1129,6 +1129,11 @@ impl<'a> SchemaCtx<'a> {
                 .types
                 .iter()
                 .any(|t| self.admits_undefined(file, t, depth)),
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsIntersectionType(i)) => {
+                i.types
+                    .iter()
+                    .all(|t| self.admits_undefined(file, t, depth))
+            }
             TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
                 // A bound type parameter, checked where its type was written
                 // (see `type_ref_schema`).
@@ -1521,6 +1526,12 @@ fn is_never(ty: &TsType) -> bool {
 /// (`0x10` -> `16`, `1e21` -> `1e+21`): ECMAScript's `Number::toString`, built
 /// on the shortest round-tripping digits, which Rust's `{:e}` also produces.
 fn js_number_key(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
     if n == 0.0 {
         return "0".to_string();
     }
@@ -4571,5 +4582,44 @@ mod tests {
         let holder = ctx.symbol_to_schema(&decl_file, &sym);
         assert_eq!(holder["properties"]["value"], json!({"type": "string"}));
         assert_eq!(required_names(&holder), ["id"]);
+    }
+
+    #[test]
+    fn an_intersection_admitting_undefined_is_optional() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { value: (string | undefined) & ('x' | undefined); id: string & {}; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["id"]);
+    }
+
+    #[test]
+    fn non_finite_numeric_keys_use_javascript_spelling() {
+        assert_eq!(js_number_key(f64::INFINITY), "Infinity");
+        assert_eq!(js_number_key(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(js_number_key(f64::NAN), "NaN");
+        let [grid] = lower_all(
+            "",
+            "export interface Grid { 0: string; 1e400: number; }",
+            &["Grid"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&grid), ["0", "Infinity"]);
+    }
+
+    #[test]
+    fn exponentiation_of_one_by_infinity_follows_javascript() {
+        let [e] = lower_all(
+            "",
+            "export enum E { A = (1 ** (1 / 0)) | 0, B = 2 ** 3 }",
+            &["E"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(e["enum"], json!([0, 8]));
     }
 }
