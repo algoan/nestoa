@@ -256,26 +256,40 @@ impl<'a> SchemaCtx<'a> {
                 let mut prefix = Vec::new();
                 let mut tail = Value::Bool(false);
                 for (i, e) in t.elem_types.iter().enumerate() {
-                    match &*e.ty {
-                        TsType::TsRestType(r) if i + 1 == t.elem_types.len() => {
-                            let rest = self.ts_type_to_schema(file, &r.type_ann);
-                            let (more, rest_tail) = spread_elements(&self.components.schemas, rest)
-                                .unwrap_or_else(|| {
-                                    (
-                                        Vec::new(),
-                                        self.unsupported(file, &r.type_ann, "rest element"),
-                                    )
-                                });
+                    // `...R`, or `...name: R` where swc puts the rest on the label.
+                    let rest = match (&*e.ty, &e.label) {
+                        (TsType::TsRestType(r), _) => Some(&*r.type_ann),
+                        (ty, Some(swc_ecma_ast::Pat::Rest(_))) => Some(ty),
+                        _ => None,
+                    };
+                    match rest {
+                        Some(operand) if i + 1 == t.elem_types.len() => {
+                            let lowered = self.ts_type_to_schema(file, operand);
+                            let (more, rest_tail) = spread_elements(
+                                &self.components.schemas,
+                                lowered,
+                            )
+                            .unwrap_or_else(|| {
+                                (Vec::new(), self.unsupported(file, operand, "rest element"))
+                            });
                             prefix.extend(more);
-                            tail = rest_tail;
+                            // `never`, `undefined` and `void` elements all lower
+                            // to JSON `null`; only `never` forbids the positions.
+                            tail = match rest_tail {
+                                Value::Null if self.is_never_array(file, operand, 0) => {
+                                    Value::Bool(false)
+                                }
+                                Value::Null => json!({}),
+                                tail => tail,
+                            };
                         }
-                        TsType::TsRestType(_) => {
+                        Some(_) => {
                             let mut schema = self.unsupported(file, ty, "tuple");
                             schema["type"] = json!("array");
                             schema["items"] = json!({});
                             return schema;
                         }
-                        elem => prefix.push(self.ts_type_to_schema(file, elem)),
+                        None => prefix.push(self.ts_type_to_schema(file, &e.ty)),
                     }
                 }
                 tuple_schema(prefix, tail)
@@ -1092,9 +1106,11 @@ impl<'a> SchemaCtx<'a> {
             attach_doc(&mut schema, doc);
         }
         let optional = member.optional
-            || member
-                .type_ann
-                .is_some_and(|t| self.admits_undefined(file, &t.type_ann, 0))
+            || match (member.type_ann, member.init) {
+                (Some(t), _) => self.admits_undefined(file, &t.type_ann, 0),
+                (None, Some(init)) => self.asserted_undefined(file, init),
+                (None, None) => false,
+            }
             || member.decorators.iter().any(marks_optional);
         Some((name, schema, optional))
     }
@@ -1131,16 +1147,13 @@ impl<'a> SchemaCtx<'a> {
                 // never `undefined`; only `Awaited` looks through one.
                 if let TsEntityName::Ident(id) = &r.type_name
                     && matches!(id.sym.as_ref(), "Awaited" | "Readonly")
-                    && let Some(mut first) = r.type_params.as_ref().and_then(|a| a.params.first())
+                    && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
                 {
-                    while id.sym == "Awaited"
-                        && let TsType::TsTypeRef(inner) = &**first
-                        && matches!(&inner.type_name, TsEntityName::Ident(p) if p.sym == "Promise")
-                        && let Some(arg) = inner.type_params.as_ref().and_then(|a| a.params.first())
-                    {
-                        first = arg;
-                    }
-                    return self.admits_undefined(file, first, depth + 1);
+                    return if id.sym == "Awaited" {
+                        self.awaited_admits_undefined(file, first, depth + 1)
+                    } else {
+                        self.admits_undefined(file, first, depth + 1)
+                    };
                 }
                 let resolved = match &r.type_name {
                     TsEntityName::Ident(id) => self.project.resolve(file, id.sym.as_ref()),
@@ -1153,6 +1166,86 @@ impl<'a> SchemaCtx<'a> {
                 match resolved {
                     Some((decl_file, Symbol::TypeAlias(alias))) => {
                         self.admits_undefined(&decl_file, &alias.type_ann, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `admits_undefined` for `Awaited<T>`: a `Promise` in `T`, written
+    /// directly, in a union or through an alias, is unwrapped first.
+    fn awaited_admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        if depth >= MAX_ALIAS_DEPTH {
+            return false;
+        }
+        match ty {
+            TsType::TsParenthesizedType(p) => {
+                self.awaited_admits_undefined(file, &p.type_ann, depth)
+            }
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => u
+                .types
+                .iter()
+                .any(|t| self.awaited_admits_undefined(file, t, depth)),
+            TsType::TsTypeRef(r) => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return self.admits_undefined(file, ty, depth);
+                };
+                if id.sym == "Promise" {
+                    return r
+                        .type_params
+                        .as_ref()
+                        .and_then(|a| a.params.first())
+                        .is_some_and(|arg| self.awaited_admits_undefined(file, arg, depth + 1));
+                }
+                match self.project.resolve(file, id.sym.as_ref()) {
+                    Some((decl_file, Symbol::TypeAlias(alias))) if r.type_params.is_none() => {
+                        self.awaited_admits_undefined(&decl_file, &alias.type_ann, depth + 1)
+                    }
+                    _ => self.admits_undefined(file, ty, depth),
+                }
+            }
+            _ => self.admits_undefined(file, ty, depth),
+        }
+    }
+
+    /// Whether an unannotated field's initialiser asserts a type admitting
+    /// `undefined` (`x = undefined as string | undefined`).
+    fn asserted_undefined(&self, file: &Path, init: &Expr) -> bool {
+        match init {
+            Expr::TsAs(a) => self.admits_undefined(file, &a.type_ann, 0),
+            Expr::Paren(p) => self.asserted_undefined(file, &p.expr),
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` is an array of `never` (`never[]`, `Array<never>`),
+    /// directly or through an alias.
+    fn is_never_array(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        let is_never = |t: &TsType| matches!(t, TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNeverKeyword);
+        match ty {
+            TsType::TsArrayType(a) => is_never(&a.elem_type),
+            TsType::TsParenthesizedType(p) => self.is_never_array(file, &p.type_ann, depth),
+            TsType::TsTypeOperator(op) if op.op == TsTypeOperatorOp::ReadOnly => {
+                self.is_never_array(file, &op.type_ann, depth)
+            }
+            TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return false;
+                };
+                if matches!(id.sym.as_ref(), "Array" | "ReadonlyArray") {
+                    return r
+                        .type_params
+                        .as_ref()
+                        .and_then(|a| a.params.first())
+                        .is_some_and(|t| is_never(t));
+                }
+                match self.project.resolve(file, id.sym.as_ref()) {
+                    Some((decl_file, Symbol::TypeAlias(alias))) => {
+                        self.is_never_array(&decl_file, &alias.type_ann, depth + 1)
                     }
                     _ => false,
                 }
@@ -1399,12 +1492,33 @@ impl<'a> SchemaCtx<'a> {
     }
 }
 
+/// A numeric property key as JavaScript spells it once it becomes a string
+/// (`0x10` -> `16`, `1e21` -> `1e+21`).
+fn js_number_key(n: f64) -> String {
+    let abs = n.abs();
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    if (1e-7..1e21).contains(&abs) {
+        return if n.fract() == 0.0 {
+            format!("{n:.0}")
+        } else {
+            n.to_string()
+        };
+    }
+    let exp = format!("{n:e}");
+    match exp.split_once('e') {
+        Some((mantissa, power)) if !power.starts_with('-') => format!("{mantissa}e+{power}"),
+        _ => exp,
+    }
+}
+
 /// The name of an interface or type-literal member, `None` for a computed key.
 fn property_key(key: &Expr) -> Option<String> {
     match key {
         Expr::Ident(i) => Some(i.sym.to_string()),
         Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-        Expr::Lit(Lit::Num(n)) => Some(number_json(n.value).to_string()),
+        Expr::Lit(Lit::Num(n)) => Some(js_number_key(n.value)),
         _ => None,
     }
 }
@@ -1414,7 +1528,7 @@ fn prop_name_key(key: &swc_ecma_ast::PropName) -> Option<String> {
     match key {
         swc_ecma_ast::PropName::Ident(i) => Some(i.sym.to_string()),
         swc_ecma_ast::PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
-        swc_ecma_ast::PropName::Num(n) => Some(number_json(n.value).to_string()),
+        swc_ecma_ast::PropName::Num(n) => Some(js_number_key(n.value)),
         _ => None,
     }
 }
@@ -2094,13 +2208,7 @@ fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> Option<(Ve
         Some(Value::Array(p)) => p.clone(),
         _ => Vec::new(),
     };
-    let tail = match rest.get("items") {
-        None => json!({}),
-        // `never[]`, whose elements `keyword_schema` lowers to JSON `null`:
-        // no position past the prefix is allowed.
-        Some(Value::Null) => Value::Bool(false),
-        Some(items) => items.clone(),
-    };
+    let tail = rest.get("items").cloned().unwrap_or_else(|| json!({}));
     Some((prefix, tail))
 }
 
@@ -4251,6 +4359,86 @@ mod tests {
         assert_eq!(
             down,
             json!({"type": "array", "items": {"type": "string"}, "maxItems": 1})
+        );
+    }
+
+    #[test]
+    fn an_undefined_rest_keeps_the_tuple_open() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder { a: [string, ...undefined[]]; b: [string, ...void[]]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        for f in ["a", "b"] {
+            assert_eq!(holder["properties"][f]["items"], json!({}), "{f}: {holder}");
+        }
+    }
+
+    #[test]
+    fn labelled_rest_elements_are_rests() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: [head: string, ...tail: number[]];\n\
+               b: [...init: string[], last: number];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"type": "array", "prefixItems": [{"type": "string"}], "items": {"type": "number"}})
+        );
+        assert_eq!(p["b"]["items"], json!({}));
+        assert!(p["b"].get("x-unresolved").is_some(), "got {}", p["b"]);
+    }
+
+    #[test]
+    fn an_asserted_initialiser_admitting_undefined_is_optional() {
+        let [book] = lower_all(
+            "",
+            "export class Book {\n\
+               title = undefined as string | undefined;\n\
+               subtitle = (undefined as string | undefined);\n\
+               isbn = '';\n\
+               constructor(public note = undefined as string | undefined) {}\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&book), ["isbn"]);
+    }
+
+    #[test]
+    fn awaited_follows_promise_aliases() {
+        let [holder] = lower_all(
+            "export type Pending = Promise<string | undefined>;",
+            "import { Pending } from './dto';\n\
+             export interface Holder { value: Awaited<Pending>; plain: Pending; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&holder), ["plain"]);
+    }
+
+    #[test]
+    fn numeric_keys_use_javascript_spelling() {
+        let [grid] = lower_all(
+            "",
+            "export interface Grid { 9007199254740992: string; 1e21: string; 1.5: string; 0x10: string; }",
+            &["Grid"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            prop_names(&grid),
+            ["9007199254740992", "1e+21", "1.5", "16"]
         );
     }
 }
