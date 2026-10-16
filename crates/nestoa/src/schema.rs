@@ -1005,6 +1005,7 @@ impl<'a> SchemaCtx<'a> {
         &mut self,
         file: &Path,
         p: &swc_ecma_ast::ClassProp,
+        hidden: &mut Vec<String>,
     ) -> Vec<(String, Value, bool)> {
         if p.is_static {
             return Vec::new();
@@ -1019,7 +1020,9 @@ impl<'a> SchemaCtx<'a> {
             init: p.value.as_deref(),
             optional: p.is_optional,
         };
-        self.class_member(file, name, member).into_iter().collect()
+        self.class_member(file, name, member, hidden)
+            .into_iter()
+            .collect()
     }
 
     /// A constructor parameter property (`constructor(public name: string)`),
@@ -1028,6 +1031,7 @@ impl<'a> SchemaCtx<'a> {
         &mut self,
         file: &Path,
         pp: &swc_ecma_ast::TsParamProp,
+        hidden: &mut Vec<String>,
     ) -> Option<(String, Value, bool)> {
         let (binding, init) = match &pp.param {
             swc_ecma_ast::TsParamPropParam::Ident(b) => (b, None),
@@ -1043,22 +1047,25 @@ impl<'a> SchemaCtx<'a> {
             init,
             optional: binding.id.optional,
         };
-        self.class_member(file, binding.id.sym.to_string(), member)
+        self.class_member(file, binding.id.sym.to_string(), member, hidden)
     }
 
     /// Lower a class member as `(name, schema, optional)`, or nothing when
     /// its JSDoc or decorators keep it off the wire. That is decided before
     /// its type is lowered, so a hidden member's types never become components.
+    /// A hidden member's name is pushed to `hidden`.
     fn class_member(
         &mut self,
         file: &Path,
         name: String,
         member: ClassMember,
+        hidden: &mut Vec<String>,
     ) -> Option<(String, Value, bool)> {
         let doc = self.jsdoc(file, member.span);
         // `@internal`/`@private` members never reach the wire.
         if doc.as_ref().is_some_and(|d| d.internal) || member.decorators.iter().any(hides_property)
         {
+            hidden.push(name);
             return None;
         }
         let mut schema = match (member.type_ann, member.init) {
@@ -1260,15 +1267,18 @@ impl<'a> SchemaCtx<'a> {
                         .unwrap_or_else(|| json!({ "x-unresolved": heritage_label(super_expr) }));
                     all_of.push(parent);
                 }
+                let mut hidden: Vec<String> = Vec::new();
                 for member in &c.body {
                     let lowered = match member {
-                        swc_ecma_ast::ClassMember::ClassProp(p) => self.class_prop(file, p),
+                        swc_ecma_ast::ClassMember::ClassProp(p) => {
+                            self.class_prop(file, p, &mut hidden)
+                        }
                         swc_ecma_ast::ClassMember::Constructor(ctor) => ctor
                             .params
                             .iter()
                             .filter_map(|param| match param {
                                 swc_ecma_ast::ParamOrTsParamProp::TsParamProp(pp) => {
-                                    self.param_prop(file, pp)
+                                    self.param_prop(file, pp, &mut hidden)
                                 }
                                 swc_ecma_ast::ParamOrTsParamProp::Param(_) => None,
                             })
@@ -1281,6 +1291,14 @@ impl<'a> SchemaCtx<'a> {
                             required.push(name);
                         }
                     }
+                }
+                // A hidden override hides the inherited property too. The parent
+                // is inlined only when it declares one, so the shared component
+                // stays untouched and other subclasses keep their `$ref`.
+                if let Some(parent) = all_of.first_mut()
+                    && inherits_any(&self.components.schemas, parent, &hidden)
+                {
+                    *parent = self.reshape_object(parent.take(), &ObjectEdit::Omit(hidden));
                 }
                 let mut obj = Map::new();
                 obj.insert("type".into(), Value::String("object".into()));
@@ -1631,6 +1649,16 @@ impl ObjectEdit {
             Self::Pick(_) => "Pick",
         }
     }
+}
+
+/// Whether the object `schema` flattens to declares any of `names`.
+fn inherits_any(schemas: &IndexMap<String, Value>, schema: &Value, names: &[String]) -> bool {
+    flatten_object(schemas, schema, 0)
+        .and_then(|obj| {
+            let props = obj.get("properties")?.as_object()?;
+            Some(names.iter().any(|n| props.contains_key(n)))
+        })
+        .unwrap_or(false)
 }
 
 /// Apply a property-set edit to `schema`, inlined into one object first so
@@ -3807,6 +3835,26 @@ mod tests {
         assert_eq!(
             holder["properties"]["r"],
             json!({"anyOf": [{"type": "string"}, {"type": "number"}]})
+        );
+    }
+
+    #[test]
+    fn a_hidden_override_hides_the_inherited_property() {
+        let [user, base, plain] = lower_all(
+            "",
+            "export class Base { password = ''; name: string; }\n\
+             export class User extends Base { @Exclude() password = ''; }\n\
+             export class Plain extends Base { extra: string; }",
+            &["User", "Base", "Plain"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(prop_names(&user["allOf"][0]), ["name"], "got {user}");
+        assert_eq!(required_names(&user["allOf"][0]), ["name"]);
+        assert_eq!(prop_names(&base), ["password", "name"]);
+        assert_eq!(
+            plain["allOf"][0],
+            json!({"$ref": "#/components/schemas/Base"})
         );
     }
 
