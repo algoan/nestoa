@@ -1143,6 +1143,12 @@ impl<'a> SchemaCtx<'a> {
                         self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1)
                     });
                 }
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && self.passthrough_types.iter().any(|t| id.sym == *t)
+                    && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
+                {
+                    return self.admits_undefined(file, first, depth + 1);
+                }
                 // Transparent wrappers. A bare `Promise` property is a promise,
                 // never `undefined`; only `Awaited` looks through one.
                 if let TsEntityName::Ident(id) = &r.type_name
@@ -2227,8 +2233,10 @@ fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> Option<(Ve
             None => break,
         }
     }
-    if rest.get("x-unresolved").is_some() {
-        return Some((Vec::new(), rest));
+    // Only the marker: a spread unresolved tuple's own `type: array` would
+    // otherwise require every remaining element to be an array.
+    if let Some(marker) = rest.get("x-unresolved") {
+        return Some((Vec::new(), json!({ "x-unresolved": marker })));
     }
     if rest.get("type") != Some(&json!("array")) {
         return None;
@@ -4525,5 +4533,43 @@ mod tests {
         assert_eq!(p["b"]["additionalProperties"], json!({"not": {}}));
         assert_eq!(p["c"]["items"], json!(false));
         assert_eq!(p["d"]["items"], json!(false));
+    }
+
+    #[test]
+    fn spreading_an_unresolved_tuple_keeps_only_its_marker() {
+        let [holder] = lower_all(
+            "export type Tail = [...string[], number];",
+            "import { Tail } from './dto';\n\
+             export interface Holder { row: [boolean, ...Tail]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["row"]["items"],
+            json!({"x-unresolved": "[...string[], number]"})
+        );
+    }
+
+    #[test]
+    fn a_passthrough_wrapper_keeps_optionality() {
+        let (project, dir) = project_from(&[(
+            "dto.ts",
+            "export interface Holder { value: Lazy<string | undefined>; id: string; }",
+        )]);
+        let mut components = ComponentSchemas::default();
+        let passthrough = ["Lazy".to_string()];
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: None,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &passthrough,
+        };
+        let (decl_file, sym) = project.resolve(&dir.join("dto.ts"), "Holder").unwrap();
+        let holder = ctx.symbol_to_schema(&decl_file, &sym);
+        assert_eq!(holder["properties"]["value"], json!({"type": "string"}));
+        assert_eq!(required_names(&holder), ["id"]);
     }
 }
