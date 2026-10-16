@@ -300,7 +300,9 @@ fn downgrade_tuple(map: &mut Map<String, Value>) {
             }
         }
         match distinct.len() {
-            0 => {}
+            0 => {
+                map.insert("items".into(), json!({}));
+            }
             1 => {
                 map.insert("items".into(), distinct.into_iter().next().unwrap());
             }
@@ -309,6 +311,9 @@ fn downgrade_tuple(map: &mut Map<String, Value>) {
                 map.insert("items".into(), json!({ "anyOf": distinct }));
             }
         }
+    } else {
+        // 3.0.3 requires `items` on an array.
+        map.insert("items".into(), json!({}));
     }
 
     if !closed {
@@ -526,7 +531,7 @@ mod tests {
     fn empty_tuple_becomes_a_zero_length_array() {
         assert_eq!(
             down(json!({"type": "array", "prefixItems": [], "items": false})),
-            json!({"type": "array", "maxItems": 0})
+            json!({"type": "array", "items": {}, "maxItems": 0})
         );
     }
 
@@ -654,7 +659,7 @@ mod tests {
             if !tail.is_null() {
                 doc["items"] = tail;
             }
-            assert_eq!(down(doc), json!({"type": "array"}));
+            assert_eq!(down(doc), json!({"type": "array", "items": {}}));
         }
     }
 
@@ -743,7 +748,7 @@ mod tests {
                 "prefixItems": [{"type": "string"}, true],
                 "items": false
             })),
-            json!({"type": "array", "maxItems": 2})
+            json!({"type": "array", "items": {}, "maxItems": 2})
         );
     }
 
