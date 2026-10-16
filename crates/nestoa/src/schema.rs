@@ -253,7 +253,13 @@ impl<'a> SchemaCtx<'a> {
                     match &*e.ty {
                         TsType::TsRestType(r) if i + 1 == t.elem_types.len() => {
                             let rest = self.ts_type_to_schema(file, &r.type_ann);
-                            let (more, rest_tail) = spread_elements(&self.components.schemas, rest);
+                            let (more, rest_tail) = spread_elements(&self.components.schemas, rest)
+                                .unwrap_or_else(|| {
+                                    (
+                                        Vec::new(),
+                                        self.unsupported(file, &r.type_ann, "rest element"),
+                                    )
+                                });
                             prefix.extend(more);
                             tail = rest_tail;
                         }
@@ -1099,10 +1105,15 @@ impl<'a> SchemaCtx<'a> {
                 .iter()
                 .any(|t| self.admits_undefined(file, t, depth)),
             TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
-                let TsEntityName::Ident(id) = &r.type_name else {
-                    return false;
+                let resolved = match &r.type_name {
+                    TsEntityName::Ident(id) => self.project.resolve(file, id.sym.as_ref()),
+                    TsEntityName::TsQualifiedName(q) => self.project.resolve_namespace_member(
+                        file,
+                        &entity_name(&q.left),
+                        q.right.sym.as_ref(),
+                    ),
                 };
-                match self.project.resolve(file, id.sym.as_ref()) {
+                match resolved {
                     Some((decl_file, Symbol::TypeAlias(alias))) => {
                         self.admits_undefined(&decl_file, &alias.type_ann, depth + 1)
                     }
@@ -1268,6 +1279,7 @@ impl<'a> SchemaCtx<'a> {
                     all_of.push(parent);
                 }
                 let mut hidden: Vec<String> = Vec::new();
+                let mut optional_names: Vec<String> = Vec::new();
                 for member in &c.body {
                     let lowered = match member {
                         swc_ecma_ast::ClassMember::ClassProp(p) => {
@@ -1287,18 +1299,40 @@ impl<'a> SchemaCtx<'a> {
                     };
                     for (name, schema, optional) in lowered {
                         props.insert(name.clone(), schema);
-                        if !optional {
+                        if optional {
+                            optional_names.push(name);
+                        } else {
                             required.push(name);
                         }
                     }
                 }
-                // A hidden override hides the inherited property too. The parent
-                // is inlined only when it declares one, so the shared component
-                // stays untouched and other subclasses keep their `$ref`.
+                // A hidden or optional override hides or relaxes the inherited
+                // property too. The parent is inlined only when it declares such
+                // a property, so the shared component stays untouched and other
+                // subclasses keep their `$ref`.
                 if let Some(parent) = all_of.first_mut()
-                    && inherits_any(&self.components.schemas, parent, &hidden)
+                    && let Some(inherited) = inherited_object(&self.components.schemas, parent)
                 {
-                    *parent = self.reshape_object(parent.take(), &ObjectEdit::Omit(hidden));
+                    let declares = |k: &String| {
+                        inherited
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|p| p.contains_key(k))
+                    };
+                    let requires = |k: &String| {
+                        inherited
+                            .get("required")
+                            .and_then(Value::as_array)
+                            .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(k)))
+                    };
+                    let hide: Vec<String> = hidden.into_iter().filter(declares).collect();
+                    let relax: Vec<String> = optional_names.into_iter().filter(requires).collect();
+                    if !hide.is_empty() {
+                        *parent = self.reshape_object(parent.take(), &ObjectEdit::Omit(hide));
+                    }
+                    if !relax.is_empty() {
+                        *parent = self.reshape_object(parent.take(), &ObjectEdit::Relax(relax));
+                    }
                 }
                 let mut obj = Map::new();
                 obj.insert("type".into(), Value::String("object".into()));
@@ -1637,6 +1671,8 @@ enum ObjectEdit {
     AllRequired,
     Omit(Vec<String>),
     Pick(Vec<String>),
+    /// Make these properties optional.
+    Relax(Vec<String>),
 }
 
 impl ObjectEdit {
@@ -1647,27 +1683,24 @@ impl ObjectEdit {
             Self::AllRequired => "Required",
             Self::Omit(_) => "Omit",
             Self::Pick(_) => "Pick",
+            Self::Relax(_) => "Optional",
         }
     }
 }
 
-/// Whether the object `schema` flattens to declares any of `names`, looking
-/// past an unresolved ancestor at the branches beside it.
-fn inherits_any(schemas: &IndexMap<String, Value>, schema: &Value, names: &[String]) -> bool {
-    let declares = |obj: Map<String, Value>| {
-        obj.get("properties")
-            .and_then(Value::as_object)
-            .is_some_and(|props| names.iter().any(|n| props.contains_key(n)))
-    };
+/// The object `schema` flattens to, or, past an unresolved ancestor, the one
+/// the branches beside it flatten to.
+fn inherited_object(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+) -> Option<Map<String, Value>> {
     if let Some(obj) = flatten_object(schemas, schema, 0) {
-        return declares(obj);
+        return Some(obj);
     }
     let mut unresolved = Vec::new();
     let mut resolvable = Vec::new();
-    if split_unresolved(schemas, schema, &mut unresolved, &mut resolvable, 0).is_none() {
-        return false;
-    }
-    flatten_object(schemas, &json!({ "allOf": resolvable }), 0).is_some_and(declares)
+    split_unresolved(schemas, schema, &mut unresolved, &mut resolvable, 0)?;
+    flatten_object(schemas, &json!({ "allOf": resolvable }), 0)
 }
 
 /// Apply a property-set edit to `schema`, inlined into one object first so
@@ -1742,6 +1775,7 @@ fn apply_edit(mut obj: Map<String, Value>, edit: &ObjectEdit) -> Value {
     };
     match edit {
         ObjectEdit::AllOptional => required.clear(),
+        ObjectEdit::Relax(keys) => required.retain(|k| !keys.contains(k)),
         ObjectEdit::AllRequired => required = keys,
         ObjectEdit::Omit(drop) | ObjectEdit::Pick(drop) => {
             let keep = |k: &str| drop.iter().any(|d| d == k) == matches!(edit, ObjectEdit::Pick(_));
@@ -1993,8 +2027,9 @@ fn tuple_schema(prefix: Vec<Value>, tail: Value) -> Value {
 
 /// What a tuple's rest element `...R` adds: the fixed positions of a spread
 /// tuple, and the schema of the positions after them. An `x-unresolved` rest
-/// is kept as that schema so the gap stays visible.
-fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> (Vec<Value>, Value) {
+/// is kept as that schema so the gap stays visible; `None` for a rest that is
+/// not an array, such as a union of them.
+fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> Option<(Vec<Value>, Value)> {
     const MAX_DEPTH: usize = 16;
     let mut rest = rest;
     for _ in 0..MAX_DEPTH {
@@ -2009,21 +2044,21 @@ fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> (Vec<Value
         }
     }
     if rest.get("x-unresolved").is_some() {
-        return (Vec::new(), rest);
+        return Some((Vec::new(), rest));
     }
     if rest.get("type") != Some(&json!("array")) {
-        return (Vec::new(), json!({}));
+        return None;
     }
     // `[]`, which `tuple_schema` writes with `maxItems: 0` rather than `items`.
     if rest.get("maxItems") == Some(&json!(0)) {
-        return (Vec::new(), Value::Bool(false));
+        return Some((Vec::new(), Value::Bool(false)));
     }
     let prefix = match rest.get("prefixItems") {
         Some(Value::Array(p)) => p.clone(),
         _ => Vec::new(),
     };
     let tail = rest.get("items").cloned().unwrap_or_else(|| json!({}));
-    (prefix, tail)
+    Some((prefix, tail))
 }
 
 /// `NonNullable<T>`: `schema` without its `null` member. A `$ref` to a
@@ -2068,6 +2103,13 @@ fn strip_null_at(schemas: &IndexMap<String, Value>, schema: Value, depth: usize)
     }
     if let Some(Value::Array(values)) = m.get_mut("enum") {
         values.retain(|v| !v.is_null());
+    }
+    // Every conjunct must admit the value, so each loses its null; a null-only
+    // one becomes unsatisfiable rather than being dropped.
+    if let Some(Value::Array(conjuncts)) = m.get_mut("allOf") {
+        for conjunct in conjuncts.iter_mut() {
+            *conjunct = strip_null_at(schemas, conjunct.take(), depth + 1);
+        }
     }
     let only_key = m.len() == 1;
     for key in ["anyOf", "oneOf"] {
@@ -3900,5 +3942,73 @@ mod tests {
         );
         assert_eq!(prop_names(&parent["allOf"][1]), ["name"]);
         assert_eq!(prop_names(&base["allOf"][1]), ["password", "name"]);
+    }
+
+    #[test]
+    fn a_namespace_qualified_alias_admitting_undefined_is_optional() {
+        let [book] = lower_with(
+            &[("types.ts", "export type Maybe = string | undefined;")],
+            "import * as Types from './types';\n\
+             export interface Book { title: Types.Maybe; isbn: string; }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&book), ["isbn"]);
+    }
+
+    #[test]
+    fn an_optional_override_relaxes_the_inherited_property() {
+        let [book, base] = lower_all(
+            "",
+            "export class Base { name: string; isbn: string; }\n\
+             export class Book extends Base { @ApiPropertyOptional() name: string; }",
+            &["Book", "Base"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            prop_names(&book["allOf"][0]),
+            ["name", "isbn"],
+            "got {book}"
+        );
+        assert_eq!(required_names(&book["allOf"][0]), ["isbn"]);
+        assert_eq!(required_names(&base), ["name", "isbn"]);
+    }
+
+    #[test]
+    fn a_rest_operand_that_is_not_an_array_stays_unresolved() {
+        let [holder] = lower_all(
+            "export type Tail = number[] | string[];",
+            "import { Tail } from './dto';\n\
+             export interface Holder { row: [boolean, ...Tail]; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["row"]["items"],
+            json!({"x-unresolved": "Tail"})
+        );
+    }
+
+    #[test]
+    fn non_nullable_strips_null_inside_intersections() {
+        let [holder] = lower_all(
+            "",
+            "export interface Holder {\n\
+               a: NonNullable<(string | null) & ('x' | null)>;\n\
+               b: NonNullable<string & null>;\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(
+            p["a"],
+            json!({"allOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]})
+        );
+        assert_eq!(p["b"], json!({"allOf": [{"type": "string"}, {"not": {}}]}));
     }
 }
