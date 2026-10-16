@@ -349,14 +349,26 @@ fn downgrade_exclusive_bound(map: &mut Map<String, Value>, exclusive: &str, boun
     }
 }
 
-/// Order two JSON numbers, exactly when both are integers (an `f64` cannot
-/// tell `2^54` from `2^54 + 2` apart).
+/// Order two JSON numbers, exactly whenever both are whole (an `f64` cannot
+/// tell `2^54` from `2^54 + 2` apart, whichever way each is spelled).
 fn compare_numbers(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    match (a.as_i64(), b.as_i64(), a.as_u64(), b.as_u64()) {
-        (Some(x), Some(y), _, _) => Some(x.cmp(&y)),
-        (_, _, Some(x), Some(y)) => Some(x.cmp(&y)),
+    match (whole_number(a), whole_number(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
         _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
+}
+
+/// A JSON number as an exact integer, when it is a whole one.
+fn whole_number(v: &Value) -> Option<i128> {
+    if let Some(n) = v.as_i64() {
+        return Some(n.into());
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.into());
+    }
+    let f = v.as_f64()?;
+    // Every whole `f64` below 2^127 converts to `i128` exactly.
+    (f.fract() == 0.0 && f.abs() < 1.7e38).then_some(f as i128)
 }
 
 /// A schema's `examples: [a, …]` (2020-12) -> `example: a`. 3.0.3 schemas only
@@ -815,6 +827,19 @@ mod tests {
                 "exclusiveMaximum": 18014398509481986_i64
             })),
             json!({"type": "integer", "maximum": 18014398509481984_i64})
+        );
+    }
+
+    #[test]
+    fn compares_mixed_integer_and_float_bounds_exactly() {
+        let doc = json!({
+            "type": "integer",
+            "minimum": 18014398509481986_i64,
+            "exclusiveMinimum": 18014398509481984.0
+        });
+        assert_eq!(
+            down(doc),
+            json!({"type": "integer", "minimum": 18014398509481986_i64})
         );
     }
 }
