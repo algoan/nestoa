@@ -336,12 +336,9 @@ fn downgrade_exclusive_bound(map: &mut Map<String, Value>, exclusive: &str, boun
     let Some(limit) = map.get(exclusive).filter(|v| v.is_number()).cloned() else {
         return;
     };
-    let (Some(n), existing) = (limit.as_f64(), map.get(bound).and_then(Value::as_f64)) else {
-        return;
-    };
-    let tighter = match existing {
-        Some(b) if exclusive == "exclusiveMinimum" => b > n,
-        Some(b) => b < n,
+    let tighter = match map.get(bound).and_then(|b| compare_numbers(b, &limit)) {
+        Some(order) if exclusive == "exclusiveMinimum" => order.is_gt(),
+        Some(order) => order.is_lt(),
         None => false,
     };
     if tighter {
@@ -349,6 +346,16 @@ fn downgrade_exclusive_bound(map: &mut Map<String, Value>, exclusive: &str, boun
     } else {
         map.insert(bound.into(), limit);
         map.insert(exclusive.into(), Value::Bool(true));
+    }
+}
+
+/// Order two JSON numbers, exactly when both are integers (an `f64` cannot
+/// tell `2^54` from `2^54 + 2` apart).
+fn compare_numbers(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a.as_i64(), b.as_i64(), a.as_u64(), b.as_u64()) {
+        (Some(x), Some(y), _, _) => Some(x.cmp(&y)),
+        (_, _, Some(x), Some(y)) => Some(x.cmp(&y)),
+        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
 }
 
@@ -789,5 +796,25 @@ mod tests {
             "components": {"schemas": {"A": {"type": "string", "nullable": true}}}
         });
         assert_eq!(down(doc.clone()), doc);
+    }
+
+    #[test]
+    fn compares_large_integer_bounds_exactly() {
+        assert_eq!(
+            down(json!({
+                "type": "integer",
+                "minimum": 18014398509481986_i64,
+                "exclusiveMinimum": 18014398509481984_i64
+            })),
+            json!({"type": "integer", "minimum": 18014398509481986_i64})
+        );
+        assert_eq!(
+            down(json!({
+                "type": "integer",
+                "maximum": 18014398509481984_i64,
+                "exclusiveMaximum": 18014398509481986_i64
+            })),
+            json!({"type": "integer", "maximum": 18014398509481984_i64})
+        );
     }
 }
