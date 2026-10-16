@@ -247,36 +247,25 @@ impl<'a> SchemaCtx<'a> {
                 "items": self.ts_type_to_schema(file, elem_type),
             }),
             TsType::TsTupleType(t) => {
-                let (rest, fixed) = match t.elem_types.split_last() {
-                    Some((last, fixed)) if matches!(*last.ty, TsType::TsRestType(_)) => {
-                        (Some(last), fixed)
-                    }
-                    _ => (None, t.elem_types.as_slice()),
-                };
-                if fixed.iter().any(|e| matches!(*e.ty, TsType::TsRestType(_))) {
-                    let mut schema = self.unsupported(file, ty, "tuple");
-                    schema["type"] = json!("array");
-                    return schema;
-                }
-                let items: Vec<Value> = fixed
-                    .iter()
-                    .map(|e| self.ts_type_to_schema(file, &e.ty))
-                    .collect();
-                // `[A, ...B[]]` stays open: the rest element types every
-                // position past the fixed ones.
-                let tail = match rest.map(|r| &*r.ty) {
-                    Some(TsType::TsRestType(r)) => {
-                        let rest = self.ts_type_to_schema(file, &r.type_ann);
-                        match rest.get("items") {
-                            Some(items) if rest.get("type") == Some(&json!("array")) => {
-                                items.clone()
-                            }
-                            _ => json!({}),
+                let mut prefix = Vec::new();
+                let mut tail = Value::Bool(false);
+                for (i, e) in t.elem_types.iter().enumerate() {
+                    match &*e.ty {
+                        TsType::TsRestType(r) if i + 1 == t.elem_types.len() => {
+                            let rest = self.ts_type_to_schema(file, &r.type_ann);
+                            let (more, rest_tail) = spread_elements(&self.components.schemas, rest);
+                            prefix.extend(more);
+                            tail = rest_tail;
                         }
+                        TsType::TsRestType(_) => {
+                            let mut schema = self.unsupported(file, ty, "tuple");
+                            schema["type"] = json!("array");
+                            return schema;
+                        }
+                        elem => prefix.push(self.ts_type_to_schema(file, elem)),
                     }
-                    _ => Value::Bool(false),
-                };
-                json!({ "type": "array", "prefixItems": items, "items": tail })
+                }
+                tuple_schema(prefix, tail)
             }
             // `[a, b?]`: positions are never required, so `b?` is just `b`.
             TsType::TsOptionalType(o) => self.ts_type_to_schema(file, &o.type_ann),
@@ -852,7 +841,7 @@ impl<'a> SchemaCtx<'a> {
                     && !p
                         .type_ann
                         .as_ref()
-                        .is_some_and(|t| admits_undefined(&t.type_ann))
+                        .is_some_and(|t| self.admits_undefined(file, &t.type_ann, 0))
                 {
                     required.push(name);
                 }
@@ -958,9 +947,13 @@ impl<'a> SchemaCtx<'a> {
                 _ => None,
             },
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
-                let mut keys = Vec::new();
+                let mut keys: Vec<String> = Vec::new();
                 for t in &u.types {
-                    keys.extend(self.string_union_keys(file, t, depth)?);
+                    for key in self.string_union_keys(file, t, depth)? {
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
                 }
                 Some(keys)
             }
@@ -1079,9 +1072,38 @@ impl<'a> SchemaCtx<'a> {
         let optional = member.optional
             || member
                 .type_ann
-                .is_some_and(|t| admits_undefined(&t.type_ann))
+                .is_some_and(|t| self.admits_undefined(file, &t.type_ann, 0))
             || member.decorators.iter().any(marks_optional);
         Some((name, schema, optional))
+    }
+
+    /// Whether a property's declared type admits `undefined`, directly or
+    /// through type aliases, which makes it optional on the wire like a `?`.
+    fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        const MAX_ALIAS_DEPTH: usize = 8;
+        match ty {
+            TsType::TsKeywordType(k) => matches!(
+                k.kind,
+                TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsVoidKeyword
+            ),
+            TsType::TsParenthesizedType(p) => self.admits_undefined(file, &p.type_ann, depth),
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => u
+                .types
+                .iter()
+                .any(|t| self.admits_undefined(file, t, depth)),
+            TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
+                let TsEntityName::Ident(id) = &r.type_name else {
+                    return false;
+                };
+                match self.project.resolve(file, id.sym.as_ref()) {
+                    Some((decl_file, Symbol::TypeAlias(alias))) => {
+                        self.admits_undefined(&decl_file, &alias.type_ann, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// The type TypeScript infers for an unannotated field from its
@@ -1150,7 +1172,7 @@ impl<'a> SchemaCtx<'a> {
                         let optional = p.optional
                             || p.type_ann
                                 .as_ref()
-                                .is_some_and(|t| admits_undefined(&t.type_ann));
+                                .is_some_and(|t| self.admits_undefined(file, &t.type_ann, 0));
                         props.insert(name.clone(), schema);
                         if !optional && !required.contains(&name) {
                             required.push(name);
@@ -1305,22 +1327,6 @@ fn prop_name_key(key: &swc_ecma_ast::PropName) -> Option<String> {
         swc_ecma_ast::PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
         swc_ecma_ast::PropName::Num(n) => Some(number_json(n.value).to_string()),
         _ => None,
-    }
-}
-
-/// Whether a property's declared type admits `undefined`, which makes it
-/// optional on the wire like a `?` does.
-fn admits_undefined(ty: &TsType) -> bool {
-    match ty {
-        TsType::TsKeywordType(k) => matches!(
-            k.kind,
-            TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsVoidKeyword
-        ),
-        TsType::TsParenthesizedType(p) => admits_undefined(&p.type_ann),
-        TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
-            u.types.iter().any(|t| admits_undefined(t))
-        }
-        _ => false,
     }
 }
 
@@ -1937,6 +1943,48 @@ fn callee_name(e: &Expr) -> String {
     }
 }
 
+/// A tuple from its fixed positions and the schema of every later one
+/// (`false` for a closed tuple). `prefixItems` must not be empty, so a tuple
+/// without fixed positions is a plain array, and `[]` admits no element.
+fn tuple_schema(prefix: Vec<Value>, tail: Value) -> Value {
+    match (prefix.is_empty(), tail) {
+        (true, Value::Bool(false)) => json!({ "type": "array", "items": {}, "maxItems": 0 }),
+        (true, tail) => json!({ "type": "array", "items": tail }),
+        (false, tail) => json!({ "type": "array", "prefixItems": prefix, "items": tail }),
+    }
+}
+
+/// What a tuple's rest element `...R` adds: the fixed positions of a spread
+/// tuple, and the schema of the positions after them. An `x-unresolved` rest
+/// is kept as that schema so the gap stays visible.
+fn spread_elements(schemas: &IndexMap<String, Value>, rest: Value) -> (Vec<Value>, Value) {
+    const MAX_DEPTH: usize = 16;
+    let mut rest = rest;
+    for _ in 0..MAX_DEPTH {
+        match rest
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/components/schemas/"))
+            .and_then(|name| schemas.get(name))
+        {
+            Some(target) => rest = target.clone(),
+            None => break,
+        }
+    }
+    if rest.get("x-unresolved").is_some() {
+        return (Vec::new(), rest);
+    }
+    if rest.get("type") != Some(&json!("array")) {
+        return (Vec::new(), json!({}));
+    }
+    let prefix = match rest.get("prefixItems") {
+        Some(Value::Array(p)) => p.clone(),
+        _ => Vec::new(),
+    };
+    let tail = rest.get("items").cloned().unwrap_or_else(|| json!({}));
+    (prefix, tail)
+}
+
 /// `NonNullable<T>`: `schema` without its `null` member. A `$ref` to a
 /// nullable component is inlined, since the component itself must stay as is.
 fn strip_null(schemas: &IndexMap<String, Value>, schema: Value) -> Value {
@@ -1986,6 +2034,9 @@ fn strip_null_at(schemas: &IndexMap<String, Value>, schema: Value, depth: usize)
             continue;
         };
         branches.retain(|b| b.get("type").and_then(Value::as_str) != Some("null"));
+        for branch in branches.iter_mut() {
+            *branch = strip_null_at(schemas, branch.take(), depth + 1);
+        }
         if branches.len() == 1 && only_key {
             return branches.pop().expect("one branch");
         }
@@ -3653,5 +3704,88 @@ mod tests {
         assert_eq!(required_names(&iface), ["0"]);
         assert_eq!(prop_names(&class), ["0"]);
         assert_eq!(prop_names(&lit), ["2"]);
+    }
+
+    #[test]
+    fn tuple_rest_operands_resolve_through_aliases_and_spreads() {
+        let [holder] = lower_all(
+            "export type Tail = number[];",
+            "import { Tail } from './dto';\n\
+             export interface Holder {\n\
+               a: [string, ...Tail];\n\
+               b: [string, ...[number, boolean]];\n\
+               c: [string, ...Missing];\n\
+               d: [...number[]];\n\
+               e: [];\n\
+             }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        let p = &holder["properties"];
+        assert_eq!(p["a"]["items"], json!({"type": "number"}));
+        assert_eq!(
+            p["b"],
+            json!({
+                "type": "array",
+                "prefixItems": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}],
+                "items": false
+            })
+        );
+        assert_eq!(p["c"]["items"], json!({"x-unresolved": "Missing"}));
+        assert_eq!(
+            p["d"],
+            json!({"type": "array", "items": {"type": "number"}})
+        );
+        assert_eq!(p["e"], json!({"type": "array", "items": {}, "maxItems": 0}));
+    }
+
+    #[test]
+    fn record_keys_are_deduplicated() {
+        let [holder] = lower_all(
+            "export type A = 'a' | 'b';\nexport type B = 'b' | 'c';",
+            "import { A, B } from './dto';\n\
+             export interface Holder { r: Record<A | B, number>; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["r"]["required"],
+            json!(["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn an_alias_admitting_undefined_makes_a_property_optional() {
+        let [book, author] = lower_all(
+            "export type Maybe = string | undefined;\n\
+             export type Opt<T> = T | undefined;\n\
+             export type Loop = Loop | string;",
+            "import { Maybe, Opt, Loop } from './dto';\n\
+             export interface Book { title: Maybe; pages: Opt<number>; loop: Loop; isbn: string; }\n\
+             export class Author { name: Maybe; }",
+            &["Book", "Author"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(required_names(&book), ["loop", "isbn"]);
+        assert!(author.get("required").is_none(), "got {author}");
+    }
+
+    #[test]
+    fn non_nullable_strips_null_inside_union_branches() {
+        let [holder] = lower_all(
+            "export type Maybe = string | null;",
+            "import { Maybe } from './dto';\n\
+             export interface Holder { r: NonNullable<Maybe | number>; }",
+            &["Holder"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            holder["properties"]["r"],
+            json!({"anyOf": [{"type": "string"}, {"type": "number"}]})
+        );
     }
 }
