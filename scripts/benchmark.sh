@@ -1,10 +1,11 @@
 #!/bin/sh
 # Check nestoa against the NestJS OpenAPI generation benchmark
 # (https://github.com/algoan/nestjs-openapi-generation-benchmark): generate the document of its
-# `nestoa-main` variant with a candidate and a baseline binary, then fail if the candidate
-#   - has more differences with the expected document than the baseline in any category,
-#   - is not deterministic (two runs give different bytes),
-#   - fails `--strict` where the baseline passes.
+# `nestoa-main` variant with a candidate and a baseline binary, then exit with
+#   1 (regression, may be intended) when the candidate has more differences with the expected
+#     document than the baseline in any category, or fails `--strict` where the baseline passes;
+#   2 (error, never intended) when the candidate is not deterministic (two runs give different
+#     bytes), a binary writes no document, or the benchmark cannot run.
 #
 #   scripts/benchmark.sh [candidate] [baseline]
 #     candidate: binary to check (default: target/release/nestoa)
@@ -46,7 +47,7 @@ require_document() {
   if [ ! -s "$OUT/$1.yaml" ]; then
     summary "❌ The $1 wrote no document:"
     summary "$(printf '\n```\n%s\n```\n' "$(cat "$OUT/$1.yaml.log")")"
-    exit 1
+    exit 2
   fi
 }
 
@@ -55,7 +56,7 @@ require_document candidate
 generate "$CANDIDATE" "$OUT/candidate-2.yaml" >/dev/null
 if ! cmp -s "$OUT/candidate.yaml" "$OUT/candidate-2.yaml"; then
   summary "❌ Two runs of the candidate gave different documents."
-  failed=1
+  exit 2
 fi
 
 if [ -n "$BASELINE" ]; then
@@ -66,8 +67,17 @@ if [ -n "$BASELINE" ]; then
     summary "$(printf '\n```\n%s\n```\n' "$(cat "$OUT/candidate.yaml.log")")"
     failed=1
   fi
+  status=0
   node "$BENCH/bench/src/cli.ts" check "$OUT/candidate.yaml" --baseline "$OUT/baseline.yaml" \
-    ${BENCHMARK_SUMMARY:+--summary "$BENCHMARK_SUMMARY"} || failed=1
+    ${BENCHMARK_SUMMARY:+--summary "$BENCHMARK_SUMMARY"} >"$OUT/check.md" || status=$?
+  cat "$OUT/check.md"
+  # `check` exits 1 on a regression, after printing its verdict; anything else is a crash
+  if [ "$status" = 1 ] && grep -q '^More differences' "$OUT/check.md"; then
+    failed=1
+  elif [ "$status" != 0 ]; then
+    summary "❌ The benchmark comparison failed (exit $status)."
+    exit 2
+  fi
 else
   node "$BENCH/bench/src/cli.ts" check "$OUT/candidate.yaml" ${BENCHMARK_SUMMARY:+--summary "$BENCHMARK_SUMMARY"}
 fi

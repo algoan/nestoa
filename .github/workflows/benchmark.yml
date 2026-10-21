@@ -5,8 +5,9 @@ name: Benchmark
 #
 # - Pull request: builds the pull request and its base, and fails if the pull request has more
 #   differences with the benchmark's expected document in any category, is not deterministic, or fails
-#   --strict where the base passes. Label the pull request `benchmark-regression` to accept a
-#   regression on purpose (explain it in the description).
+#   --strict where the base passes. Label the pull request `benchmark-regression` to accept more
+#   differences or a --strict failure on purpose (explain it in the description); non-determinism and
+#   errors are never accepted.
 # - Push to main: asks the benchmark to refresh its `nestoa-main` results (it opens a pull request).
 #
 # Needs the BENCHMARK_TOKEN secret: a token with read and write access to the contents of the benchmark
@@ -79,16 +80,20 @@ jobs:
         if: env.HAS_TOKEN == 'true'
         env:
           BENCHMARK_DIR: .benchmark
-          BENCHMARK_SUMMARY: ${{ github.step_summary }}
           ACCEPTED: ${{ contains(github.event.pull_request.labels.*.name, 'benchmark-regression') }}
         run: |
-          if ! scripts/benchmark.sh target/release/nestoa target/base/release/nestoa; then
-            if [ "$ACCEPTED" = true ]; then
-              echo "::warning::Benchmark regression accepted by the benchmark-regression label"
-            else
-              echo "::error::Benchmark regression, see the job summary (label the pull request benchmark-regression to accept it)"
-              exit 1
-            fi
+          export BENCHMARK_SUMMARY="$GITHUB_STEP_SUMMARY"
+          status=0
+          scripts/benchmark.sh target/release/nestoa target/base/release/nestoa || status=$?
+          # The label only accepts a regression (exit 1), never an error (exit 2)
+          if [ "$status" = 1 ] && [ "$ACCEPTED" = true ]; then
+            echo "::warning::Benchmark regression accepted by the benchmark-regression label"
+          elif [ "$status" = 1 ]; then
+            echo "::error::Benchmark regression, see the job summary (label the pull request benchmark-regression to accept it)"
+            exit 1
+          elif [ "$status" != 0 ]; then
+            echo "::error::The benchmark could not run, see the job summary"
+            exit "$status"
           fi
 
   refresh:

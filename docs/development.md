@@ -66,8 +66,9 @@ make bench BENCHMARK_DIR=path/to/the/benchmark    # another checkout
 ```
 
 The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs it on every pull request, against
-a build of the base commit. To accept a regression on purpose, explain it in the pull request and add
-the `benchmark-regression` label. On a merge to main, and in the release workflow, it dispatches the
+a build of the base commit. To accept more differences or a `--strict` failure on purpose, explain it
+in the pull request and add the `benchmark-regression` label; the script exits 1 for those, and 2 for
+what is never accepted (non-determinism, no document written, a benchmark that cannot run). On a merge to main, and in the release workflow, it dispatches the
 benchmark's refresh workflow, which opens a pull request there with the results of `nestoa-main` or of
 the released version. Both need the `BENCHMARK_TOKEN` secret, a token with read and write access to the
 contents of the benchmark repository; without it the jobs are skipped with a warning.
