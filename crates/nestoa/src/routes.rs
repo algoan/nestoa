@@ -1594,7 +1594,12 @@ fn multipart_body(
         }
         // Applies to the fields `properties` doesn't name.
         if any_file {
-            object.insert("additionalProperties".into(), binary);
+            // A dictionary body (`Record<string, number>`) keeps its values.
+            let files = match object.remove("additionalProperties") {
+                Some(values) if values.is_object() => json!({ "anyOf": [values, binary] }),
+                _ => binary,
+            };
+            object.insert("additionalProperties".into(), files);
         }
         schema
     } else {
@@ -4668,6 +4673,25 @@ mod tests {
         assert_eq!(
             content("/books/export"),
             json!({"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}})
+        );
+    }
+
+    #[test]
+    fn any_files_beside_a_dictionary_body_keep_its_values() {
+        let doc = document(
+            "uploads-dictionary",
+            r#"
+            @Controller('books')
+            export class BooksController {
+                @Post() @UseInterceptors(AnyFilesInterceptor())
+                create(@Body() fields: Record<string, number>): void {}
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+                ["additionalProperties"],
+            json!({"anyOf": [{"type": "number"}, {"type": "string", "format": "binary"}]})
         );
     }
 }
