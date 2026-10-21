@@ -401,7 +401,10 @@ impl<'a> Extractor<'a> {
                     let arg = |i| {
                         nth_arg(d, i).and_then(|e| crate::constval::string(self.project, file, e))
                     };
-                    if arg(0).is_some_and(|h| h.eq_ignore_ascii_case("Content-Type")) {
+                    // Headers are set bottom-up, so the topmost one is sent.
+                    if content_type.is_none()
+                        && arg(0).is_some_and(|h| h.eq_ignore_ascii_case("Content-Type"))
+                    {
                         content_type = arg(1);
                     }
                 }
@@ -598,7 +601,9 @@ impl<'a> Extractor<'a> {
             {
                 (
                     Some(json!({ "type": "string", "format": "binary" })),
-                    content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
                 )
             } else {
                 let response = rewritten.or_else(|| {
@@ -613,7 +618,10 @@ impl<'a> Extractor<'a> {
                     let schema = ctx.ts_type_to_schema(file, declared_return?);
                     (!schema.is_null() && schema != json!({})).then_some(schema)
                 });
-                (response, content_type.unwrap_or_else(|| JSON.to_string()))
+                (
+                    response,
+                    content_type.clone().unwrap_or_else(|| JSON.to_string()),
+                )
             }
         };
 
@@ -704,11 +712,17 @@ impl<'a> Extractor<'a> {
             let full_path = concrete.path.clone();
             // A `@route-mapping` match is the most specific author intent, so
             // it wins over an interceptor override or the declared return type.
-            let response = route_mapping
+            let overridden = route_mapping
                 .iter()
                 .find(|(suffix, _)| path_matches_suffix(&full_path, suffix))
                 .map(|(_, schema)| schema.clone())
-                .or_else(|| response_override(self.config, &interceptor_names, &full_path))
+                .or_else(|| response_override(self.config, &interceptor_names, &full_path));
+            // An overriding schema is a JSON payload, not the file or stream.
+            let response_media_type = match &overridden {
+                Some(_) => content_type.clone().unwrap_or_else(|| JSON.to_string()),
+                None => template.response_media_type.clone(),
+            };
+            let response = overridden
                 .or_else(|| response_value.clone())
                 .filter(|_| !template.redirect);
             let signals = errors::RouteSignals {
@@ -731,6 +745,7 @@ impl<'a> Extractor<'a> {
                 ),
                 path: full_path,
                 response,
+                response_media_type,
                 errors: route_errors,
                 ..template.clone()
             });
@@ -879,15 +894,21 @@ impl<'a> Extractor<'a> {
         let TsType::TsTypeRef(r) = crate::interceptors::unwrap_async(ty) else {
             return false;
         };
-        let TsEntityName::Ident(name) = &r.type_name else {
-            return false;
-        };
-        let name = name.sym.as_str();
-        match self.project.import_origin(file, name) {
-            Some((package, exported)) if package.starts_with("@nestjs/") => {
-                exported == "StreamableFile"
+        let name = entity_name(&r.type_name);
+        match self.package_origin(file, &name) {
+            Some((package, exported)) => {
+                package.starts_with("@nestjs/") && exported == "StreamableFile"
             }
-            _ => name == "StreamableFile" && self.project.resolve(file, name).is_none(),
+            None => name == "StreamableFile" && self.project.resolve(file, &name).is_none(),
+        }
+    }
+
+    /// The package a name (`FileInterceptor`, or `ns.FileInterceptor`
+    /// through a namespace import) comes from, with its exported name there.
+    fn package_origin(&self, file: &Path, name: &str) -> Option<(String, String)> {
+        match name.rsplit_once('.') {
+            Some((ns, member)) => self.project.namespace_member_origin(file, ns, member),
+            None => self.project.import_origin(file, name),
         }
     }
 
@@ -1318,6 +1339,14 @@ fn pipe_effects(
 
 /// The class an expression names, by its last segment: `ParseIntPipe` for
 /// `ParseIntPipe` or `Common.ParseIntPipe`.
+/// `A` or `ns.A`.
+fn entity_name(name: &TsEntityName) -> String {
+    match name {
+        TsEntityName::Ident(i) => i.sym.to_string(),
+        TsEntityName::TsQualifiedName(q) => format!("{}.{}", entity_name(&q.left), q.right.sym),
+    }
+}
+
 fn class_name(expr: &Expr) -> Option<String> {
     crate::constval::dotted_name(expr).map(|n| n.rsplit('.').next().unwrap_or_default().to_string())
 }
@@ -4412,5 +4441,53 @@ mod tests {
                 {"type": "object", "properties": {"owner": {}, "title": {}}, "additionalProperties": binary},
             ]})
         );
+    }
+
+    #[test]
+    fn response_media_types_follow_nest_and_the_final_schema() {
+        let mut config = Config::default();
+        config.interceptors.insert(
+            "SigningInterceptor".into(),
+            crate::config::InterceptorConfig {
+                response: Some(crate::config::ResponseOverride {
+                    when_path_ends_with: Some("/signed".into()),
+                    schema: json!({"type": "object"}),
+                }),
+                ..Default::default()
+            },
+        );
+        let doc = document_with(
+            "media-types",
+            r#"
+            import * as Common from '@nestjs/common';
+            import { StreamableFile as Foreign } from '@acme/files';
+            @Controller('books')
+            export class BooksController {
+                @Get('csv')
+                @Header('Content-Type', 'text/csv')
+                @Header('Content-Type', 'application/json')
+                csv(): string { return ''; }
+
+                @Get([':id', ':id/signed']) @UseInterceptors(SigningInterceptor)
+                file(): StreamableFile { return null as any; }
+
+                @Get('qualified') qualified(): Common.StreamableFile { return null as any; }
+                @Get('foreign') foreign(): Foreign { return null as any; }
+            }
+            "#,
+            config,
+        );
+        let content = |path: &str| doc["paths"][path]["get"]["responses"]["200"]["content"].clone();
+        let keys = |path: &str| -> Vec<String> {
+            content(path).as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(keys("/books/csv"), ["text/csv"]);
+        assert_eq!(keys("/books/{id}"), ["application/octet-stream"]);
+        assert_eq!(
+            content("/books/{id}/signed"),
+            json!({"application/json": {"schema": {"type": "object"}}})
+        );
+        assert_eq!(keys("/books/qualified"), ["application/octet-stream"]);
+        assert_eq!(keys("/books/foreign"), ["application/json"]);
     }
 }
