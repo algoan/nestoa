@@ -1086,6 +1086,15 @@ impl<'a> SchemaCtx<'a> {
                 let TsEntityName::Ident(id) = &r.type_name else {
                     return None;
                 };
+                // A bound parameter, as lowered where its argument was written.
+                if depth == 0
+                    && let Some(binding) = self
+                        .type_env
+                        .as_ref()
+                        .and_then(|env| env.get(id.sym.as_ref()))
+                {
+                    return string_enum_keys(binding.resolved.as_ref()?);
+                }
                 let (decl_file, Symbol::TypeAlias(alias)) =
                     self.project.resolve(file, id.sym.as_ref())?
                 else {
@@ -1294,27 +1303,22 @@ impl<'a> SchemaCtx<'a> {
                     ),
                 };
                 match resolved {
-                    Some((decl_file, Symbol::TypeAlias(alias))) => match &alias.type_params {
-                        Some(params) => {
-                            let scope = self.alias_scope(
-                                env,
-                                file,
-                                &decl_file,
-                                params,
-                                r.type_params.as_deref(),
-                                depth,
-                            );
-                            self.admits_undefined_in(
-                                Some(&scope),
-                                &decl_file,
-                                &alias.type_ann,
-                                depth + 1,
-                            )
-                        }
-                        None => {
-                            self.admits_undefined_in(env, &decl_file, &alias.type_ann, depth + 1)
-                        }
-                    },
+                    Some((decl_file, Symbol::TypeAlias(alias))) => {
+                        let scope = self.alias_env(
+                            env,
+                            file,
+                            &decl_file,
+                            &alias,
+                            r.type_params.as_deref(),
+                            depth,
+                        );
+                        self.admits_undefined_in(
+                            scope.as_ref(),
+                            &decl_file,
+                            &alias.type_ann,
+                            depth + 1,
+                        )
+                    }
                     _ => false,
                 }
             }
@@ -1333,19 +1337,20 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
-    /// The parameters of a generic alias bound to the arguments of a
-    /// reference to it, written in `file` under `env`, or to their defaults.
-    /// The alias body sees these alone: the referencing scope's bindings may
-    /// share its parameters' names.
-    fn alias_scope(
+    /// The bindings an alias body is checked under: its own parameters bound
+    /// to the arguments of a reference to it, written in `file` under `env`,
+    /// or to their defaults. Never the referencing scope's bindings, which may
+    /// share names the body uses; `None` for a non-generic alias.
+    fn alias_env(
         &self,
         env: Option<&TypeEnv>,
         file: &Path,
         decl_file: &Path,
-        params: &swc_ecma_ast::TsTypeParamDecl,
+        alias: &swc_ecma_ast::TsTypeAliasDecl,
         args: Option<&TsTypeParamInstantiation>,
         depth: usize,
-    ) -> TypeEnv {
+    ) -> Option<TypeEnv> {
+        let params = alias.type_params.as_ref()?;
         let mut scope = TypeEnv::new();
         for (i, param) in params.params.iter().enumerate() {
             let (origin, ty, admits) = match (args.and_then(|a| a.params.get(i)), &param.default) {
@@ -1371,7 +1376,7 @@ impl<'a> SchemaCtx<'a> {
                 },
             );
         }
-        scope
+        Some(scope)
     }
 
     /// `admits_undefined` for `Awaited<T>`: a `Promise` in `T`, written
@@ -1396,10 +1401,21 @@ impl<'a> SchemaCtx<'a> {
                 .iter()
                 .any(|t| self.awaited_admits_undefined(env, file, t, depth)),
             TsType::TsTypeRef(r) => {
-                let TsEntityName::Ident(id) = &r.type_name else {
-                    return self.admits_undefined_in(env, file, ty, depth);
-                };
-                if id.sym == "Promise" {
+                // A bound parameter is awaited where its type was written.
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && r.type_params.is_none()
+                    && let Some(binding) = env.and_then(|env| env.get(id.sym.as_ref()))
+                {
+                    return self.awaited_admits_undefined(
+                        None,
+                        &binding.origin_file,
+                        &binding.ty,
+                        depth + 1,
+                    );
+                }
+                if let TsEntityName::Ident(id) = &r.type_name
+                    && id.sym == "Promise"
+                {
                     return r
                         .type_params
                         .as_ref()
@@ -1408,9 +1424,30 @@ impl<'a> SchemaCtx<'a> {
                             self.awaited_admits_undefined(env, file, arg, depth + 1)
                         });
                 }
-                match self.project.resolve(file, id.sym.as_ref()) {
-                    Some((decl_file, Symbol::TypeAlias(alias))) if r.type_params.is_none() => {
-                        self.awaited_admits_undefined(env, &decl_file, &alias.type_ann, depth + 1)
+                let resolved = match &r.type_name {
+                    TsEntityName::Ident(id) => self.project.resolve(file, id.sym.as_ref()),
+                    TsEntityName::TsQualifiedName(q) => self.project.resolve_namespace_member(
+                        file,
+                        &entity_name(&q.left),
+                        q.right.sym.as_ref(),
+                    ),
+                };
+                match resolved {
+                    Some((decl_file, Symbol::TypeAlias(alias))) => {
+                        let scope = self.alias_env(
+                            env,
+                            file,
+                            &decl_file,
+                            &alias,
+                            r.type_params.as_deref(),
+                            depth,
+                        );
+                        self.awaited_admits_undefined(
+                            scope.as_ref(),
+                            &decl_file,
+                            &alias.type_ann,
+                            depth + 1,
+                        )
                     }
                     _ => self.admits_undefined_in(env, file, ty, depth),
                 }
@@ -1854,6 +1891,34 @@ fn entity_name(e: &TsEntityName) -> String {
             format!("{}.{}", entity_name(&q.left), q.right.sym)
         }
     }
+}
+
+/// The keys a lowered string-literal union admits: `enum` values of a
+/// `string` schema, or of every `anyOf` branch.
+fn string_enum_keys(schema: &Value) -> Option<Vec<String>> {
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+        let mut keys: Vec<String> = Vec::new();
+        for key in branches
+            .iter()
+            .map(string_enum_keys)
+            .collect::<Option<Vec<_>>>()?
+            .concat()
+        {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        return Some(keys);
+    }
+    if schema.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    schema
+        .get("enum")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect()
 }
 
 /// A declaration's own generic type parameters, in order, with their
@@ -5168,5 +5233,53 @@ mod tests {
         };
         assert_eq!(required_names(&instance("fixed")), ["value"]);
         assert_eq!(required_names(&instance("passed")), ["tag"]);
+    }
+
+    #[test]
+    fn bound_key_parameters_list_their_keys() {
+        let (_, schemas) = lower_component(
+            GENERICS,
+            "import { Book } from './dto';\n\
+             export type Fields<K extends string> = Record<K, string>;\n\
+             export type Only<K extends keyof Book> = Pick<Book, K>;\n\
+             export interface Holder { fields: Fields<'title' | 'author'>; only: Only<'title'>; }",
+            "Holder",
+        );
+        let instance = |p: &str| schemas[&ref_name(&schemas["Holder"], p)].clone();
+        assert_eq!(prop_names(&instance("fields")), ["title", "author"]);
+        assert_eq!(required_names(&instance("fields")), ["title", "author"]);
+        assert_eq!(prop_names(&instance("only")), ["title"], "got {schemas:?}");
+    }
+
+    #[test]
+    fn a_plain_alias_ignores_the_bindings_it_is_reached_under_for_optionality() {
+        let (_, schemas) = lower_component(
+            "",
+            "export class Item { id: string; }\n\
+             export type Fixed = Item;\n\
+             export interface Box<Item> { value: Fixed; other: Item; }\n\
+             export interface Holder { box: Box<string | undefined>; }",
+            "Holder",
+        );
+        let instance = &schemas[&ref_name(&schemas["Holder"], "box")];
+        assert_eq!(required_names(instance), ["value"]);
+    }
+
+    #[test]
+    fn awaited_follows_bindings_generic_and_namespace_aliases() {
+        let (_, schemas) = lower_component(
+            "export type Later = Promise<string | undefined>;",
+            "import * as dto from './dto';\n\
+             export type Pending<T = string | undefined> = Promise<T>;\n\
+             export interface Wait<T> { value: Awaited<T>; tag: string; }\n\
+             export interface Holder {\n\
+               defaulted: Awaited<Pending>; explicit: Awaited<Pending<number | undefined>>;\n\
+               namespaced: Awaited<dto.Later>; wait: Wait<Promise<string | undefined>>; tag: string;\n\
+             }",
+            "Holder",
+        );
+        assert_eq!(required_names(&schemas["Holder"]), ["wait", "tag"]);
+        let wait = &schemas[&ref_name(&schemas["Holder"], "wait")];
+        assert_eq!(required_names(wait), ["tag"]);
     }
 }
