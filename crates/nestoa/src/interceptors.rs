@@ -353,6 +353,7 @@ fn unify(
                 resolved: None,
                 admits_undefined: None,
                 awaited_admits_undefined: None,
+                scope: None,
             },
         );
         return true;
