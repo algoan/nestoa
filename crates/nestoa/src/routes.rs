@@ -4603,4 +4603,21 @@ mod tests {
             json!({"type": "http", "scheme": "bearer"})
         );
     }
+
+    #[test]
+    fn the_3_0_downgrade_keeps_oauth_scope_names() {
+        let config: Config = serde_json::from_value(json!({
+            "openapiVersion": "3.0.3",
+            "security": {"name": "oauth", "scheme": {"type": "oauth2", "flows": {"clientCredentials": {
+                "tokenUrl": "https://auth.example.com/token",
+                "scopes": {"const": "Read books"},
+            }}}},
+        }))
+        .unwrap();
+        let doc = document_with("security-oauth-30", SECURED_CONTROLLER, config);
+        assert_eq!(
+            doc["components"]["securitySchemes"]["oauth"]["flows"]["clientCredentials"]["scopes"],
+            json!({"const": "Read books"})
+        );
+    }
 }

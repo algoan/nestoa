@@ -244,7 +244,6 @@ fn is_name_keyed_map(key: &str) -> bool {
             | "encoding"
             | "callbacks"
             | "links"
-            | "securitySchemes"
             | "variables"
     )
 }
