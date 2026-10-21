@@ -211,10 +211,16 @@ fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
 /// `const` values are read at the schema level but are likewise instance data
 /// inside.
 ///
+/// Security requirements and schemes hold no schema either: a scheme named
+/// `const` must keep its name.
+///
 /// Only meaningful in keyword position: inside a `properties` map the same
 /// word is a field name, which is what `is_name_keyed_map` exists to catch.
 fn is_instance_data(key: &str) -> bool {
-    matches!(key, "example" | "examples" | "default" | "enum" | "const") || key.starts_with("x-")
+    matches!(
+        key,
+        "example" | "examples" | "default" | "enum" | "const" | "security" | "securitySchemes"
+    ) || key.starts_with("x-")
 }
 
 /// Whether a keyword's value is a map keyed by user-chosen names rather than

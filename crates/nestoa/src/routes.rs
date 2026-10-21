@@ -4527,4 +4527,22 @@ mod tests {
             "{warnings:?}"
         );
     }
+
+    #[test]
+    fn the_3_0_downgrade_keeps_security_requirements() {
+        let config: Config = serde_json::from_value(json!({
+            "openapiVersion": "3.0.3",
+            "security": {"name": "const"},
+        }))
+        .unwrap();
+        let doc = document_with("security-30", SECURED_CONTROLLER, config);
+        assert_eq!(
+            doc["paths"]["/pets"]["get"]["security"],
+            json!([{"const": []}])
+        );
+        assert_eq!(
+            doc["components"]["securitySchemes"]["const"],
+            json!({"type": "http", "scheme": "bearer"})
+        );
+    }
 }
