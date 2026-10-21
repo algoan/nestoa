@@ -920,6 +920,12 @@ impl<'a> Extractor<'a> {
                 let kind = match package_origin(self.project, file, &dotted) {
                     Some((package, exported)) if package == "@nestjs/platform-express" => exported,
                     Some(_) => continue,
+                    // A local factory of the same name is not Nest's.
+                    None if self.project.resolve(file, &dotted).is_some()
+                        || self.project.resolve_const(file, &dotted).is_some() =>
+                    {
+                        continue;
+                    }
                     None => dotted.rsplit('.').next().unwrap_or_default().to_string(),
                 };
                 let arg = |i: usize| c.args.get(i).map(|a| &*a.expr);
@@ -4560,6 +4566,24 @@ mod tests {
         assert_eq!(success("/books/logged")["content"], binary);
         assert_eq!(success("/books/download")["content"], binary);
         assert_eq!(success("/books/muted"), json!({"description": "OK"}));
+    }
+
+    #[test]
+    fn a_local_upload_factory_is_not_nests() {
+        let doc = document(
+            "uploads-local",
+            r#"
+            const FileInterceptor = (field: string) => AuditInterceptor;
+            @Controller('books')
+            export class BooksController {
+                @Post() @UseInterceptors(FileInterceptor('cover')) create(): void {}
+            }
+            "#,
+        );
+        assert!(
+            doc["paths"]["/books"]["post"].get("requestBody").is_none(),
+            "{doc}"
+        );
     }
 
     #[test]
