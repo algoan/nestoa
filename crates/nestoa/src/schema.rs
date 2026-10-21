@@ -42,9 +42,13 @@ pub struct ComponentSchemas {
     /// instantiation is inlined there.
     recursive: HashSet<String>,
     /// The type parameters (declaration + index) whose defaults are being
-    /// lowered. A reference needing one of them again (`A<T = B>`,
-    /// `B<U = A>`) has no finite expansion, so it stays a plain component.
-    defaulting: HashSet<(std::path::PathBuf, String, usize)>,
+    /// lowered, with the signature of the arguments bound before them and the
+    /// component name a reference back to that instance reserved. A reference
+    /// needing one of these defaults again has no finite expansion: with the
+    /// same arguments (`Link<T, U = Node<T>>`, `Node<T>` holding `Link<T>`) it
+    /// is the instance in flight, otherwise (`A<T = B>`, `B<U = A>`) a plain
+    /// component.
+    defaulting: HashMap<(std::path::PathBuf, String, usize), (String, Option<String>)>,
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
@@ -818,18 +822,24 @@ impl<'a> SchemaCtx<'a> {
         args: &[&TsType],
     ) -> Option<Value> {
         let declared = generic_params(sym);
+        let params: Vec<String> = declared.iter().map(|(p, _)| p.clone()).collect();
         let param_key = |i: usize| (decl_file.to_path_buf(), sym.name(), i);
-        if (args.len()..declared.len()).any(|i| self.components.defaulting.contains(&param_key(i)))
-        {
-            return None;
-        }
         // Arguments are lowered in the *caller's* scope, before this
         // declaration is marked active: they belong to the reference site, not
         // to the body about to be expanded. Marking first would read a finite
         // nesting like `Box<Box<T>>` as recursion and leave the inner
         // argument's own parameter unbound.
         let mut new_env: TypeEnv = HashMap::new();
+        // Names references back to this instance reserved while its defaults
+        // were lowered.
+        let mut closed: Vec<String> = Vec::new();
         for (i, (param, default)) in declared.iter().enumerate() {
+            if i == args.len()
+                && let Some(closing) =
+                    self.close_default_cycle(decl_file, sym, type_name, &params, &new_env, i)
+            {
+                return closing;
+            }
             let (origin, arg) = match (args.get(i), default) {
                 (Some(arg), _) => (file, *arg),
                 (None, Some(default)) => (decl_file, &**default),
@@ -837,12 +847,20 @@ impl<'a> SchemaCtx<'a> {
             };
             let defaulted = args.get(i).is_none();
             let caller_env = defaulted.then(|| self.type_env.replace(new_env.clone()));
-            let guarded = defaulted && self.components.defaulting.insert(param_key(i));
+            let guarded = defaulted && !self.components.defaulting.contains_key(&param_key(i));
+            if guarded {
+                let supplied = instantiation_key(decl_file, &sym.name(), &params[..i], &new_env).2;
+                self.components
+                    .defaulting
+                    .insert(param_key(i), (supplied, None));
+            }
             let resolved = self.ts_type_to_schema(origin, arg);
             let admits_undefined = self.admits_undefined(origin, arg, 0);
             let awaited = self.awaited_admits_undefined(self.type_env.as_ref(), origin, arg, 0);
-            if guarded {
-                self.components.defaulting.remove(&param_key(i));
+            if guarded
+                && let Some((_, Some(name))) = self.components.defaulting.remove(&param_key(i))
+            {
+                closed.push(name);
             }
             if let Some(env) = caller_env {
                 self.type_env = env;
@@ -861,8 +879,11 @@ impl<'a> SchemaCtx<'a> {
         if new_env.is_empty() {
             return None;
         }
-        let params: Vec<String> = declared.into_iter().map(|(p, _)| p).collect();
         let key = instantiation_key(decl_file, &sym.name(), &params, &new_env);
+        if let Some(name) = closed.first() {
+            let hint = name.clone();
+            return Some(self.lower_instance(decl_file, sym, key, hint, new_env, &closed));
+        }
         // Already lowered as a component — by an earlier route, or an earlier
         // field of this one — so reuse it rather than lowering a duplicate
         // under a fresh name.
@@ -905,7 +926,63 @@ impl<'a> SchemaCtx<'a> {
             sanitize_name(type_name),
             instantiation_suffix(&params, &new_env)
         );
-        self.instantiating.push((key.clone(), hint, None));
+        Some(self.lower_instance(decl_file, sym, key, hint, new_env, &[]))
+    }
+
+    /// Whether a reference supplying the arguments bound in `env` reaches a
+    /// default of its declaration that is already being lowered (see
+    /// `ComponentSchemas::defaulting`): `None` if not, else what the reference
+    /// lowers to, `Some(None)` standing for a plain component.
+    fn close_default_cycle(
+        &mut self,
+        decl_file: &Path,
+        sym: &Symbol,
+        type_name: &str,
+        params: &[String],
+        env: &TypeEnv,
+        first_default: usize,
+    ) -> Option<Option<Value>> {
+        let key = |i: usize| (decl_file.to_path_buf(), sym.name(), i);
+        let Some((sig, reserved)) = self.components.defaulting.get(&key(first_default)).cloned()
+        else {
+            let in_flight = (first_default..params.len())
+                .any(|i| self.components.defaulting.contains_key(&key(i)));
+            return in_flight.then_some(None);
+        };
+        if sig != instantiation_key(decl_file, &sym.name(), &params[..first_default], env).2 {
+            return Some(None);
+        }
+        let name = reserved.unwrap_or_else(|| {
+            let hint = format!(
+                "{}{}",
+                sanitize_name(type_name),
+                instantiation_suffix(&params[..first_default], env)
+            );
+            let name = self.components.fresh_name("", &hint);
+            self.components.allocated.insert(name.clone());
+            self.components.recursive.insert(name.clone());
+            if let Some(entry) = self.components.defaulting.get_mut(&key(first_default)) {
+                entry.1 = Some(name.clone());
+            }
+            name
+        });
+        Some(Some(ref_value(&name)))
+    }
+
+    /// Lower the body of an instantiation under `env`. `closed` holds the
+    /// names references back to it already reserved: the first names the
+    /// component, the others point at it.
+    fn lower_instance(
+        &mut self,
+        decl_file: &Path,
+        sym: &Symbol,
+        key: InstantiationKey,
+        hint: String,
+        env: TypeEnv,
+        closed: &[String],
+    ) -> Value {
+        self.instantiating
+            .push((key.clone(), hint, closed.first().cloned()));
         if !self.inline_generics {
             self.reserve_instantiation_name(self.instantiating.len() - 1);
         }
@@ -917,27 +994,32 @@ impl<'a> SchemaCtx<'a> {
             Some(name) => self.current_owner.replace(name),
             None => self.current_owner.clone(),
         };
-        let saved = self.type_env.replace(new_env);
+        let saved = self.type_env.replace(env);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.type_env = saved;
         self.current_owner = saved_owner;
-        // A name is present only if something referred back to this instance.
-        // Registering the finished schema under it makes every level of the
-        // recursion share one component, and recording the instantiation makes
-        // a later route binding the same arguments reuse it.
+        // Under `inline_generics`, a name is present only if something referred
+        // back to this instance. Registering the finished schema under it makes
+        // every level of the recursion share one component, and recording the
+        // instantiation makes a later route binding the same arguments reuse it.
         let (_, _, name) = self.instantiating.pop().expect("instantiation in flight");
         match name {
             // A `void` instantiation (`Identity<void>`) has no schema to name.
             Some(name) if schema.is_null() && !self.components.recursive.contains(&name) => {
                 self.components.allocated.remove(&name);
-                Some(schema)
+                schema
             }
             Some(name) => {
                 self.components.schemas.insert(name.clone(), schema);
+                for alias in closed.iter().skip(1) {
+                    self.components
+                        .schemas
+                        .insert(alias.clone(), ref_value(&name));
+                }
                 self.components.instantiated.insert(key, name.clone());
-                Some(ref_value(&name))
+                ref_value(&name)
             }
-            None => Some(schema),
+            None => schema,
         }
     }
 
@@ -5401,5 +5483,24 @@ mod tests {
             "got {schemas:?}"
         );
         assert_eq!(inner["properties"]["second"], json!({"type": "number"}));
+    }
+
+    #[test]
+    fn a_default_closing_a_cycle_keeps_the_supplied_arguments() {
+        let (_, schemas) = lower_component(
+            "",
+            "export interface Link<T, U = Node<T>> { value: T; child: U; }\n\
+             export interface Node<T> { next: Link<T>; }\n\
+             export interface Holder { link: Link<number>; }",
+            "Holder",
+        );
+        let link = ref_name(&schemas["Holder"], "link");
+        assert_eq!(
+            schemas[&link]["properties"]["value"],
+            json!({"type": "number"})
+        );
+        let node = &schemas[&ref_name(&schemas[&link], "child")];
+        assert_eq!(ref_name(node, "next"), link, "got {schemas:?}");
+        assert!(!schemas.contains_key("Link"));
     }
 }
