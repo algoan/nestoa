@@ -139,6 +139,9 @@ pub struct TypeBinding {
     /// Whether the bound type admits `undefined`, decided where the argument
     /// was written. Set alongside `resolved`, whose schema drops `undefined`.
     pub admits_undefined: Option<bool>,
+    /// Whether `Awaited<>` of the bound type admits `undefined`, decided
+    /// where the argument was written, like `admits_undefined`.
+    pub awaited_admits_undefined: Option<bool>,
 }
 
 /// Map of type-parameter name -> bound concrete type.
@@ -166,11 +169,15 @@ fn instantiation_key(
     params: &[String],
     env: &TypeEnv,
 ) -> InstantiationKey {
-    let sig: Vec<(&Value, Option<bool>)> = params
+    let sig: Vec<(&Value, Option<bool>, Option<bool>)> = params
         .iter()
         .filter_map(|p| {
             let binding = env.get(p)?;
-            Some((binding.resolved.as_ref()?, binding.admits_undefined))
+            Some((
+                binding.resolved.as_ref()?,
+                binding.admits_undefined,
+                binding.awaited_admits_undefined,
+            ))
         })
         .collect();
     (
@@ -825,6 +832,7 @@ impl<'a> SchemaCtx<'a> {
                 .then(|| self.type_env.replace(new_env.clone()));
             let resolved = self.ts_type_to_schema(origin, arg);
             let admits_undefined = self.admits_undefined(origin, arg, 0);
+            let awaited = self.awaited_admits_undefined(self.type_env.as_ref(), origin, arg, 0);
             if let Some(env) = caller_env {
                 self.type_env = env;
             }
@@ -835,6 +843,7 @@ impl<'a> SchemaCtx<'a> {
                     ty: arg.clone(),
                     resolved: Some(resolved),
                     admits_undefined: Some(admits_undefined),
+                    awaited_admits_undefined: Some(awaited),
                 },
             );
         }
@@ -1093,7 +1102,11 @@ impl<'a> SchemaCtx<'a> {
                         .as_ref()
                         .and_then(|env| env.get(id.sym.as_ref()))
                 {
-                    return string_enum_keys(binding.resolved.as_ref()?);
+                    return string_enum_keys(
+                        &self.components.schemas,
+                        binding.resolved.as_ref()?,
+                        0,
+                    );
                 }
                 let (decl_file, Symbol::TypeAlias(alias)) =
                     self.project.resolve(file, id.sym.as_ref())?
@@ -1353,19 +1366,13 @@ impl<'a> SchemaCtx<'a> {
         let params = alias.type_params.as_ref()?;
         let mut scope = TypeEnv::new();
         for (i, param) in params.params.iter().enumerate() {
-            let (origin, ty, admits) = match (args.and_then(|a| a.params.get(i)), &param.default) {
-                (Some(arg), _) => (
-                    file,
-                    arg,
-                    self.admits_undefined_in(env, file, arg, depth + 1),
-                ),
-                (None, Some(default)) => (
-                    decl_file,
-                    default,
-                    self.admits_undefined_in(Some(&scope), decl_file, default, depth + 1),
-                ),
+            let (origin, ty, outer) = match (args.and_then(|a| a.params.get(i)), &param.default) {
+                (Some(arg), _) => (file, arg, env),
+                (None, Some(default)) => (decl_file, default, Some(&scope)),
                 (None, None) => continue,
             };
+            let admits = self.admits_undefined_in(outer, origin, ty, depth + 1);
+            let awaited = self.awaited_admits_undefined(outer, origin, ty, depth + 1);
             scope.insert(
                 param.name.sym.to_string(),
                 TypeBinding {
@@ -1373,6 +1380,7 @@ impl<'a> SchemaCtx<'a> {
                     ty: (**ty).clone(),
                     resolved: None,
                     admits_undefined: Some(admits),
+                    awaited_admits_undefined: Some(awaited),
                 },
             );
         }
@@ -1406,12 +1414,14 @@ impl<'a> SchemaCtx<'a> {
                     && r.type_params.is_none()
                     && let Some(binding) = env.and_then(|env| env.get(id.sym.as_ref()))
                 {
-                    return self.awaited_admits_undefined(
-                        None,
-                        &binding.origin_file,
-                        &binding.ty,
-                        depth + 1,
-                    );
+                    return binding.awaited_admits_undefined.unwrap_or_else(|| {
+                        self.awaited_admits_undefined(
+                            None,
+                            &binding.origin_file,
+                            &binding.ty,
+                            depth + 1,
+                        )
+                    });
                 }
                 if let TsEntityName::Ident(id) = &r.type_name
                     && id.sym == "Promise"
@@ -1894,18 +1904,30 @@ fn entity_name(e: &TsEntityName) -> String {
 }
 
 /// The keys a lowered string-literal union admits: `enum` values of a
-/// `string` schema, or of every `anyOf` branch.
-fn string_enum_keys(schema: &Value) -> Option<Vec<String>> {
+/// `string` schema, or of every `anyOf` branch, through component `$ref`s.
+fn string_enum_keys(
+    schemas: &IndexMap<String, Value>,
+    schema: &Value,
+    depth: usize,
+) -> Option<Vec<String>> {
+    const MAX_REF_DEPTH: usize = 8;
+    if depth >= MAX_REF_DEPTH {
+        return None;
+    }
+    if let Some(name) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        return string_enum_keys(schemas, schemas.get(name)?, depth + 1);
+    }
     if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
         let mut keys: Vec<String> = Vec::new();
-        for key in branches
-            .iter()
-            .map(string_enum_keys)
-            .collect::<Option<Vec<_>>>()?
-            .concat()
-        {
-            if !keys.contains(&key) {
-                keys.push(key);
+        for branch in branches {
+            for key in string_enum_keys(schemas, branch, depth + 1)? {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
             }
         }
         return Some(keys);
@@ -4543,6 +4565,7 @@ mod tests {
                 ty: (*bound.type_ann).clone(),
                 resolved: None,
                 admits_undefined: None,
+                awaited_admits_undefined: None,
             },
         )]);
         let mut components = ComponentSchemas::default();
@@ -4575,6 +4598,7 @@ mod tests {
                     ty: (*bound.type_ann).clone(),
                     resolved: None,
                     admits_undefined: None,
+                    awaited_admits_undefined: None,
                 },
             );
         }
@@ -5281,5 +5305,55 @@ mod tests {
         assert_eq!(required_names(&schemas["Holder"]), ["wait", "tag"]);
         let wait = &schemas[&ref_name(&schemas["Holder"], "wait")];
         assert_eq!(required_names(wait), ["tag"]);
+    }
+
+    #[test]
+    fn named_key_arguments_list_their_keys() {
+        let (_, schemas) = lower_component(
+            GENERICS,
+            "import { Book } from './dto';\n\
+             export type Keys = 'title' | 'author';\n\
+             export type More = Keys | 'year';\n\
+             export type Fields<K extends string> = Record<K, string>;\n\
+             export type Without<K extends string> = Omit<Book, K>;\n\
+             export interface Holder { fields: Fields<More>; without: Without<Keys>; }",
+            "Holder",
+        );
+        let instance = |p: &str| schemas[&ref_name(&schemas["Holder"], p)].clone();
+        assert_eq!(prop_names(&instance("fields")), ["title", "author", "year"]);
+        assert_eq!(
+            instance("without")["properties"],
+            json!({}),
+            "got {schemas:?}"
+        );
+    }
+
+    #[test]
+    fn awaited_optionality_follows_forwarded_bindings_and_keys_instances() {
+        for order in [["a", "b"], ["b", "a"]] {
+            let fields = order.map(|f| match f {
+                "a" => "a: Wait<Promise<string>>;",
+                _ => "b: Wait<Promise<string | undefined>>;",
+            });
+            let (_, schemas) = lower_component(
+                "",
+                &format!(
+                    "export interface Wait<U> {{ value: Awaited<U>; tag: string; }}\n\
+                     export interface Outer<T> {{ inner: Wait<T>; }}\n\
+                     export interface Holder {{ {} {} outer: Outer<Promise<string | undefined>>; }}",
+                    fields[0], fields[1]
+                ),
+                "Holder",
+            );
+            let instance = |p: &str| schemas[&ref_name(&schemas["Holder"], p)].clone();
+            assert_eq!(
+                required_names(&instance("a")),
+                ["value", "tag"],
+                "order {order:?}"
+            );
+            assert_eq!(required_names(&instance("b")), ["tag"], "order {order:?}");
+            let inner = &schemas[&ref_name(&instance("outer"), "inner")];
+            assert_eq!(required_names(inner), ["tag"], "order {order:?}");
+        }
     }
 }

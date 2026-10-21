@@ -352,6 +352,7 @@ fn unify(
                 ty: concrete.clone(),
                 resolved: None,
                 admits_undefined: None,
+                awaited_admits_undefined: None,
             },
         );
         return true;
