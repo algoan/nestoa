@@ -58,7 +58,7 @@ security, docs), is not deterministic, or fails `--strict` where the baseline pa
 the new and fixed differences.
 
 ```sh
-git clone git@github.com:algoan/nestjs-openapi-generation-benchmark.git ../nestjs-openapi-generation-benchmark
+git clone https://github.com/algoan/nestjs-openapi-generation-benchmark.git ../nestjs-openapi-generation-benchmark
 npm --prefix ../nestjs-openapi-generation-benchmark/bench ci
 make bench                                        # differences of this branch
 make bench BASELINE=path/to/main/nestoa           # fail on a regression against main's binary
