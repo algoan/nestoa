@@ -492,37 +492,31 @@ impl<'a> Extractor<'a> {
         // pagination); when it does, the rewritten schema replaces the
         // declared return type — and we skip lowering the declared type at
         // all so its now-unreferenced components don't leak into the doc.
-        let mut response_value: Option<Value> = None;
-        if let Some(ret) = m.function.return_type.as_ref() {
-            let rewritten = if interceptor_names.is_empty() {
-                None
-            } else {
-                rewrite_response(
-                    self.project,
-                    self.config,
-                    file,
-                    &ret.type_ann,
-                    &interceptor_names,
-                    self.components,
-                )
+        let declared_return = m.function.return_type.as_ref().map(|r| &*r.type_ann);
+        let rewritten = if interceptor_names.is_empty() {
+            None
+        } else {
+            rewrite_response(
+                self.project,
+                self.config,
+                file,
+                declared_return,
+                &interceptor_names,
+                self.components,
+            )
+        };
+        let response_value = rewritten.or_else(|| {
+            let mut ctx = SchemaCtx {
+                project: self.project,
+                components: self.components,
+                type_env: None,
+                current_owner: None,
+                instantiating: Vec::new(),
+                passthrough_types: &self.config.passthrough_types,
             };
-            if rewritten.is_some() {
-                response_value = rewritten;
-            } else {
-                let mut ctx = SchemaCtx {
-                    project: self.project,
-                    components: self.components,
-                    type_env: None,
-                    current_owner: None,
-                    instantiating: Vec::new(),
-                    passthrough_types: &self.config.passthrough_types,
-                };
-                let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
-                if !schema.is_null() && schema != json!({}) {
-                    response_value = Some(schema);
-                }
-            }
-        }
+            let schema = ctx.ts_type_to_schema(file, declared_return?);
+            (!schema.is_null() && schema != json!({})).then_some(schema)
+        });
 
         // `@route-mapping` lets one method serving several paths return a
         // distinct schema per path, keyed by a trailing path suffix. Resolve

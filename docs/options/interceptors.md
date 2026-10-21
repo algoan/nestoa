@@ -37,8 +37,14 @@ type may not be what the client receives. For a class declared as
 `implements NestInterceptor<In, Out>`, nestoa:
 
 1. unwraps the handler's return type (`Promise` / `Observable`),
-2. matches it against `In` to bind the interceptor's generic parameters,
+2. matches it against `In` to bind the interceptor's generic parameters
+   (`unknown` and `any` match every type),
 3. lowers `Out` with those bindings as the response schema.
+
+A handler without a return type only takes an interceptor whose `Out` doesn't
+depend on `In`: `NestInterceptor<unknown, Envelope<string>>`, or
+`NestInterceptor<T, Envelope<boolean>>`, but not
+`NestInterceptor<T, Envelope<T>>`.
 
 ```ts
 export class PaginateInterceptor<T>
