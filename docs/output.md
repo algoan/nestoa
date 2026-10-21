@@ -6,8 +6,11 @@ For every `@Controller` class in the [included](options/include.md) files,
 including handlers inherited through `extends`:
 
 - **Operations** from `@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`, `@Head`,
-  `@Options` and `@All` (expanded to every method). When several verb
-  decorators are stacked, the topmost one wins, as in NestJS.
+  `@Options`, `@All` (expanded to every method) and `@Sse` (a `GET`). When
+  several verb decorators are stacked, the topmost one wins, as in NestJS.
+  Each operation's `operationId` is `<Controller>_<method>`
+  (`BooksController_findOne`); when one handler serves several paths or
+  methods, the later ones in the document get `_2`, `_3`, ….
 - **Paths** built from the [base path](options/base-path.md), the version, the
   controller path and the route path. A path can be a literal or a constant
   (`ROUTES.LIST`, `` `redirect/${Species.CAT}` ``, `BASE + '/x'`, a string enum
@@ -17,19 +20,64 @@ including handlers inherited through `extends`:
 - **Parameters** from `@Param`, `@Query`, `@Headers` and
   [aliased decorators](options/decorator-aliases.md). An object `@Query()` or
   `@Param()` produces one parameter per property. `@Headers()` without a name,
-  and the `Accept`, `Content-Type` and `Authorization` headers, are left out.
+  and the `Accept`, `Content-Type` and `Authorization` headers, are left out;
+  `Authorization` marks the operation as [secured](options/security.md).
   Pipes shape the parameter: `DefaultValuePipe` makes it optional with a
   `default`, and `ParseIntPipe`, `ParseFloatPipe`, `ParseBoolPipe` and
   `ParseUUIDPipe` set its type.
-- **Request body** from `@Body`.
+- **Request body** from `@Body`, as `application/json`. A file-upload
+  interceptor makes it `multipart/form-data`, see [File uploads](#file-uploads).
 - **Success response** from the return type, after unwrapping `Promise` and
-  `Observable`. The status is `201` for `POST` and `200` otherwise, unless
-  `@HttpCode(...)` says otherwise. Its argument can be a number, a named
-  constant or an enum member such as `HttpStatus.NO_CONTENT`.
+  `Observable`, and after the route's [interceptors](options/interceptors.md).
+  See [Success responses](#success-responses).
 - **Error responses**, see [`errorResponses`](options/error-responses.md).
+- **Security**: each operation lists the [`security`](options/security.md)
+  scheme it needs, or `security: []` when it is public.
 - **Tags**: each operation is tagged with its controller's class name, without
   the `Controller` suffix (`BooksController` → `Books`).
 - **Summaries and descriptions** from [JSDoc](jsdoc.md).
+
+### Success responses
+
+The status is `201` for `POST` and `200` otherwise, unless `@HttpCode(...)`
+says otherwise. Its argument can be a number, a constant (`MULTI_STATUS`,
+`STATUS.ACCEPTED`) or an enum member such as `HttpStatus.NO_CONTENT`.
+
+| Handler | Response |
+| --- | --- |
+| returns a type | that type, as `application/json` |
+| `@Header('Content-Type', 'text/csv')` | the same schema under that media type |
+| returns `StreamableFile` | `type: string`, `format: binary`, as `application/octet-stream` or the `@Header('Content-Type', …)` type |
+| `@Sse()`, even under another verb decorator | `200`, whatever `@HttpCode` says, with `type: string` as `text/event-stream` |
+| `@Redirect(url, status)` | the redirect status (`302` by default, whatever `@HttpCode` says), with a `Location` header and no body |
+| status `204`, `205` or `304` | no body, whatever the return type |
+| no return type | no body, unless an interceptor's output doesn't depend on its input |
+
+A `StreamableFile` class of your own is lowered like any other type. A handler
+returning `{ url, statusCode }` from a `@Redirect` route changes the status at
+runtime, which nestoa doesn't follow.
+
+### File uploads
+
+A handler whose `@UseInterceptors(...)`, on it or on its controller, holds a
+file-upload interceptor from `@nestjs/platform-express` takes a
+`multipart/form-data` body. Each file is a `type: string`, `format: binary`
+property:
+
+| Interceptor | Properties |
+| --- | --- |
+| `FileInterceptor('cover')` | `cover`, one file |
+| `FilesInterceptor('photos', 5)` | `photos`, an array of files with `maxItems: 5` |
+| `FileFieldsInterceptor([{ name: 'front', maxCount: 1 }, { name: 'back' }])` | `front` and `back`, arrays of files |
+| `AnyFilesInterceptor()` | files under any other field name (`additionalProperties`) |
+| `NoFilesInterceptor()` | none: a multipart body of `@Body` fields only |
+
+The `@Body` DTO or `@Body('field')` properties sit beside the files: inline
+for `@Body('field')`, in an `allOf` with the DTO's `$ref` otherwise. The file
+of a `FileInterceptor` or `FilesInterceptor` is required when the
+`@UploadedFile()` / `@UploadedFiles()` parameter isn't optional (`file?:`).
+The `400` of [`validation`](options/error-responses.md#fields) still only
+applies to a route with a `@Body`.
 
 ## How types are lowered
 

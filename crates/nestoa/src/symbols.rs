@@ -481,17 +481,6 @@ impl Project {
         self.resolve_inner(file, name, false, &mut visited)
     }
 
-    /// Resolve a numeric `const` by name, following imports and re-exports the
-    /// same way type resolution does. Used for decorator arguments that name a
-    /// constant, e.g. `@HttpCode(MULTI_STATUS)` where `MULTI_STATUS = 207` is
-    /// declared in (and re-exported from) another module.
-    pub fn resolve_const_number(&self, file: &Path, name: &str) -> Option<f64> {
-        let mut visited: std::collections::HashSet<(PathBuf, String)> =
-            std::collections::HashSet::new();
-        let (_, c) = self.resolve_const_inner(file, name, false, &mut visited)?;
-        numeric_expr(c.init())
-    }
-
     /// The variable `name` refers to in `file`, following imports and
     /// re-exports, with the file declaring it.
     /// A dotted name (`Routes.LIST`) is a constant of a namespace.
@@ -958,17 +947,6 @@ fn to_int32(v: f64) -> i32 {
         return 0;
     }
     (v.trunc() % 4_294_967_296.0) as i64 as u32 as i32
-}
-
-/// The numeric value of an expression that is a number literal, optionally
-/// negated (`207`, `-1`). Returns `None` for anything else.
-fn numeric_expr(expr: &swc_ecma_ast::Expr) -> Option<f64> {
-    use swc_ecma_ast::{Expr, Lit, UnaryOp};
-    match expr {
-        Expr::Lit(Lit::Num(n)) => Some(n.value),
-        Expr::Unary(u) if matches!(u.op, UnaryOp::Minus) => numeric_expr(&u.arg).map(|v| -v),
-        _ => None,
-    }
 }
 
 fn collect_import(i: &ImportDecl, fs: &mut FileSymbols) {
@@ -1613,7 +1591,10 @@ mod tests {
         let app = dir.join("app.ts");
         let (file, _) = project.resolve(&app, "Hidden").expect("Hidden resolves");
         assert_eq!(file, dir.join("real.ts"));
-        assert_eq!(project.resolve_const_number(&app, "LIMIT"), Some(2.0));
+        let (file, _) = project
+            .resolve_const(&app, "LIMIT")
+            .expect("LIMIT resolves");
+        assert_eq!(file, dir.join("limits.ts"));
         assert_eq!(
             resolved_name(&project, &dir.join("uses-ambient.ts"), "Ambient"),
             Some("Ambient".to_string())

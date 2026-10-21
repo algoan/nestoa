@@ -13,10 +13,10 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
 use crate::constval::object_value;
 use crate::dialect;
-use crate::errors::{self, ERROR_SCHEMA_NAME};
+use crate::errors;
 use crate::globalprefix::{Bootstrap, Version, versions};
 use crate::interceptors::{
-    interceptor_class_names, request_body_transform, response_override, rewrite_response,
+    Rewrite, interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
 use crate::jsdoc::JsDoc;
 use crate::schema::{ComponentSchemas, SchemaCtx, decorator_name, describe};
@@ -75,25 +75,29 @@ const ALL_METHODS: [HttpMethod; 8] = [
     HttpMethod::Trace,
 ];
 
-/// A handler's HTTP-verb decorator: a single method, or `@All`.
+/// A handler's HTTP-verb decorator: a single method, `@All`, or `@Sse`.
 #[derive(Clone, Copy)]
 enum VerbDecorator {
     One(HttpMethod),
     All,
+    /// A `GET` streaming server-sent events.
+    Sse,
 }
 
 impl VerbDecorator {
     fn from_name(name: &str) -> Option<Self> {
-        if name == "All" {
-            return Some(Self::All);
+        match name {
+            "All" => Some(Self::All),
+            "Sse" => Some(Self::Sse),
+            _ => HttpMethod::from_decorator(name).map(Self::One),
         }
-        HttpMethod::from_decorator(name).map(Self::One)
     }
 
     fn methods(&self) -> &[HttpMethod] {
         match self {
             Self::One(m) => std::slice::from_ref(m),
             Self::All => &ALL_METHODS,
+            Self::Sse => &[HttpMethod::Get],
         }
     }
 
@@ -117,7 +121,13 @@ pub struct Route {
     pub parameters: Vec<RouteParam>,
     pub request_body: Option<RequestBody>,
     pub response: Option<Value>,
+    /// The media type of `response`.
+    pub response_media_type: String,
     pub status_code: u16,
+    /// Set by `@Redirect`: the success response is a redirect with a
+    /// `Location` header.
+    pub redirect: bool,
+    pub security: AuthRequirement,
     pub tags: Vec<String>,
     /// Error responses (`status -> description`), reconstructed from guards,
     /// pipes, validation, and declared throws. Every one references the shared
@@ -154,6 +164,39 @@ pub struct RequestBody {
     pub schema: Value,
     pub required: bool,
     pub description: Option<String>,
+    pub media_type: &'static str,
+}
+
+/// Whether an operation needs the configured security scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRequirement {
+    None,
+    Required,
+    /// Credentials are read when sent, as by an optional `Authorization`
+    /// header.
+    Optional,
+}
+
+const JSON: &str = "application/json";
+const MULTIPART: &str = "multipart/form-data";
+
+/// What a file-upload interceptor (`FileInterceptor('cover')`) reads from a
+/// multipart body.
+#[derive(Clone)]
+enum Upload {
+    Fields(Vec<FileField>),
+    /// `AnyFilesInterceptor`: files under any field name.
+    Any,
+}
+
+#[derive(Clone)]
+struct FileField {
+    name: String,
+    array: bool,
+    max_count: Option<Value>,
+    /// The single field of a `FileInterceptor`/`FilesInterceptor`, which a
+    /// non-optional `@UploadedFile()`/`@UploadedFiles()` parameter requires.
+    single: bool,
 }
 
 /// What a controller contributes to each of its handlers' routes.
@@ -169,6 +212,8 @@ struct ClassCtx<'c> {
     opted_out: bool,
     has_roles: bool,
     guarded: bool,
+    /// File-upload interceptors in the controller's `@UseInterceptors`.
+    uploads: Vec<Upload>,
 }
 
 pub struct Extractor<'a> {
@@ -255,6 +300,7 @@ impl<'a> Extractor<'a> {
             opted_out: has_any_decorator(&class.decorators, &er.auth_opt_out),
             has_roles: has_any_decorator(&class.decorators, &er.role_decorators),
             guarded: has_use_guards(&class.decorators, &er.auth_guards),
+            uploads: self.uploads(file, &class.decorators),
         };
         let mut seen = std::collections::HashSet::new();
         let mut owner = (file.to_path_buf(), None::<crate::symbols::Shared<Class>>);
@@ -330,6 +376,10 @@ impl<'a> Extractor<'a> {
         let mut http: Option<(VerbDecorator, &Decorator)> = None;
         let mut deprecated = false;
         let mut http_code: Option<u16> = None;
+        // `@Redirect(url, status)` answers with its own status, 302 by
+        // default, whatever `@HttpCode` says.
+        let mut redirect_code: Option<u16> = None;
+        let mut content_type: Option<String> = None;
         for d in &m.function.decorators {
             let name = decorator_name(d);
             if let Some(verb) = VerbDecorator::from_name(&name) {
@@ -338,19 +388,28 @@ impl<'a> Extractor<'a> {
                 }
                 continue;
             }
-            if name == "HttpCode" {
-                // `@HttpCode(207)` — a literal — or `@HttpCode(MULTI_STATUS)`,
-                // where the argument names a numeric `const` (possibly
-                // imported from another module, e.g. a shared constants package).
-                http_code = numeric_arg(d)
-                    .or_else(|| {
-                        ident_arg(d)
-                            .and_then(|c| self.project.resolve_const_number(file, &c))
-                            .map(|v| v as u16)
-                    })
-                    .or_else(|| {
-                        member_arg(d).and_then(|(obj, prop)| self.member_status(file, &obj, &prop))
-                    });
+            match name.as_str() {
+                "HttpCode" => http_code = first_arg(d).and_then(|e| self.status_value(file, e)),
+                // Decorators apply bottom-up: the topmost redirect is sent.
+                "Redirect" if redirect_code.is_none() => {
+                    redirect_code = Some(
+                        nth_arg(d, 1)
+                            .and_then(|e| self.status_value(file, e))
+                            .unwrap_or(302),
+                    );
+                }
+                "Header" => {
+                    let arg = |i| {
+                        nth_arg(d, i).and_then(|e| crate::constval::string(self.project, file, e))
+                    };
+                    // Headers are set bottom-up, so the topmost one is sent.
+                    if content_type.is_none()
+                        && arg(0).is_some_and(|h| h.eq_ignore_ascii_case("Content-Type"))
+                    {
+                        content_type = arg(1);
+                    }
+                }
+                _ => {}
             }
         }
         let Some((verb, verb_decorator)) = http else {
@@ -447,7 +506,16 @@ impl<'a> Extractor<'a> {
         let mut params: Vec<RouteParam> = Vec::new();
         let mut request_body: Option<RequestBody> = None;
         let mut body_fields: Vec<BodyField> = Vec::new();
+        // `@Headers('Authorization')`: `Some(required)`.
+        let mut reads_authorization: Option<bool> = None;
+        let mut file_param_required = false;
         for p in &m.function.params {
+            if p.decorators
+                .iter()
+                .any(|d| matches!(decorator_name(d).as_str(), "UploadedFile" | "UploadedFiles"))
+            {
+                file_param_required |= !extract_pat(&p.pat).optional;
+            }
             if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                 match parsed {
                     ParsedParam::Routed(rps) => {
@@ -473,6 +541,9 @@ impl<'a> Extractor<'a> {
                     }
                     ParsedParam::Body(b) => request_body = Some(b),
                     ParsedParam::BodyField(f) => body_fields.push(f),
+                    ParsedParam::Authorization { required } => {
+                        reads_authorization = Some(reads_authorization == Some(true) || required);
+                    }
                     ParsedParam::Ignored => {}
                 }
             }
@@ -487,13 +558,39 @@ impl<'a> Extractor<'a> {
         if let Some(body) = request_body.as_mut() {
             request_body_transform(self.config, &interceptor_names, body);
         }
+        // A global `ValidationPipe` validates the `@Body`, not the files.
+        let has_body = request_body.is_some();
+        let mut uploads = class.uploads.clone();
+        uploads.extend(self.uploads(file, &m.function.decorators));
+        if !uploads.is_empty() {
+            request_body = Some(multipart_body(
+                request_body,
+                &uploads,
+                file_param_required,
+                self.components,
+            ));
+        }
 
         // Response type. An interceptor may reshape the wire response (e.g.
         // pagination); when it does, the rewritten schema replaces the
         // declared return type — and we skip lowering the declared type at
         // all so its now-unreferenced components don't leak into the doc.
-        let mut response_value: Option<Value> = None;
-        if let Some(ret) = m.function.return_type.as_ref() {
+        // `@Sse` marks an event stream even under another verb decorator.
+        let sse = m
+            .function
+            .decorators
+            .iter()
+            .any(|d| decorator_name(d) == "Sse");
+        let declared_return = m.function.return_type.as_ref().map(|r| &*r.type_ann);
+        let (response_value, response_media_type) = if redirect_code.is_some() {
+            (None, JSON.to_string())
+        } else if sse {
+            (
+                Some(json!({ "type": "string" })),
+                "text/event-stream".to_string(),
+            )
+        } else {
+            let project = self.project;
             let rewritten = if interceptor_names.is_empty() {
                 None
             } else {
@@ -501,28 +598,45 @@ impl<'a> Extractor<'a> {
                     self.project,
                     self.config,
                     file,
-                    &ret.type_ann,
+                    declared_return,
                     &interceptor_names,
                     self.components,
+                    |f, t| is_streamable_file(project, f, t),
                 )
             };
-            if rewritten.is_some() {
-                response_value = rewritten;
-            } else {
-                let mut ctx = SchemaCtx {
-                    project: self.project,
-                    components: self.components,
-                    type_env: None,
-                    current_owner: None,
-                    instantiating: Vec::new(),
-                    passthrough_types: &self.config.passthrough_types,
-                };
-                let schema = ctx.ts_type_to_schema(file, &ret.type_ann);
-                if !schema.is_null() && schema != json!({}) {
-                    response_value = Some(schema);
+            let binary = || {
+                (
+                    Some(json!({ "type": "string", "format": "binary" })),
+                    content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                )
+            };
+            let json_type = || content_type.clone().unwrap_or_else(|| JSON.to_string());
+            match rewritten {
+                Some(Rewrite::Schema(schema)) => (Some(schema), json_type()),
+                Some(Rewrite::File) => binary(),
+                Some(Rewrite::Empty) => (None, json_type()),
+                None if declared_return.is_some_and(|t| is_streamable_file(project, file, t)) => {
+                    binary()
+                }
+                None => {
+                    let mut ctx = SchemaCtx {
+                        project: self.project,
+                        components: self.components,
+                        type_env: None,
+                        current_owner: None,
+                        instantiating: Vec::new(),
+                        passthrough_types: &self.config.passthrough_types,
+                    };
+                    let response = declared_return.and_then(|t| {
+                        let schema = ctx.ts_type_to_schema(file, t);
+                        (!schema.is_null() && schema != json!({})).then_some(schema)
+                    });
+                    (response, json_type())
                 }
             }
-        }
+        };
 
         // `@route-mapping` lets one method serving several paths return a
         // distinct schema per path, keyed by a trailing path suffix. Resolve
@@ -548,7 +662,11 @@ impl<'a> Extractor<'a> {
                 .collect()
         };
 
-        let status_code = http_code.unwrap_or(verb.default_status());
+        // Nest writes an event stream's head with 200, whatever `@HttpCode` says.
+        let status_code = redirect_code
+            .or(sse.then_some(200))
+            .or(http_code)
+            .unwrap_or(verb.default_status());
 
         // Error-response signals for this method (path-independent parts).
         // The auth opt-out and role decorators apply if present on either the
@@ -565,6 +683,12 @@ impl<'a> Extractor<'a> {
                 class_guarded || has_use_guards(&m.function.decorators, &er.auth_guards)
             }
             AuthScope::None => false,
+        };
+        let security = match reads_authorization {
+            _ if auth_active && !opted_out => AuthRequirement::Required,
+            Some(true) => AuthRequirement::Required,
+            Some(false) => AuthRequirement::Optional,
+            None => AuthRequirement::None,
         };
         let pipe_names: Vec<String> = m
             .function
@@ -590,25 +714,34 @@ impl<'a> Extractor<'a> {
             parameters: params,
             request_body,
             response: None,
+            response_media_type,
             status_code,
+            redirect: redirect_code.is_some(),
+            security,
             tags: vec![tag.to_string()],
             errors: BTreeMap::new(),
             catch_all: matches!(verb, VerbDecorator::All),
             handler,
             file: file.to_path_buf(),
         };
-        let has_body = template.request_body.is_some();
         for (method, concrete) in &full_paths {
             let method = *method;
             let full_path = concrete.path.clone();
             // A `@route-mapping` match is the most specific author intent, so
             // it wins over an interceptor override or the declared return type.
-            let response = route_mapping
+            let overridden = route_mapping
                 .iter()
                 .find(|(suffix, _)| path_matches_suffix(&full_path, suffix))
                 .map(|(_, schema)| schema.clone())
-                .or_else(|| response_override(self.config, &interceptor_names, &full_path))
-                .or_else(|| response_value.clone());
+                .or_else(|| response_override(self.config, &interceptor_names, &full_path));
+            // An overriding schema is a JSON payload, not the file or stream.
+            let response_media_type = match &overridden {
+                Some(_) => content_type.clone().unwrap_or_else(|| JSON.to_string()),
+                None => template.response_media_type.clone(),
+            };
+            let response = overridden
+                .or_else(|| response_value.clone())
+                .filter(|_| !template.redirect);
             let signals = errors::RouteSignals {
                 auth_active,
                 auth_opted_out: opted_out,
@@ -629,6 +762,7 @@ impl<'a> Extractor<'a> {
                 ),
                 path: full_path,
                 response,
+                response_media_type,
                 errors: route_errors,
                 ..template.clone()
             });
@@ -752,6 +886,131 @@ impl<'a> Extractor<'a> {
             .unwrap_or_else(|| "argument".to_string()))
     }
 
+    /// The status a `@HttpCode` or `@Redirect` argument names: a number, a
+    /// numeric constant, possibly imported, or an enum member.
+    fn status_value(&self, file: &Path, e: &Expr) -> Option<u16> {
+        if let Some(crate::symbols::EnumValue::Num(n)) =
+            crate::constval::value(self.project, file, e)
+        {
+            return Some(n as u16);
+        }
+        let Expr::Member(m) = crate::constval::unwrap(e) else {
+            return None;
+        };
+        match (m.obj.as_ref(), &m.prop) {
+            (Expr::Ident(obj), swc_ecma_ast::MemberProp::Ident(prop)) => {
+                self.member_status(file, &obj.sym, &prop.sym)
+            }
+            _ => None,
+        }
+    }
+
+    /// The file-upload interceptors of `@UseInterceptors(...)` decorators:
+    /// `FileInterceptor('cover')`, `FilesInterceptor('photos', 5)`,
+    /// `FileFieldsInterceptor([{ name, maxCount }])`, `AnyFilesInterceptor()`,
+    /// and `NoFilesInterceptor()`, a multipart body without files.
+    fn uploads(&self, file: &Path, decorators: &[Decorator]) -> Vec<Upload> {
+        let mut out = Vec::new();
+        for d in decorators {
+            let Expr::Call(call) = &*d.expr else { continue };
+            if decorator_name(d) != "UseInterceptors" {
+                continue;
+            }
+            for arg in &call.args {
+                let Expr::Call(c) = crate::constval::unwrap(&arg.expr) else {
+                    continue;
+                };
+                let Callee::Expr(callee) = &c.callee else {
+                    continue;
+                };
+                let Some(dotted) = crate::constval::dotted_name(callee) else {
+                    continue;
+                };
+                // Matched by the name it is exported as (`FileInterceptor as
+                // Upload`), and only from Nest's Express platform when imported.
+                let kind = match package_origin(self.project, file, &dotted) {
+                    Some((package, exported)) if package == "@nestjs/platform-express" => exported,
+                    Some(_) => continue,
+                    // A local factory of the same name is not Nest's.
+                    None if self.project.resolve(file, &dotted).is_some()
+                        || self.project.resolve_const(file, &dotted).is_some() =>
+                    {
+                        continue;
+                    }
+                    None => dotted.rsplit('.').next().unwrap_or_default().to_string(),
+                };
+                let arg = |i: usize| c.args.get(i).map(|a| &*a.expr);
+                let name = |e: Option<&Expr>| {
+                    let e = e?;
+                    let name = crate::constval::string(self.project, file, e);
+                    if name.is_none() {
+                        crate::diag::warn(format!(
+                            "cannot evaluate a field name of {kind}(…); the file is left out"
+                        ));
+                    }
+                    name
+                };
+                let count = |e: Option<&Expr>| match crate::constval::value(self.project, file, e?)?
+                {
+                    crate::symbols::EnumValue::Num(n) => Some(crate::schema::number_json(n)),
+                    crate::symbols::EnumValue::Str(_) => None,
+                };
+                let field = |name, array, max_count, single| FileField {
+                    name,
+                    array,
+                    max_count,
+                    single,
+                };
+                out.push(match kind.as_str() {
+                    "FileInterceptor" => Upload::Fields(
+                        name(arg(0))
+                            .map(|n| field(n, false, None, true))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "FilesInterceptor" => Upload::Fields(
+                        name(arg(0))
+                            .map(|n| field(n, true, count(arg(1)), true))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "FileFieldsInterceptor" => {
+                        let Some(Expr::Array(fields)) = arg(0).map(crate::constval::unwrap) else {
+                            crate::diag::warn(format!(
+                                "cannot read the fields of {kind}(…); the files are left out"
+                            ));
+                            out.push(Upload::Fields(Vec::new()));
+                            continue;
+                        };
+                        Upload::Fields(
+                            fields
+                                .elems
+                                .iter()
+                                .flatten()
+                                .filter_map(|e| match crate::constval::unwrap(&e.expr) {
+                                    Expr::Object(o) => {
+                                        let n = name(object_value(o, "name").as_ref())?;
+                                        Some(field(
+                                            n,
+                                            true,
+                                            count(object_value(o, "maxCount").as_ref()),
+                                            false,
+                                        ))
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                        )
+                    }
+                    "AnyFilesInterceptor" => Upload::Any,
+                    "NoFilesInterceptor" => Upload::Fields(Vec::new()),
+                    _ => continue,
+                });
+            }
+        }
+        out
+    }
+
     /// The status named by `@HttpCode(<Enum>.<MEMBER>)`: a member of an enum
     /// in the symbol table, or of NestJS's `HttpStatus`, whose declarations are
     /// not parsed unless `@nestjs/common` is in `resolvePackages`.
@@ -860,6 +1119,11 @@ impl<'a> Extractor<'a> {
         if let DecoratorKind::Header = location {
             match &decorator_arg {
                 None => return Some(ParsedParam::Ignored),
+                Some(h) if h.eq_ignore_ascii_case("Authorization") => {
+                    return Some(ParsedParam::Authorization {
+                        required: !extract_pat(&p.pat).optional,
+                    });
+                }
                 Some(h) if IGNORED_HEADERS.iter().any(|i| h.eq_ignore_ascii_case(i)) => {
                     return Some(ParsedParam::Ignored);
                 }
@@ -913,6 +1177,7 @@ impl<'a> Extractor<'a> {
                 schema,
                 required: !pat_info.optional,
                 description,
+                media_type: JSON,
             })),
             DecoratorKind::Param | DecoratorKind::Query if body_field.is_none() => {
                 let location = match location {
@@ -1076,6 +1341,38 @@ fn pipe_effects(
 
 /// The class an expression names, by its last segment: `ParseIntPipe` for
 /// `ParseIntPipe` or `Common.ParseIntPipe`.
+/// Whether a handler returns NestJS's `StreamableFile`, which is sent as raw
+/// bytes. A project type of that name is a JSON schema like any other.
+fn is_streamable_file(project: &Project, file: &Path, ty: &TsType) -> bool {
+    let TsType::TsTypeRef(r) = crate::interceptors::unwrap_async(ty) else {
+        return false;
+    };
+    let name = entity_name(&r.type_name);
+    match package_origin(project, file, &name) {
+        Some((package, exported)) => {
+            package.starts_with("@nestjs/") && exported == "StreamableFile"
+        }
+        None => name == "StreamableFile" && project.resolve(file, &name).is_none(),
+    }
+}
+
+/// The package a name (`FileInterceptor`, or `ns.FileInterceptor` through a
+/// namespace import) comes from, with its exported name there.
+fn package_origin(project: &Project, file: &Path, name: &str) -> Option<(String, String)> {
+    match name.rsplit_once('.') {
+        Some((ns, member)) => project.namespace_member_origin(file, ns, member),
+        None => project.import_origin(file, name),
+    }
+}
+
+/// `A` or `ns.A`.
+fn entity_name(name: &TsEntityName) -> String {
+    match name {
+        TsEntityName::Ident(i) => i.sym.to_string(),
+        TsEntityName::TsQualifiedName(q) => format!("{}.{}", entity_name(&q.left), q.right.sym),
+    }
+}
+
 fn class_name(expr: &Expr) -> Option<String> {
     crate::constval::dotted_name(expr).map(|n| n.rsplit('.').next().unwrap_or_default().to_string())
 }
@@ -1233,6 +1530,11 @@ enum ParsedParam {
     Routed(Vec<RouteParam>),
     Body(RequestBody),
     BodyField(BodyField),
+    /// `@Headers('Authorization')`, which documents credentials rather than
+    /// a parameter.
+    Authorization {
+        required: bool,
+    },
     Ignored,
 }
 
@@ -1242,6 +1544,109 @@ struct BodyField {
     required: bool,
     schema: Value,
     description: Option<String>,
+}
+
+/// The `multipart/form-data` body of a handler with file-upload interceptors:
+/// the JSON `body`'s fields, if any, beside the files.
+fn multipart_body(
+    body: Option<RequestBody>,
+    uploads: &[Upload],
+    file_param_required: bool,
+    components: &ComponentSchemas,
+) -> RequestBody {
+    let binary = json!({ "type": "string", "format": "binary" });
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    let mut any_file = false;
+    for upload in uploads {
+        match upload {
+            Upload::Any => any_file = true,
+            Upload::Fields(fields) => {
+                for f in fields {
+                    let mut schema = binary.clone();
+                    if f.array {
+                        schema = json!({ "type": "array", "items": schema });
+                        if let Some(max) = &f.max_count {
+                            schema["maxItems"] = max.clone();
+                        }
+                    }
+                    if f.single && file_param_required {
+                        required.push(Value::String(f.name.clone()));
+                    }
+                    properties.insert(f.name.clone(), schema);
+                }
+            }
+        }
+    }
+    let files_required = !required.is_empty();
+    let (schema, body_required, description) = match body {
+        Some(b) => (b.schema, b.required, b.description),
+        None => (json!({ "type": "object" }), false, None),
+    };
+    let inline = schema.get("type") == Some(&json!("object")) && schema.get("$ref").is_none();
+    let schema = if inline {
+        let mut schema = schema;
+        let object = schema.as_object_mut().expect("an object schema");
+        if !properties.is_empty() {
+            let props = object
+                .entry("properties")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(props) = props.as_object_mut() {
+                props.extend(properties);
+            }
+        }
+        if files_required {
+            let req = object
+                .entry("required")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(req) = req.as_array_mut() {
+                req.extend(required);
+            }
+        }
+        // Applies to the fields `properties` doesn't name.
+        if any_file {
+            // A dictionary body (`Record<string, number>`) keeps its values.
+            let files = match object.remove("additionalProperties") {
+                Some(values) if values.is_object() => json!({ "anyOf": [values, binary] }),
+                _ => binary,
+            };
+            object.insert("additionalProperties".into(), files);
+        }
+        schema
+    } else {
+        let mut files = json!({ "type": "object", "properties": properties });
+        if files_required {
+            files["required"] = Value::Array(required);
+        }
+        // `additionalProperties` only spares the fields its own branch names,
+        // so the body's fields are named there too, unconstrained.
+        let body_fields = any_file
+            .then(|| object_members(&schema, components))
+            .flatten();
+        if let Some((fields, _)) = body_fields {
+            for (name, _) in fields {
+                files["properties"]
+                    .as_object_mut()
+                    .expect("an object")
+                    .entry(name)
+                    .or_insert_with(|| json!({}));
+            }
+            files["additionalProperties"] = binary;
+        }
+        if files["properties"].as_object().is_some_and(Map::is_empty)
+            && files.get("additionalProperties").is_none()
+        {
+            schema
+        } else {
+            json!({ "allOf": [schema, files] })
+        }
+    };
+    RequestBody {
+        schema,
+        required: body_required || files_required,
+        description,
+        media_type: MULTIPART,
+    }
 }
 
 /// The object body assembled from a handler's `@Body('field')` parameters.
@@ -1276,6 +1681,7 @@ fn body_from_fields(fields: Vec<BodyField>) -> RequestBody {
         schema,
         required: any_required,
         description: None,
+        media_type: JSON,
     }
 }
 
@@ -1334,46 +1740,12 @@ fn first_arg(d: &Decorator) -> Option<&Expr> {
     Some(&call.args.first()?.expr)
 }
 
-fn numeric_arg(d: &swc_ecma_ast::Decorator) -> Option<u16> {
-    let call = match &*d.expr {
-        Expr::Call(c) => c,
-        _ => return None,
-    };
-    let first = call.args.first()?;
-    if let Expr::Lit(Lit::Num(n)) = first.expr.as_ref() {
-        return Some(n.value as u16);
-    }
-    None
-}
-
-/// The identifier name of a decorator's first argument, e.g. `MULTI_STATUS` in
-/// `@HttpCode(MULTI_STATUS)`. `None` when the argument is not a bare identifier.
-fn ident_arg(d: &swc_ecma_ast::Decorator) -> Option<String> {
-    let call = match &*d.expr {
-        Expr::Call(c) => c,
-        _ => return None,
-    };
-    match call.args.first()?.expr.as_ref() {
-        Expr::Ident(i) => Some(i.sym.to_string()),
-        _ => None,
-    }
-}
-
-/// The `(object, property)` names of a decorator's first argument when it is a
-/// plain member access, e.g. `("HttpStatus", "NO_CONTENT")`.
-fn member_arg(d: &swc_ecma_ast::Decorator) -> Option<(String, String)> {
+/// A decorator call's argument at `index`.
+fn nth_arg(d: &Decorator, index: usize) -> Option<&Expr> {
     let Expr::Call(call) = &*d.expr else {
         return None;
     };
-    let Expr::Member(m) = call.args.first()?.expr.as_ref() else {
-        return None;
-    };
-    match (m.obj.as_ref(), &m.prop) {
-        (Expr::Ident(obj), swc_ecma_ast::MemberProp::Ident(prop)) => {
-            Some((obj.sym.to_string(), prop.sym.to_string()))
-        }
-        _ => None,
-    }
+    Some(&call.args.get(index)?.expr)
 }
 
 /// Whether any decorator in `decorators` has one of the given names.
@@ -1801,13 +2173,17 @@ fn normalize_segment(s: &str) -> String {
 pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
     components.resolve_deferred();
     // Register the shared error-body schema once, if any route emits an error
-    // response. Tree-shaking below drops it if nothing ends up referencing it.
+    // response, under a name no project schema takes. Tree-shaking below
+    // drops it if nothing ends up referencing it.
+    let error_schema_name = errors::error_schema_name(|n| components.schemas.contains_key(n));
     if routes.iter().any(|r| !r.errors.is_empty()) {
         components
             .schemas
-            .entry(ERROR_SCHEMA_NAME.to_string())
-            .or_insert_with(errors::error_schema);
+            .insert(error_schema_name.clone(), errors::error_schema());
     }
+    let error_ref = json!({ "$ref": format!("#/components/schemas/{error_schema_name}") });
+    let security = config.security.enabled.then_some(&config.security);
+    let mut secured = false;
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
     // NestJS registers handlers in declaration order and the router serves the
     // first match, so an `@All` and an explicit verb on the same method and path
@@ -1853,6 +2229,11 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         if let Some(d) = &r.description {
             op.insert("description".into(), Value::String(d.clone()));
         }
+        // Made unique once the paths are sorted.
+        op.insert(
+            "operationId".into(),
+            Value::String(r.handler.replace('.', "_")),
+        );
         if r.deprecated {
             op.insert("deprecated".into(), Value::Bool(true));
         }
@@ -1896,7 +2277,7 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             let mut content = Map::new();
             let mut media = Map::new();
             media.insert("schema".into(), body.schema.clone());
-            content.insert("application/json".into(), Value::Object(media));
+            content.insert(body.media_type.into(), Value::Object(media));
             let mut rb = Map::new();
             rb.insert("required".into(), Value::Bool(body.required));
             if let Some(d) = &body.description {
@@ -1912,11 +2293,17 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             "description".into(),
             Value::String(default_status_text(r.status_code).to_string()),
         );
-        if let Some(schema) = &r.response {
+        if r.redirect {
+            status.insert(
+                "headers".into(),
+                json!({ "Location": { "description": "The redirect target", "schema": { "type": "string" } } }),
+            );
+        }
+        if let Some(schema) = r.response.as_ref().filter(|_| !bodiless(r.status_code)) {
             let mut content = Map::new();
             let mut media = Map::new();
             media.insert("schema".into(), schema.clone());
-            content.insert("application/json".into(), Value::Object(media));
+            content.insert(r.response_media_type.clone(), Value::Object(media));
             status.insert("content".into(), Value::Object(content));
         }
         responses.insert(r.status_code.to_string(), Value::Object(status));
@@ -1932,15 +2319,24 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             status.insert("description".into(), Value::String(description.clone()));
             let mut content = Map::new();
             let mut media = Map::new();
-            media.insert(
-                "schema".into(),
-                json!({ "$ref": format!("#/components/schemas/{ERROR_SCHEMA_NAME}") }),
-            );
+            media.insert("schema".into(), error_ref.clone());
             content.insert("application/json".into(), Value::Object(media));
             status.insert("content".into(), Value::Object(content));
             responses.insert(code.to_string(), Value::Object(status));
         }
         op.insert("responses".into(), Value::Object(responses));
+        if let Some(scheme) = security {
+            let requirement = json!({ scheme.name.clone(): [] });
+            // An empty requirement lets the request go without credentials; an
+            // empty list says outright that the operation is public.
+            let requirements = match r.security {
+                AuthRequirement::None => json!([]),
+                AuthRequirement::Required => json!([requirement]),
+                AuthRequirement::Optional => json!([{}, requirement]),
+            };
+            secured |= r.security != AuthRequirement::None;
+            op.insert("security".into(), requirements);
+        }
         entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
 
@@ -1954,9 +2350,22 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
     sorted_paths.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut paths_json: Map<String, Value> = Map::new();
+    let mut operation_ids = std::collections::HashSet::new();
     for (p, ops) in sorted_paths {
         let mut sorted_ops: Vec<(String, Value)> = ops.into_iter().collect();
         sorted_ops.sort_by(|a, b| a.0.cmp(&b.0));
+        // A handler serving several paths or methods numbers its later
+        // operations, in document order.
+        for (_, op) in &mut sorted_ops {
+            let base = op["operationId"].as_str().unwrap_or_default().to_string();
+            let mut id = base.clone();
+            let mut n = 1;
+            while !operation_ids.insert(id.clone()) {
+                n += 1;
+                id = format!("{base}_{n}");
+            }
+            op["operationId"] = Value::String(id);
+        }
         paths_json.insert(p, Value::Object(sorted_ops.into_iter().collect()));
     }
 
@@ -1989,11 +2398,19 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         .into_iter()
         .filter(|(name, _)| reachable.contains(name))
         .collect();
+    let mut comp = Map::new();
     if !schema_pairs.is_empty() {
         schema_pairs.sort_by(|a, b| a.0.cmp(&b.0));
         let schemas: Map<String, Value> = schema_pairs.into_iter().collect();
-        let mut comp = Map::new();
         comp.insert("schemas".into(), Value::Object(schemas));
+    }
+    if let Some(scheme) = security.filter(|_| secured) {
+        comp.insert(
+            "securitySchemes".into(),
+            json!({ scheme.name.clone(): scheme.scheme.clone() }),
+        );
+    }
+    if !comp.is_empty() {
         root.insert("components".into(), Value::Object(comp));
     }
     let mut doc = Value::Object(root);
@@ -2060,14 +2477,27 @@ fn reachable_schemas(
     reachable
 }
 
+/// Statuses whose response never carries a body.
+fn bodiless(code: u16) -> bool {
+    matches!(code, 204 | 205 | 304)
+}
+
 fn default_status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
         201 => "Created",
         202 => "Accepted",
+        203 => "Non-Authoritative Information",
         204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        207 => "Multi-Status",
         301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -3222,9 +3652,9 @@ mod tests {
         assert_eq!(status(HttpMethod::Delete, "/items/{id}"), 204);
         assert_eq!(status(HttpMethod::Post, "/items"), 200);
         assert_eq!(status(HttpMethod::Put, "/items/{id}"), 203);
-        // Not an enum, or a member whose implicit value follows an unsupported
-        // initialiser: falls back to the method default.
-        assert_eq!(status(HttpMethod::Patch, "/items/{id}"), 200);
+        assert_eq!(status(HttpMethod::Patch, "/items/{id}"), 299);
+        // A member whose implicit value follows an unsupported initialiser
+        // falls back to the method default.
         assert_eq!(status(HttpMethod::Get, "/items/{id}"), 200);
     }
 
@@ -3464,7 +3894,10 @@ mod tests {
             parameters: vec![],
             request_body: None,
             response: None,
+            response_media_type: JSON.to_string(),
             status_code: 200,
+            redirect: false,
+            security: AuthRequirement::None,
             tags: vec![],
             errors: BTreeMap::new(),
             catch_all: false,
@@ -3647,5 +4080,653 @@ mod tests {
 
         let doc = to_openapi(&Config::default(), &routes, components);
         assert!(doc.as_object().unwrap().get("components").is_none());
+    }
+
+    /// The document of one in-memory controller file, under `config`.
+    fn document_with(name: &str, body: &str, config: Config) -> Value {
+        let (routes, components) =
+            extract_with(name, &[("ctrl.ts", body)], &["ctrl.ts"], config.clone());
+        to_openapi(&config, &routes, components)
+    }
+
+    fn document(name: &str, body: &str) -> Value {
+        document_with(name, body, Config::default())
+    }
+
+    fn status_codes(doc: &Value, path: &str, method: &str) -> Vec<String> {
+        doc["paths"][path][method]["responses"]
+            .as_object()
+            .unwrap_or_else(|| panic!("no {method} {path} in {doc}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn redirect_answers_with_its_status_and_no_content() {
+        let doc = document(
+            "redirect",
+            r#"
+            import { HttpStatus } from '@nestjs/common';
+            const MOVED = 301;
+            @Controller('links')
+            export class LinksController {
+                @Get('docs') @Redirect('https://docs.example.com', MOVED) docs(): void {}
+                @Get('home') @Redirect('/') home(): void {}
+                @Get('stacked') @Redirect('/a', 301) @Redirect('/b', 307) stacked(): void {}
+                @Get('next') @HttpCode(200) @Redirect('/new', HttpStatus.TEMPORARY_REDIRECT)
+                next(): { url: string } { return { url: '/x' }; }
+            }
+            "#,
+        );
+        for (path, code) in [
+            ("/links/docs", "301"),
+            ("/links/home", "302"),
+            ("/links/next", "307"),
+            ("/links/stacked", "301"),
+        ] {
+            assert_eq!(status_codes(&doc, path, "get"), [code, "401"], "{path}");
+            let success = &doc["paths"][path]["get"]["responses"][code];
+            assert!(success.get("content").is_none(), "{path}: {success}");
+            assert_eq!(
+                success["headers"]["Location"]["schema"],
+                json!({"type": "string"})
+            );
+        }
+    }
+
+    #[test]
+    fn sse_is_a_get_streaming_events() {
+        let doc = document(
+            "sse",
+            r#"
+            @Controller('feed')
+            export class FeedController {
+                @Sse('events') events(): Observable<MessageEvent> { return null as any; }
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/feed/events"]["get"]["responses"]["200"]["content"],
+            json!({"text/event-stream": {"schema": {"type": "string"}}})
+        );
+    }
+
+    #[test]
+    fn files_and_content_type_headers_set_the_media_type() {
+        let doc = document(
+            "streamable",
+            r#"
+            import { StreamableFile as Download } from '@nestjs/common';
+            @Controller('books')
+            export class BooksController {
+                @Get('export') export(): StreamableFile { return null as any; }
+                @Get('download') download(): Download { return null as any; }
+                @Get('cover') @Header('Content-Type', 'image/png')
+                cover(): Promise<StreamableFile> { return null as any; }
+                @Get('csv') @Header('content-type', 'text/csv') csv(): string { return ''; }
+                @Get('etag') @Header('ETag', 'x') etag(): string { return ''; }
+            }
+            "#,
+        );
+        let content = |path: &str| doc["paths"][path]["get"]["responses"]["200"]["content"].clone();
+        let binary = json!({"type": "string", "format": "binary"});
+        assert_eq!(
+            content("/books/export"),
+            json!({"application/octet-stream": {"schema": binary}})
+        );
+        assert_eq!(
+            content("/books/download"),
+            json!({"application/octet-stream": {"schema": binary}})
+        );
+        assert_eq!(
+            content("/books/cover"),
+            json!({"image/png": {"schema": binary}})
+        );
+        assert_eq!(
+            content("/books/csv"),
+            json!({"text/csv": {"schema": {"type": "string"}}})
+        );
+        assert_eq!(
+            content("/books/etag"),
+            json!({"application/json": {"schema": {"type": "string"}}})
+        );
+    }
+
+    #[test]
+    fn a_project_streamable_file_is_a_json_schema() {
+        let doc = document(
+            "streamable-shadow",
+            r#"
+            class StreamableFile { name: string; }
+            @Controller('books')
+            export class BooksController {
+                @Get('export') export(): StreamableFile { return null as any; }
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books/export"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"],
+            json!({"$ref": "#/components/schemas/StreamableFile"})
+        );
+    }
+
+    #[test]
+    fn file_uploads_are_multipart_bodies() {
+        let doc = document(
+            "uploads",
+            r#"
+            export class CoverDto { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Post('cover') @UseInterceptors(FileInterceptor('cover'))
+                cover(@UploadedFile() cover: Express.Multer.File, @Body() dto: CoverDto): void {}
+
+                @Post('photos') @UseInterceptors(FilesInterceptor('photos', 5))
+                photos(@UploadedFiles() photos?: Express.Multer.File[]): void {}
+
+                @Post('scan')
+                @UseInterceptors(FileFieldsInterceptor([{ name: 'front', maxCount: 1 }, { name: 'back' }]))
+                scan(@UploadedFiles() files: { front?: Express.Multer.File[] }, @Body('note') note: string): void {}
+
+                @Post('any') @UseInterceptors(AnyFilesInterceptor())
+                any(@UploadedFiles() files: Express.Multer.File[]): void {}
+            }
+            "#,
+        );
+        let body = |path: &str| doc["paths"][path]["post"]["requestBody"].clone();
+        let binary = json!({"type": "string", "format": "binary"});
+        assert_eq!(
+            body("/books/cover"),
+            json!({"required": true, "content": {"multipart/form-data": {"schema": {"allOf": [
+                {"$ref": "#/components/schemas/CoverDto"},
+                {"type": "object", "properties": {"cover": binary}, "required": ["cover"]},
+            ]}}}})
+        );
+        assert_eq!(
+            body("/books/photos"),
+            json!({"required": false, "content": {"multipart/form-data": {"schema": {
+                "type": "object",
+                "properties": {"photos": {"type": "array", "items": binary, "maxItems": 5}},
+            }}}})
+        );
+        assert_eq!(
+            body("/books/scan")["content"]["multipart/form-data"]["schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string"},
+                    "front": {"type": "array", "items": binary, "maxItems": 1},
+                    "back": {"type": "array", "items": binary},
+                },
+                "required": ["note"],
+            })
+        );
+        assert_eq!(
+            body("/books/any")["content"]["multipart/form-data"]["schema"],
+            json!({"type": "object", "additionalProperties": binary})
+        );
+        // Only a `@Body` is validated.
+        assert_eq!(status_codes(&doc, "/books/photos", "post"), ["201", "401"]);
+        assert_eq!(
+            status_codes(&doc, "/books/cover", "post"),
+            ["201", "400", "401"]
+        );
+    }
+
+    #[test]
+    fn bodiless_statuses_have_no_content() {
+        let doc = document(
+            "no-content",
+            r#"
+            import { HttpStatus } from '@nestjs/common';
+            export class Book { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Post('archive') @HttpCode(204) archive(): Book { return null as any; }
+                @Get('cached') @HttpCode(HttpStatus.NOT_MODIFIED) cached(): Book { return null as any; }
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books/archive"]["post"]["responses"]["204"],
+            json!({"description": "No Content"})
+        );
+        assert_eq!(
+            doc["paths"]["/books/cached"]["get"]["responses"]["304"],
+            json!({"description": "Not Modified"})
+        );
+        assert!(
+            doc.get("components")
+                .and_then(|c| c["schemas"].get("Book"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_error_component_gives_way_to_a_project_error() {
+        let doc = document(
+            "error-clash",
+            r#"
+            export class Error { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Get() list(): Error { return null as any; }
+            }
+            "#,
+        );
+        let schemas = &doc["components"]["schemas"];
+        assert_eq!(
+            schemas["Error"]["properties"]["title"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            schemas["HttpError"]["properties"]["code"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            doc["paths"]["/books"]["get"]["responses"]["401"]["content"]["application/json"]["schema"],
+            json!({"$ref": "#/components/schemas/HttpError"})
+        );
+    }
+
+    #[test]
+    fn operation_ids_name_the_handler_and_are_unique() {
+        let (routes, components) = extract_with(
+            "operation-ids",
+            &[
+                (
+                    "books.ts",
+                    r#"
+                    @Controller('books')
+                    export class BooksController {
+                        @Get() list(): string { return ''; }
+                        @Get([':id', 'by-slug/:id']) get(@Param('id') id: string): string { return ''; }
+                    }
+                    "#,
+                ),
+                (
+                    "authors.ts",
+                    "@Controller('authors') export class AuthorsController { @Get() list(): string { return ''; } }",
+                ),
+            ],
+            &["books.ts", "authors.ts"],
+            Config::default(),
+        );
+        let doc = to_openapi(&Config::default(), &routes, components);
+        let id = |path: &str| doc["paths"][path]["get"]["operationId"].clone();
+        assert_eq!(id("/books"), "BooksController_list");
+        assert_eq!(id("/books/by-slug/{id}"), "BooksController_get");
+        assert_eq!(id("/books/{id}"), "BooksController_get_2");
+        assert_eq!(id("/authors"), "AuthorsController_list");
+    }
+
+    const SECURED_CONTROLLER: &str = r#"
+        @Controller('pets')
+        export class PetsController {
+            @Get() list(): string { return ''; }
+            @Get('open') @Unprotected() open(): string { return ''; }
+            @Post('hook') @Unprotected() hook(@Headers('Authorization') auth: string): void {}
+            @Post('maybe') @Unprotected() maybe(@Headers('authorization') auth?: string): void {}
+        }
+    "#;
+
+    #[test]
+    fn guarded_operations_declare_a_security_requirement() {
+        let doc = document("security", SECURED_CONTROLLER);
+        assert_eq!(
+            doc["components"]["securitySchemes"],
+            json!({"bearerAuth": {"type": "http", "scheme": "bearer"}})
+        );
+        let security =
+            |path: &str, method: &str| doc["paths"][path][method].get("security").cloned();
+        assert_eq!(security("/pets", "get"), Some(json!([{"bearerAuth": []}])));
+        assert_eq!(security("/pets/open", "get"), Some(json!([])));
+        assert_eq!(
+            security("/pets/hook", "post"),
+            Some(json!([{"bearerAuth": []}]))
+        );
+        assert_eq!(
+            security("/pets/maybe", "post"),
+            Some(json!([{}, {"bearerAuth": []}]))
+        );
+        assert!(doc.get("security").is_none());
+    }
+
+    #[test]
+    fn the_security_scheme_is_configurable() {
+        let config: Config = serde_json::from_value(json!({
+            "security": {"name": "apiKey", "scheme": {"type": "apiKey", "in": "header", "name": "X-Api-Key"}},
+            "errorResponses": {"auth": "none"},
+        }))
+        .unwrap();
+        let doc = document_with("security-custom", SECURED_CONTROLLER, config);
+        assert_eq!(
+            doc["components"]["securitySchemes"],
+            json!({"apiKey": {"type": "apiKey", "in": "header", "name": "X-Api-Key"}})
+        );
+        assert_eq!(doc["paths"]["/pets"]["get"]["security"], json!([]));
+        assert_eq!(
+            doc["paths"]["/pets/hook"]["post"]["security"],
+            json!([{"apiKey": []}])
+        );
+
+        let off: Config = serde_json::from_value(json!({"security": {"enabled": false}})).unwrap();
+        let doc = document_with("security-off", SECURED_CONTROLLER, off);
+        assert!(doc["components"].get("securitySchemes").is_none(), "{doc}");
+        assert!(doc["paths"]["/pets"]["get"].get("security").is_none());
+    }
+
+    #[test]
+    fn an_interceptor_wrapping_a_file_gives_a_json_response() {
+        let doc = document(
+            "streamable-wrapped",
+            r#"
+            interface Envelope<D> { data: D; }
+            class StampInterceptor implements NestInterceptor<unknown, Envelope<string>> {}
+            @Controller('books')
+            export class BooksController {
+                @Get('export') @UseInterceptors(StampInterceptor)
+                export(): StreamableFile { return null as any; }
+            }
+            "#,
+        );
+        let content = &doc["paths"]["/books/export"]["get"]["responses"]["200"]["content"];
+        assert_eq!(
+            content["application/json"]["schema"]["properties"]["data"],
+            json!({"type": "string"}),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn aliased_and_any_file_uploads_keep_their_files() {
+        let doc = document(
+            "uploads-aliased",
+            r#"
+            import { FileInterceptor as Upload, AnyFilesInterceptor } from '@nestjs/platform-express';
+            export class Base { owner: string; }
+            export class CoverDto extends Base { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Post('cover') @UseInterceptors(Upload('cover'))
+                cover(@UploadedFile() cover: Express.Multer.File): void {}
+
+                @Post('any') @UseInterceptors(AnyFilesInterceptor())
+                any(@Body() dto: CoverDto): void {}
+            }
+            "#,
+        );
+        let schema = |path: &str| {
+            doc["paths"][path]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+                .clone()
+        };
+        let binary = json!({"type": "string", "format": "binary"});
+        assert_eq!(
+            schema("/books/cover"),
+            json!({"type": "object", "properties": {"cover": binary}, "required": ["cover"]})
+        );
+        assert_eq!(
+            schema("/books/any"),
+            json!({"allOf": [
+                {"$ref": "#/components/schemas/CoverDto"},
+                {"type": "object", "properties": {"owner": {}, "title": {}}, "additionalProperties": binary},
+            ]})
+        );
+    }
+
+    #[test]
+    fn response_media_types_follow_nest_and_the_final_schema() {
+        let mut config = Config::default();
+        config.interceptors.insert(
+            "SigningInterceptor".into(),
+            crate::config::InterceptorConfig {
+                response: Some(crate::config::ResponseOverride {
+                    when_path_ends_with: Some("/signed".into()),
+                    schema: json!({"type": "object"}),
+                }),
+                ..Default::default()
+            },
+        );
+        let doc = document_with(
+            "media-types",
+            r#"
+            import * as Common from '@nestjs/common';
+            import { StreamableFile as Foreign } from '@acme/files';
+            @Controller('books')
+            export class BooksController {
+                @Get('csv')
+                @Header('Content-Type', 'text/csv')
+                @Header('Content-Type', 'application/json')
+                csv(): string { return ''; }
+
+                @Get([':id', ':id/signed']) @UseInterceptors(SigningInterceptor)
+                file(): StreamableFile { return null as any; }
+
+                @Get('qualified') qualified(): Common.StreamableFile { return null as any; }
+                @Get('foreign') foreign(): Foreign { return null as any; }
+            }
+            "#,
+            config,
+        );
+        let content = |path: &str| doc["paths"][path]["get"]["responses"]["200"]["content"].clone();
+        let keys = |path: &str| -> Vec<String> {
+            content(path).as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(keys("/books/csv"), ["text/csv"]);
+        assert_eq!(keys("/books/{id}"), ["application/octet-stream"]);
+        assert_eq!(
+            content("/books/{id}/signed"),
+            json!({"application/json": {"schema": {"type": "object"}}})
+        );
+        assert_eq!(keys("/books/qualified"), ["application/octet-stream"]);
+        assert_eq!(keys("/books/foreign"), ["application/json"]);
+    }
+
+    #[test]
+    fn only_nest_upload_interceptors_make_a_multipart_body() {
+        crate::diag::take_warnings();
+        let doc = document(
+            "uploads-origin",
+            r#"
+            import { FileInterceptor } from '@acme/uploads';
+            import { FileFieldsInterceptor } from '@nestjs/platform-express';
+            const FIELDS = [{ name: 'front' }];
+            @Controller('books')
+            export class BooksController {
+                @Post('foreign') @UseInterceptors(FileInterceptor('cover')) foreign(): void {}
+                @Post('fields') @UseInterceptors(FileFieldsInterceptor(FIELDS)) fields(): void {}
+            }
+            "#,
+        );
+        assert!(
+            doc["paths"]["/books/foreign"]["post"]
+                .get("requestBody")
+                .is_none()
+        );
+        assert_eq!(
+            doc["paths"]["/books/fields"]["post"]["requestBody"]["content"],
+            json!({"multipart/form-data": {"schema": {"type": "object"}}})
+        );
+        let warnings = crate::diag::take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("cannot read the fields of FileFieldsInterceptor")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn interceptors_passing_a_file_or_no_body_through_are_followed() {
+        let doc = document(
+            "interceptor-outputs",
+            r#"
+            export class Book { title: string; }
+            class PassInterceptor<T> implements NestInterceptor<T, T> {}
+            class DownloadInterceptor implements NestInterceptor<unknown, StreamableFile> {}
+            class MuteInterceptor implements NestInterceptor<unknown, void> {}
+            @Controller('books')
+            export class BooksController {
+                @Get('logged') @UseInterceptors(PassInterceptor)
+                logged(): StreamableFile { return null as any; }
+                @Get('download') @UseInterceptors(DownloadInterceptor)
+                download(): Book { return null as any; }
+                @Get('muted') @UseInterceptors(MuteInterceptor)
+                muted(): Book { return null as any; }
+            }
+            "#,
+        );
+        let success = |path: &str| doc["paths"][path]["get"]["responses"]["200"].clone();
+        let binary =
+            json!({"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}});
+        assert_eq!(success("/books/logged")["content"], binary);
+        assert_eq!(success("/books/download")["content"], binary);
+        assert_eq!(success("/books/muted"), json!({"description": "OK"}));
+    }
+
+    #[test]
+    fn a_local_upload_factory_is_not_nests() {
+        let doc = document(
+            "uploads-local",
+            r#"
+            const FileInterceptor = (field: string) => AuditInterceptor;
+            @Controller('books')
+            export class BooksController {
+                @Post() @UseInterceptors(FileInterceptor('cover')) create(): void {}
+            }
+            "#,
+        );
+        assert!(
+            doc["paths"]["/books"]["post"].get("requestBody").is_none(),
+            "{doc}"
+        );
+    }
+
+    #[test]
+    fn the_3_0_downgrade_keeps_security_requirements() {
+        let config: Config = serde_json::from_value(json!({
+            "openapiVersion": "3.0.3",
+            "security": {"name": "const"},
+        }))
+        .unwrap();
+        let doc = document_with("security-30", SECURED_CONTROLLER, config);
+        assert_eq!(
+            doc["paths"]["/pets"]["get"]["security"],
+            json!([{"const": []}])
+        );
+        assert_eq!(
+            doc["components"]["securitySchemes"]["const"],
+            json!({"type": "http", "scheme": "bearer"})
+        );
+    }
+
+    #[test]
+    fn the_3_0_downgrade_keeps_oauth_scope_names() {
+        let config: Config = serde_json::from_value(json!({
+            "openapiVersion": "3.0.3",
+            "security": {"name": "oauth", "scheme": {"type": "oauth2", "flows": {"clientCredentials": {
+                "tokenUrl": "https://auth.example.com/token",
+                "scopes": {"const": "Read books"},
+            }}}},
+        }))
+        .unwrap();
+        let doc = document_with("security-oauth-30", SECURED_CONTROLLER, config);
+        assert_eq!(
+            doc["components"]["securitySchemes"]["oauth"]["flows"]["clientCredentials"]["scopes"],
+            json!({"const": "Read books"})
+        );
+    }
+
+    #[test]
+    fn an_aliased_void_interceptor_output_leaves_no_body() {
+        let doc = document(
+            "interceptor-void-alias",
+            r#"
+            export class Book { title: string; }
+            type NoContent = void;
+            class MuteInterceptor implements NestInterceptor<unknown, NoContent> {}
+            @Controller('books')
+            export class BooksController {
+                @Get() @UseInterceptors(MuteInterceptor) list(): Book { return null as any; }
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books"]["get"]["responses"]["200"],
+            json!({"description": "OK"})
+        );
+    }
+
+    #[test]
+    fn pass_through_interceptors_keep_the_payload() {
+        let doc = document(
+            "interceptor-chain",
+            r#"
+            export class Book { title: string; }
+            interface Envelope<D> { data: D; }
+            class StampInterceptor implements NestInterceptor<unknown, Envelope<string>> {}
+            class LoggingInterceptor implements NestInterceptor<any, any> {}
+            class TraceInterceptor implements NestInterceptor<unknown, Observable<unknown>> {}
+            class DeferInterceptor<T> implements NestInterceptor<T, Observable<T>> {}
+            @Controller('books')
+            export class BooksController {
+                @Get() @UseInterceptors(StampInterceptor, LoggingInterceptor, TraceInterceptor)
+                list(): Book { return null as any; }
+                @Get('export') @UseInterceptors(DeferInterceptor)
+                export(): StreamableFile { return null as any; }
+            }
+            "#,
+        );
+        let content = |path: &str| doc["paths"][path]["get"]["responses"]["200"]["content"].clone();
+        assert_eq!(
+            content("/books")["application/json"]["schema"]["properties"]["data"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            content("/books/export"),
+            json!({"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}})
+        );
+    }
+
+    #[test]
+    fn any_files_beside_a_dictionary_body_keep_its_values() {
+        let doc = document(
+            "uploads-dictionary",
+            r#"
+            @Controller('books')
+            export class BooksController {
+                @Post() @UseInterceptors(AnyFilesInterceptor())
+                create(@Body() fields: Record<string, number>): void {}
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+                ["additionalProperties"],
+            json!({"anyOf": [{"type": "number"}, {"type": "string", "format": "binary"}]})
+        );
+    }
+
+    #[test]
+    fn sse_streams_with_200_under_any_stacking() {
+        let doc = document(
+            "sse-stacked",
+            r#"
+            @Controller('feed')
+            export class FeedController {
+                @Get('events') @Sse() events(): Observable<MessageEvent> { return null as any; }
+                @Sse('quiet') @HttpCode(204) quiet(): Observable<MessageEvent> { return null as any; }
+            }
+            "#,
+        );
+        let stream = json!({"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}});
+        for path in ["/feed/events", "/feed/quiet"] {
+            assert_eq!(
+                doc["paths"][path]["get"]["responses"]["200"], stream,
+                "{path}"
+            );
+        }
     }
 }

@@ -31,6 +31,7 @@ paths:
   /books/{id}:
     get:
       summary: Find a book
+      operationId: BooksController_findOne
       tags: [Books]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
@@ -45,6 +46,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+      security:
+        - bearerAuth: []
 components:
   schemas:
     Book:
@@ -57,7 +60,8 @@ components:
       required: [isbn, title]
 ```
 
-The shared `Error` component referenced by `401` is omitted here.
+The shared `Error` component referenced by `401` and the `bearerAuth` security
+scheme are omitted here.
 
 ## Install
 

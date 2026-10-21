@@ -21,6 +21,8 @@ use swc_ecma_ast::{
     TsUnionOrIntersectionType,
 };
 
+use swc_ecma_visit::{Visit, VisitWith};
+
 use crate::config::{Config, RequestBodyTransform};
 use crate::routes::RequestBody;
 use crate::schema::{ComponentSchemas, SchemaCtx, TypeBinding, TypeEnv};
@@ -103,21 +105,33 @@ pub fn response_override(
     found
 }
 
-/// Compute the response schema after applying the route's interceptors, or
-/// `None` to keep the handler's declared return type unchanged.
+/// What a route's interceptors send instead of the handler's return value.
+pub enum Rewrite {
+    Schema(Value),
+    /// A file, as `is_file` recognizes it.
+    File,
+    /// `void` or `undefined`: no body.
+    Empty,
+}
+
+/// Compute the response after applying the route's interceptors, or `None`
+/// to keep the handler's declared return type unchanged.
 ///
 /// Interceptors are applied in declared order (class-level before method-level);
-/// each matching interceptor's `Out` becomes the input type for the next.
+/// each matching interceptor's `Out` becomes the input type for the next. A
+/// handler without a return annotation (`declared_return: None`) only takes an
+/// interceptor whose `Out` does not depend on its `In`.
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_response(
     project: &Project,
     config: &Config,
     controller_file: &Path,
-    declared_return: &TsType,
+    declared_return: Option<&TsType>,
     interceptor_names: &[String],
     components: &mut ComponentSchemas,
-) -> Option<Value> {
-    let mut current_ty = unwrap_async(declared_return).clone();
+    is_file: impl Fn(&Path, &TsType) -> bool,
+) -> Option<Rewrite> {
+    let mut current_ty = declared_return.map(|t| unwrap_async(t).clone());
     let mut current_file = controller_file.to_path_buf();
     let mut env: TypeEnv = HashMap::new();
     let mut matched = false;
@@ -141,23 +155,60 @@ pub fn rewrite_response(
         let Some((in_ty, out_ty)) = nest_interceptor_args(class) else {
             continue;
         };
+        // `NestInterceptor<any, any>` or `<any, Observable<any>>` (logging,
+        // tracing) says nothing about the payload: keep what the earlier
+        // interceptors made of it.
+        if is_wildcard(unwrap_async(&out_ty)) {
+            continue;
+        }
         let params = type_param_names(class);
 
         // Bind the interceptor's generics from the current (incoming) type.
         let mut local_env: TypeEnv = HashMap::new();
-        if !unify(&params, &in_ty, &current_ty, &current_file, &mut local_env) {
-            // `In` doesn't describe the incoming type — leave it untransformed.
+        let accepted = match &current_ty {
+            Some(current) => unify(&params, &in_ty, current, &current_file, &mut local_env),
+            None => is_wildcard(&in_ty) || is_param(&params, &in_ty),
+        };
+        // `In` doesn't describe the incoming type, or doesn't bind every
+        // parameter `Out` needs (`NestInterceptor<unknown, Envelope<T>>`):
+        // leave it untransformed.
+        let unbound: HashSet<String> = params
+            .iter()
+            .filter(|p| !local_env.contains_key(*p))
+            .cloned()
+            .collect();
+        if !accepted || mentions_any(&out_ty, &unbound) {
             continue;
         }
         // Newer bindings win, but keep prior ones so chained substitutions resolve.
         env.extend(local_env);
-        current_ty = out_ty;
+        current_ty = Some(out_ty);
         current_file = decl_file;
         matched = true;
     }
 
     if !matched {
         return None;
+    }
+    // `NestInterceptor<T, T>` passes the handler's own value through.
+    let (mut out_file, mut out_ty) = (current_file.clone(), current_ty.clone()?);
+    for _ in 0..env.len() {
+        let TsType::TsTypeRef(r) = unwrap_async(&out_ty) else {
+            break;
+        };
+        let Some(binding) = ref_ident(&r.type_name)
+            .filter(|_| r.type_params.is_none())
+            .and_then(|n| env.get(&n))
+        else {
+            break;
+        };
+        (out_file, out_ty) = (binding.origin_file.clone(), binding.ty.clone());
+    }
+    if is_file(&out_file, &out_ty) {
+        return Some(Rewrite::File);
+    }
+    if is_nullish(unwrap_async(&out_ty)) {
+        return Some(Rewrite::Empty);
     }
 
     let mut ctx = SchemaCtx {
@@ -168,11 +219,14 @@ pub fn rewrite_response(
         instantiating: Vec::new(),
         passthrough_types: &config.passthrough_types,
     };
-    let schema = lower_inline(&mut ctx, &current_file, &current_ty);
-    if schema.is_null() || schema == json!({}) {
+    let schema = lower_inline(&mut ctx, &current_file, current_ty.as_ref()?);
+    // `void` through an alias (`type NoContent = void`) lowers to nothing.
+    if schema.is_null() {
+        Some(Rewrite::Empty)
+    } else if schema == json!({}) {
         None
     } else {
-        Some(schema)
+        Some(Rewrite::Schema(schema))
     }
 }
 
@@ -230,7 +284,7 @@ fn type_param_names(class: &Class) -> HashSet<String> {
 /// way the schema lowerer treats `X | undefined` as just `X`, and is what lets
 /// an interceptor whose handler returns `Promise<DataToPaginate<T> | undefined>`
 /// still bind `T` and produce the transformed `PaginatedData<T>` response.
-fn unwrap_async(ty: &TsType) -> &TsType {
+pub(crate) fn unwrap_async(ty: &TsType) -> &TsType {
     if let TsType::TsTypeRef(r) = ty
         && let Some(name) = ref_ident(&r.type_name)
         && (name == "Promise" || name == "Observable")
@@ -273,6 +327,9 @@ fn unify(
     concrete_file: &Path,
     env: &mut TypeEnv,
 ) -> bool {
+    if is_wildcard(pattern) {
+        return true;
+    }
     // Arrays on both sides → recurse on the element type.
     if let (Some(pe), Some(ce)) = (array_elem(pattern), array_elem(concrete)) {
         return unify(params, pe, ce, concrete_file, env);
@@ -318,6 +375,45 @@ fn unify(
         (None, None) => true,
         _ => false,
     }
+}
+
+/// `unknown` or `any`, which accept every incoming type.
+fn is_wildcard(ty: &TsType) -> bool {
+    matches!(
+        ty,
+        TsType::TsKeywordType(k) if matches!(
+            k.kind,
+            TsKeywordTypeKind::TsUnknownKeyword | TsKeywordTypeKind::TsAnyKeyword
+        )
+    )
+}
+
+/// A bare reference to one of the generic `params` (`T`).
+fn is_param(params: &HashSet<String>, ty: &TsType) -> bool {
+    matches!(ty, TsType::TsTypeRef(r) if r.type_params.is_none()
+        && ref_ident(&r.type_name).is_some_and(|n| params.contains(&n)))
+}
+
+/// Whether `ty` refers to any of the generic `params`, at any depth.
+fn mentions_any(ty: &TsType, params: &HashSet<String>) -> bool {
+    struct Finder<'p> {
+        params: &'p HashSet<String>,
+        found: bool,
+    }
+    impl Visit for Finder<'_> {
+        fn visit_ts_type_ref(&mut self, r: &swc_ecma_ast::TsTypeRef) {
+            if ref_ident(&r.type_name).is_some_and(|n| self.params.contains(&n)) {
+                self.found = true;
+            }
+            r.visit_children_with(self);
+        }
+    }
+    let mut finder = Finder {
+        params,
+        found: false,
+    };
+    ty.visit_with(&mut finder);
+    finder.found
 }
 
 /// The element type of an array type, accepting both `T[]` and `Array<T>` forms.
@@ -1275,11 +1371,84 @@ mod tests {
             schema: item.clone(),
             required: true,
             description: None,
+            media_type: "application/json",
         };
         request_body_transform(&config, &["BulkInterceptor".into()], &mut body);
         assert_eq!(
             body.schema,
             json!({ "anyOf": [item.clone(), { "type": "array", "items": item }] })
         );
+    }
+
+    const ENVELOPE_DTS: &str = r#"
+        export interface Envelope<D> { data: D; requestId: string; }
+        export declare class StampInterceptor implements NestInterceptor<unknown, Envelope<string>> {
+            intercept(): unknown;
+        }
+        export declare class AnyInterceptor implements NestInterceptor<any, Envelope<number>> {
+            intercept(): unknown;
+        }
+        export declare class ConstInterceptor<T> implements NestInterceptor<T, Envelope<boolean>> {
+            intercept(): unknown;
+        }
+        export declare class WrapInterceptor<T> implements NestInterceptor<T, Envelope<T>> {
+            intercept(): unknown;
+        }
+        export declare class UnboundInterceptor<T> implements NestInterceptor<unknown, Envelope<T>> {
+            intercept(): unknown;
+        }
+    "#;
+
+    fn envelope_routes(name: &str) -> Vec<Route> {
+        let controller = r#"
+            import { StampInterceptor, AnyInterceptor, ConstInterceptor, WrapInterceptor, UnboundInterceptor } from './envelope';
+            export class Item { id: string; }
+            @Controller('items')
+            export class ItemsController {
+                @Get('stamped') @UseInterceptors(StampInterceptor) stamped(): Item { return null as any; }
+                @Get('any') @UseInterceptors(AnyInterceptor) any(): Promise<Item> { return null as any; }
+                @Get('bare') @UseInterceptors(StampInterceptor) bare() { return null; }
+                @Get('const') @UseInterceptors(ConstInterceptor) constant() { return null; }
+                @Get('wrapped') @UseInterceptors(WrapInterceptor) wrapped() { return null; }
+                @Get('unbound') @UseInterceptors(UnboundInterceptor) unbound(): Item { return null as any; }
+            }
+        "#;
+        let (project, _dir, paths) = build(
+            name,
+            &[
+                ("envelope.d.ts", ENVELOPE_DTS),
+                ("items.controller.ts", controller),
+            ],
+        );
+        extract(&Config::default(), &project, &[paths[1].clone()]).0
+    }
+
+    #[test]
+    fn an_unknown_or_any_input_matches_every_return_type() {
+        let routes = envelope_routes("wildcard");
+        let data = |path: &str| {
+            let r = routes.iter().find(|r| r.path == path).unwrap();
+            r.response.as_ref().map(|s| s["properties"]["data"].clone())
+        };
+        assert_eq!(data("/items/stamped"), Some(json!({"type": "string"})));
+        assert_eq!(data("/items/any"), Some(json!({"type": "number"})));
+        // `T` is bound by nothing, so the declared type stays.
+        let unbound = routes.iter().find(|r| r.path == "/items/unbound").unwrap();
+        assert_eq!(
+            unbound.response,
+            Some(json!({"$ref": "#/components/schemas/Item"}))
+        );
+    }
+
+    #[test]
+    fn an_unannotated_handler_takes_an_output_independent_of_its_input() {
+        let routes = envelope_routes("unannotated");
+        let data = |path: &str| {
+            let r = routes.iter().find(|r| r.path == path).unwrap();
+            r.response.as_ref().map(|s| s["properties"]["data"].clone())
+        };
+        assert_eq!(data("/items/bare"), Some(json!({"type": "string"})));
+        assert_eq!(data("/items/const"), Some(json!({"type": "boolean"})));
+        assert_eq!(data("/items/wrapped"), None);
     }
 }
