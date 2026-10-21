@@ -41,6 +41,10 @@ pub struct ComponentSchemas {
     /// were lowered. Interceptor output reuses only these: any other
     /// instantiation is inlined there.
     recursive: HashSet<String>,
+    /// Declarations whose missing type arguments are being defaulted. A
+    /// default reaching its own declaration (`A<T = B>`, `B<U = A>`) has no
+    /// finite expansion, so that reference stays a plain component.
+    defaulting: HashSet<(std::path::PathBuf, String)>,
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
@@ -814,6 +818,10 @@ impl<'a> SchemaCtx<'a> {
         args: &[&TsType],
     ) -> Option<Value> {
         let declared = generic_params(sym);
+        let decl_key = (decl_file.to_path_buf(), sym.name());
+        if args.len() < declared.len() && self.components.defaulting.contains(&decl_key) {
+            return None;
+        }
         // Arguments are lowered in the *caller's* scope, before this
         // declaration is marked active: they belong to the reference site, not
         // to the body about to be expanded. Marking first would read a finite
@@ -826,13 +834,15 @@ impl<'a> SchemaCtx<'a> {
                 (None, Some(default)) => (decl_file, &**default),
                 (None, None) => continue,
             };
-            let caller_env = args
-                .get(i)
-                .is_none()
-                .then(|| self.type_env.replace(new_env.clone()));
+            let defaulted = args.get(i).is_none();
+            let caller_env = defaulted.then(|| self.type_env.replace(new_env.clone()));
+            let guarded = defaulted && self.components.defaulting.insert(decl_key.clone());
             let resolved = self.ts_type_to_schema(origin, arg);
             let admits_undefined = self.admits_undefined(origin, arg, 0);
             let awaited = self.awaited_admits_undefined(self.type_env.as_ref(), origin, arg, 0);
+            if guarded {
+                self.components.defaulting.remove(&decl_key);
+            }
             if let Some(env) = caller_env {
                 self.type_env = env;
             }
@@ -5355,5 +5365,22 @@ mod tests {
             let inner = &schemas[&ref_name(&instance("outer"), "inner")];
             assert_eq!(required_names(inner), ["tag"], "order {order:?}");
         }
+    }
+
+    #[test]
+    fn mutually_recursive_defaults_terminate() {
+        let (_, schemas) = lower_component(
+            "",
+            "export interface First<T = Second> { next: T; }\n\
+             export interface Second<U = First> { back: U; }\n\
+             export interface Holder { first: First; }",
+            "Holder",
+        );
+        let first = &schemas[&ref_name(&schemas["Holder"], "first")];
+        let second = &schemas[&ref_name(first, "next")];
+        assert!(
+            second["properties"]["back"].get("$ref").is_some(),
+            "got {schemas:?}"
+        );
     }
 }
