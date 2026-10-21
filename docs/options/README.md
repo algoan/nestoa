@@ -46,6 +46,7 @@ Every key is optional, and an unknown key is an error.
 | `decoratorAliases` | `{}` | [decoratorAliases](decorator-aliases.md) |
 | `interceptors` | `{}` | [interceptors](interceptors.md) |
 | `errorResponses` | enabled | [errorResponses](error-responses.md) |
+| `security` | bearer token | [security](security.md) |
 
 ## Composition
 

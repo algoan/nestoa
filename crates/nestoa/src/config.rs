@@ -93,6 +93,43 @@ pub struct Config {
     /// ("Tier A") set. See `ErrorResponses`.
     #[serde(default)]
     pub error_responses: ErrorResponses,
+
+    /// The security scheme of authenticated operations, which
+    /// `errorResponses`' `auth`, `authGuards` and `authOptOut` pick out.
+    #[serde(default)]
+    pub security: Security,
+}
+
+/// See `Config::security`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Security {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The key of the scheme in `components.securitySchemes`.
+    #[serde(default = "default_security_name")]
+    pub name: String,
+    /// The OpenAPI Security Scheme Object, emitted verbatim.
+    #[serde(default = "default_security_scheme")]
+    pub scheme: serde_json::Value,
+}
+
+impl Default for Security {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: default_security_name(),
+            scheme: default_security_scheme(),
+        }
+    }
+}
+
+fn default_security_name() -> String {
+    "bearerAuth".to_string()
+}
+
+fn default_security_scheme() -> serde_json::Value {
+    serde_json::json!({ "type": "http", "scheme": "bearer" })
 }
 
 /// Configuration for automatic error-response generation. Recovers the
@@ -416,6 +453,7 @@ impl Default for Config {
             decorator_aliases: indexmap::IndexMap::new(),
             interceptors: indexmap::IndexMap::new(),
             error_responses: ErrorResponses::default(),
+            security: Security::default(),
         }
     }
 }

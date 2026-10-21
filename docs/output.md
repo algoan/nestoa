@@ -20,7 +20,8 @@ including handlers inherited through `extends`:
 - **Parameters** from `@Param`, `@Query`, `@Headers` and
   [aliased decorators](options/decorator-aliases.md). An object `@Query()` or
   `@Param()` produces one parameter per property. `@Headers()` without a name,
-  and the `Accept`, `Content-Type` and `Authorization` headers, are left out.
+  and the `Accept`, `Content-Type` and `Authorization` headers, are left out;
+  `Authorization` marks the operation as [secured](options/security.md).
   Pipes shape the parameter: `DefaultValuePipe` makes it optional with a
   `default`, and `ParseIntPipe`, `ParseFloatPipe`, `ParseBoolPipe` and
   `ParseUUIDPipe` set its type.
@@ -30,6 +31,8 @@ including handlers inherited through `extends`:
   `Observable`, and after the route's [interceptors](options/interceptors.md).
   See [Success responses](#success-responses).
 - **Error responses**, see [`errorResponses`](options/error-responses.md).
+- **Security**: each operation lists the [`security`](options/security.md)
+  scheme it needs, or `security: []` when it is public.
 - **Tags**: each operation is tagged with its controller's class name, without
   the `Controller` suffix (`BooksController` → `Books`).
 - **Summaries and descriptions** from [JSDoc](jsdoc.md).

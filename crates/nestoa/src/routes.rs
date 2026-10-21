@@ -127,6 +127,7 @@ pub struct Route {
     /// Set by `@Redirect`: the success response is a redirect with a
     /// `Location` header.
     pub redirect: bool,
+    pub security: AuthRequirement,
     pub tags: Vec<String>,
     /// Error responses (`status -> description`), reconstructed from guards,
     /// pipes, validation, and declared throws. Every one references the shared
@@ -164,6 +165,16 @@ pub struct RequestBody {
     pub required: bool,
     pub description: Option<String>,
     pub media_type: &'static str,
+}
+
+/// Whether an operation needs the configured security scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRequirement {
+    None,
+    Required,
+    /// Credentials are read when sent, as by an optional `Authorization`
+    /// header.
+    Optional,
 }
 
 const JSON: &str = "application/json";
@@ -491,6 +502,8 @@ impl<'a> Extractor<'a> {
         let mut params: Vec<RouteParam> = Vec::new();
         let mut request_body: Option<RequestBody> = None;
         let mut body_fields: Vec<BodyField> = Vec::new();
+        // `@Headers('Authorization')`: `Some(required)`.
+        let mut reads_authorization: Option<bool> = None;
         let mut file_param_required = false;
         for p in &m.function.params {
             if p.decorators
@@ -524,6 +537,9 @@ impl<'a> Extractor<'a> {
                     }
                     ParsedParam::Body(b) => request_body = Some(b),
                     ParsedParam::BodyField(f) => body_fields.push(f),
+                    ParsedParam::Authorization { required } => {
+                        reads_authorization = Some(reads_authorization == Some(true) || required);
+                    }
                     ParsedParam::Ignored => {}
                 }
             }
@@ -633,6 +649,12 @@ impl<'a> Extractor<'a> {
             }
             AuthScope::None => false,
         };
+        let security = match reads_authorization {
+            _ if auth_active && !opted_out => AuthRequirement::Required,
+            Some(true) => AuthRequirement::Required,
+            Some(false) => AuthRequirement::Optional,
+            None => AuthRequirement::None,
+        };
         let pipe_names: Vec<String> = m
             .function
             .params
@@ -660,6 +682,7 @@ impl<'a> Extractor<'a> {
             response_media_type,
             status_code,
             redirect: redirect_code.is_some(),
+            security,
             tags: vec![tag.to_string()],
             errors: BTreeMap::new(),
             catch_all: matches!(verb, VerbDecorator::All),
@@ -1055,6 +1078,11 @@ impl<'a> Extractor<'a> {
         if let DecoratorKind::Header = location {
             match &decorator_arg {
                 None => return Some(ParsedParam::Ignored),
+                Some(h) if h.eq_ignore_ascii_case("Authorization") => {
+                    return Some(ParsedParam::Authorization {
+                        required: !extract_pat(&p.pat).optional,
+                    });
+                }
                 Some(h) if IGNORED_HEADERS.iter().any(|i| h.eq_ignore_ascii_case(i)) => {
                     return Some(ParsedParam::Ignored);
                 }
@@ -1429,6 +1457,11 @@ enum ParsedParam {
     Routed(Vec<RouteParam>),
     Body(RequestBody),
     BodyField(BodyField),
+    /// `@Headers('Authorization')`, which documents credentials rather than
+    /// a parameter.
+    Authorization {
+        required: bool,
+    },
     Ignored,
 }
 
@@ -2051,6 +2084,8 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             .insert(error_schema_name.clone(), errors::error_schema());
     }
     let error_ref = json!({ "$ref": format!("#/components/schemas/{error_schema_name}") });
+    let security = config.security.enabled.then_some(&config.security);
+    let mut secured = false;
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
     // NestJS registers handlers in declaration order and the router serves the
     // first match, so an `@All` and an explicit verb on the same method and path
@@ -2192,6 +2227,18 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             responses.insert(code.to_string(), Value::Object(status));
         }
         op.insert("responses".into(), Value::Object(responses));
+        if let Some(scheme) = security {
+            let requirement = json!({ scheme.name.clone(): [] });
+            // An empty requirement lets the request go without credentials; an
+            // empty list says outright that the operation is public.
+            let requirements = match r.security {
+                AuthRequirement::None => json!([]),
+                AuthRequirement::Required => json!([requirement]),
+                AuthRequirement::Optional => json!([{}, requirement]),
+            };
+            secured |= r.security != AuthRequirement::None;
+            op.insert("security".into(), requirements);
+        }
         entry.insert(r.method.as_lower().to_string(), Value::Object(op));
     }
 
@@ -2253,11 +2300,19 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         .into_iter()
         .filter(|(name, _)| reachable.contains(name))
         .collect();
+    let mut comp = Map::new();
     if !schema_pairs.is_empty() {
         schema_pairs.sort_by(|a, b| a.0.cmp(&b.0));
         let schemas: Map<String, Value> = schema_pairs.into_iter().collect();
-        let mut comp = Map::new();
         comp.insert("schemas".into(), Value::Object(schemas));
+    }
+    if let Some(scheme) = security.filter(|_| secured) {
+        comp.insert(
+            "securitySchemes".into(),
+            json!({ scheme.name.clone(): scheme.scheme.clone() }),
+        );
+    }
+    if !comp.is_empty() {
         root.insert("components".into(), Value::Object(comp));
     }
     let mut doc = Value::Object(root);
@@ -3744,6 +3799,7 @@ mod tests {
             response_media_type: JSON.to_string(),
             status_code: 200,
             redirect: false,
+            security: AuthRequirement::None,
             tags: vec![],
             errors: BTreeMap::new(),
             catch_all: false,
@@ -4204,5 +4260,61 @@ mod tests {
         assert_eq!(id("/books/by-slug/{id}"), "BooksController_get");
         assert_eq!(id("/books/{id}"), "BooksController_get_2");
         assert_eq!(id("/authors"), "AuthorsController_list");
+    }
+
+    const SECURED_CONTROLLER: &str = r#"
+        @Controller('pets')
+        export class PetsController {
+            @Get() list(): string { return ''; }
+            @Get('open') @Unprotected() open(): string { return ''; }
+            @Post('hook') @Unprotected() hook(@Headers('Authorization') auth: string): void {}
+            @Post('maybe') @Unprotected() maybe(@Headers('authorization') auth?: string): void {}
+        }
+    "#;
+
+    #[test]
+    fn guarded_operations_declare_a_security_requirement() {
+        let doc = document("security", SECURED_CONTROLLER);
+        assert_eq!(
+            doc["components"]["securitySchemes"],
+            json!({"bearerAuth": {"type": "http", "scheme": "bearer"}})
+        );
+        let security =
+            |path: &str, method: &str| doc["paths"][path][method].get("security").cloned();
+        assert_eq!(security("/pets", "get"), Some(json!([{"bearerAuth": []}])));
+        assert_eq!(security("/pets/open", "get"), Some(json!([])));
+        assert_eq!(
+            security("/pets/hook", "post"),
+            Some(json!([{"bearerAuth": []}]))
+        );
+        assert_eq!(
+            security("/pets/maybe", "post"),
+            Some(json!([{}, {"bearerAuth": []}]))
+        );
+        assert!(doc.get("security").is_none());
+    }
+
+    #[test]
+    fn the_security_scheme_is_configurable() {
+        let config: Config = serde_json::from_value(json!({
+            "security": {"name": "apiKey", "scheme": {"type": "apiKey", "in": "header", "name": "X-Api-Key"}},
+            "errorResponses": {"auth": "none"},
+        }))
+        .unwrap();
+        let doc = document_with("security-custom", SECURED_CONTROLLER, config);
+        assert_eq!(
+            doc["components"]["securitySchemes"],
+            json!({"apiKey": {"type": "apiKey", "in": "header", "name": "X-Api-Key"}})
+        );
+        assert_eq!(doc["paths"]["/pets"]["get"]["security"], json!([]));
+        assert_eq!(
+            doc["paths"]["/pets/hook"]["post"]["security"],
+            json!([{"apiKey": []}])
+        );
+
+        let off: Config = serde_json::from_value(json!({"security": {"enabled": false}})).unwrap();
+        let doc = document_with("security-off", SECURED_CONTROLLER, off);
+        assert!(doc["components"].get("securitySchemes").is_none(), "{doc}");
+        assert!(doc["paths"]["/pets"]["get"].get("security").is_none());
     }
 }
