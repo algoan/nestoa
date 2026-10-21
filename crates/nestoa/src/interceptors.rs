@@ -180,8 +180,15 @@ pub fn rewrite_response(
         if !accepted || mentions_any(&out_ty, &unbound) {
             continue;
         }
-        // Newer bindings win, but keep prior ones so chained substitutions resolve.
-        env.extend(local_env);
+        // `In` was matched against the previous interceptor's `Out`, so the
+        // new bindings are read under that interceptor's bindings alone (a
+        // chained `Box<B>` may bind `B` to its `A`), and replace them: this
+        // `Out` names only its own parameters.
+        let prior = (!env.is_empty()).then(|| std::rc::Rc::new(std::mem::take(&mut env)));
+        for binding in local_env.values_mut() {
+            binding.scope = prior.clone();
+        }
+        env = local_env;
         current_ty = Some(out_ty);
         current_file = decl_file;
         matched = true;
@@ -192,17 +199,18 @@ pub fn rewrite_response(
     }
     // `NestInterceptor<T, T>` passes the handler's own value through.
     let (mut out_file, mut out_ty) = (current_file.clone(), current_ty.clone()?);
-    for _ in 0..env.len() {
+    let mut scope = Some(std::rc::Rc::new(env.clone()));
+    for _ in 0..=interceptor_names.len() {
         let TsType::TsTypeRef(r) = unwrap_async(&out_ty) else {
             break;
         };
         let Some(binding) = ref_ident(&r.type_name)
             .filter(|_| r.type_params.is_none())
-            .and_then(|n| env.get(&n))
+            .and_then(|n| scope.as_ref()?.get(&n).cloned())
         else {
             break;
         };
-        (out_file, out_ty) = (binding.origin_file.clone(), binding.ty.clone());
+        (out_file, out_ty, scope) = (binding.origin_file, binding.ty, binding.scope);
     }
     if is_file(&out_file, &out_ty) {
         return Some(Rewrite::File);
@@ -215,6 +223,7 @@ pub fn rewrite_response(
         project,
         components,
         type_env: Some(env),
+        inline_generics: true,
         current_owner: None,
         instantiating: Vec::new(),
         passthrough_types: &config.passthrough_types,
@@ -351,6 +360,8 @@ fn unify(
                 ty: concrete.clone(),
                 resolved: None,
                 admits_undefined: None,
+                awaited_admits_undefined: None,
+                scope: None,
             },
         );
         return true;
@@ -1083,9 +1094,8 @@ mod tests {
         assert_eq!(items, "#/components/schemas/Project");
 
         // The element DTO is registered; the generic wrappers are inlined, not refs.
-        assert!(components.schemas.contains_key("Project"));
-        assert!(!components.schemas.contains_key("PaginatedData"));
-        assert!(!components.schemas.contains_key("DataToPaginate"));
+        let names: Vec<&str> = components.schemas.keys().map(String::as_str).collect();
+        assert_eq!(names, ["Project"], "got {names:?}");
     }
 
     #[test]
@@ -1152,7 +1162,7 @@ mod tests {
         let resp = route.response.as_ref().expect("response schema");
         // Untransformed: the declared DataToPaginate<Project> is emitted as a $ref.
         let refstr = resp.get("$ref").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(refstr, "#/components/schemas/DataToPaginate");
+        assert_eq!(refstr, "#/components/schemas/DataToPaginateProject");
     }
 
     fn signed_controller() -> String {
@@ -1330,6 +1340,82 @@ mod tests {
         // components (which would collide across controllers with a different T).
         assert!(!components.schemas.contains_key("Envelope"));
         assert!(!components.schemas.contains_key("Element"));
+    }
+
+    #[test]
+    fn chained_interceptor_bindings_keep_the_earlier_scope() {
+        let (project, _dir, paths) = build(
+            "chained",
+            &[
+                (
+                    "interceptors.ts",
+                    "export interface Box<A> { items: A[]; }\n\
+                     export class Boxing<A> implements NestInterceptor<A[], Box<A>> {}\n\
+                     export class Unboxing<B> implements NestInterceptor<Box<B>, { value: B }> {}",
+                ),
+                (
+                    "books.controller.ts",
+                    r#"
+                    import { Boxing, Unboxing } from './interceptors';
+                    @Controller('books')
+                    export class BooksController {
+                        @Get()
+                        @UseInterceptors(Boxing, Unboxing)
+                        public list(): (string | undefined)[] { return []; }
+                    }
+                    "#,
+                ),
+            ],
+        );
+        let (routes, _) = extract(&Config::default(), &project, &[paths[1].clone()]);
+        let resp = routes[0].response.as_ref().expect("response schema");
+        assert_eq!(
+            resp["properties"]["value"],
+            json!({"type": "string"}),
+            "got {resp}"
+        );
+        assert!(resp.get("required").is_none(), "got {resp}");
+    }
+
+    #[test]
+    fn a_later_interceptor_ignores_bindings_it_does_not_follow() {
+        let (project, _dir, paths) = build(
+            "reset",
+            &[
+                (
+                    "boxing.ts",
+                    "export interface Box<A> { items: A[]; }\n\
+                     export class Boxing<Item> implements NestInterceptor<Item, Box<Item>> {}\n\
+                     export class Unboxing<U> implements NestInterceptor<Box<U>, { value: U }> {}",
+                ),
+                (
+                    "reset.ts",
+                    "import { Box } from './boxing';\n\
+                     export class Item { id: string; }\n\
+                     export class Reset implements NestInterceptor<unknown, Box<Item>> {}",
+                ),
+                (
+                    "books.controller.ts",
+                    r#"
+                    import { Boxing, Unboxing } from './boxing';
+                    import { Reset } from './reset';
+                    @Controller('books')
+                    export class BooksController {
+                        @Get()
+                        @UseInterceptors(Boxing, Reset, Unboxing)
+                        public list(): string { return ''; }
+                    }
+                    "#,
+                ),
+            ],
+        );
+        let (routes, _) = extract(&Config::default(), &project, &[paths[2].clone()]);
+        let resp = routes[0].response.as_ref().expect("response schema");
+        assert_eq!(
+            resp["properties"]["value"],
+            json!({"$ref": "#/components/schemas/Item"}),
+            "got {resp}"
+        );
     }
 
     #[test]
