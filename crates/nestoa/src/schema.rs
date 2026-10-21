@@ -37,6 +37,10 @@ pub struct ComponentSchemas {
     /// instantiating `TreeNode<Project>` would lower a duplicate component
     /// under a fresh name instead of reusing the first.
     instantiated: HashMap<InstantiationKey, String>,
+    /// The instantiation components something referred back to while they
+    /// were lowered. Interceptor output reuses only these: any other
+    /// instantiation is inlined there.
+    recursive: HashSet<String>,
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
@@ -746,9 +750,16 @@ impl<'a> SchemaCtx<'a> {
             .insert(key.clone(), provisional.clone());
         // Lower with this type as the owner, so a same-named child is prefixed
         // by *this* type's name rather than an outer one.
+        // A shared component never depends on where it is first reached: the
+        // bindings in scope there belong to the referencing body, and may
+        // shadow names the declaration uses (`interface Box<Item>`).
         let saved_owner = self.current_owner.replace(provisional.clone());
+        let saved_env = self.type_env.take();
+        let saved_inline = std::mem::replace(&mut self.inline_generics, false);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.current_owner = saved_owner;
+        self.type_env = saved_env;
+        self.inline_generics = saved_inline;
         // A collision (provisional != base) may still be a duplicate: reuse an
         // earlier sibling with an identical shape instead of adding a copy.
         if provisional != base
@@ -835,15 +846,16 @@ impl<'a> SchemaCtx<'a> {
         // Already lowered as a component — by an earlier route, or an earlier
         // field of this one — so reuse it rather than lowering a duplicate
         // under a fresh name.
-        if let Some(name) = self.components.instantiated.get(&key) {
+        if let Some(name) = self.components.instantiated.get(&key)
+            && (!self.inline_generics || self.components.recursive.contains(name))
+        {
             return Some(ref_value(name));
         }
         // The same declaration bound to the same arguments, still in flight:
         // genuine recursion, with no finite inlining. Point at the instance
         // already being lowered.
         if let Some(i) = self.instantiating.iter().position(|(k, ..)| *k == key) {
-            let name = self.reserve_instantiation_name(i);
-            return Some(ref_value(&name));
+            return Some(ref_value(&self.refer_back(i)));
         }
         // A *different* binding of a declaration in flight is not recursion —
         // `Pair<Project>` holding `other: Pair<string>` — so it is lowered on
@@ -863,8 +875,7 @@ impl<'a> SchemaCtx<'a> {
                 .iter()
                 .position(|(k, ..)| (&k.0, &k.1) == (&key.0, &key.1))
         {
-            let name = self.reserve_instantiation_name(i);
-            return Some(ref_value(&name));
+            return Some(ref_value(&self.refer_back(i)));
         }
         // The name this instance would take if something refers back to it,
         // built from its own arguments so the component is named after what it
@@ -896,6 +907,11 @@ impl<'a> SchemaCtx<'a> {
         // a later route binding the same arguments reuse it.
         let (_, _, name) = self.instantiating.pop().expect("instantiation in flight");
         match name {
+            // A `void` instantiation (`Identity<void>`) has no schema to name.
+            Some(name) if schema.is_null() && !self.components.recursive.contains(&name) => {
+                self.components.allocated.remove(&name);
+                Some(schema)
+            }
             Some(name) => {
                 self.components.schemas.insert(name.clone(), schema);
                 self.components.instantiated.insert(key, name.clone());
@@ -905,8 +921,17 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
+    /// `reserve_instantiation_name` for a reference back to the instantiation
+    /// at `idx`, which makes it recursive.
+    fn refer_back(&mut self, idx: usize) -> String {
+        let name = self.reserve_instantiation_name(idx);
+        self.components.recursive.insert(name.clone());
+        name
+    }
+
     /// The component name for the instantiation at `idx`, allocated on first
-    /// use: an instance nothing refers back to is inlined and never named.
+    /// use: under `inline_generics`, an instance nothing refers back to is
+    /// inlined and never named.
     fn reserve_instantiation_name(&mut self, idx: usize) -> String {
         if let Some(name) = &self.instantiating[idx].2 {
             return name.clone();
@@ -1188,17 +1213,30 @@ impl<'a> SchemaCtx<'a> {
     /// Whether a property's declared type admits `undefined`, directly or
     /// through type aliases, which makes it optional on the wire like a `?`.
     fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+        self.admits_undefined_in(self.type_env.as_ref(), file, ty, depth)
+    }
+
+    /// `admits_undefined` with the type parameters of `env` in scope.
+    fn admits_undefined_in(
+        &self,
+        env: Option<&TypeEnv>,
+        file: &Path,
+        ty: &TsType,
+        depth: usize,
+    ) -> bool {
         const MAX_ALIAS_DEPTH: usize = 8;
         match ty {
             TsType::TsKeywordType(k) => matches!(
                 k.kind,
                 TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsVoidKeyword
             ),
-            TsType::TsParenthesizedType(p) => self.admits_undefined(file, &p.type_ann, depth),
+            TsType::TsParenthesizedType(p) => {
+                self.admits_undefined_in(env, file, &p.type_ann, depth)
+            }
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => u
                 .types
                 .iter()
-                .any(|t| self.admits_undefined(file, t, depth)),
+                .any(|t| self.admits_undefined_in(env, file, t, depth)),
             // `unknown`/`any` leave the other constituents' values as they are.
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsIntersectionType(i)) => {
                 let constraining: Vec<&TsType> = i
@@ -1215,27 +1253,24 @@ impl<'a> SchemaCtx<'a> {
                 !constraining.is_empty()
                     && constraining
                         .iter()
-                        .all(|t| self.admits_undefined(file, t, depth))
+                        .all(|t| self.admits_undefined_in(env, file, t, depth))
             }
             TsType::TsTypeRef(r) if depth < MAX_ALIAS_DEPTH => {
                 // A bound type parameter, checked where its type was written
                 // (see `type_ref_schema`).
                 if let TsEntityName::Ident(id) = &r.type_name
                     && r.type_params.is_none()
-                    && let Some(binding) = self
-                        .type_env
-                        .as_ref()
-                        .and_then(|env| env.get(id.sym.as_ref()))
+                    && let Some(binding) = env.and_then(|env| env.get(id.sym.as_ref()))
                 {
                     return binding.admits_undefined.unwrap_or_else(|| {
-                        self.admits_undefined(&binding.origin_file, &binding.ty, depth + 1)
+                        self.admits_undefined_in(None, &binding.origin_file, &binding.ty, depth + 1)
                     });
                 }
                 if let TsEntityName::Ident(id) = &r.type_name
                     && self.passthrough_types.iter().any(|t| id.sym == *t)
                     && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
                 {
-                    return self.admits_undefined(file, first, depth + 1);
+                    return self.admits_undefined_in(env, file, first, depth + 1);
                 }
                 // Transparent wrappers. A bare `Promise` property is a promise,
                 // never `undefined`; only `Awaited` looks through one.
@@ -1245,9 +1280,9 @@ impl<'a> SchemaCtx<'a> {
                     && let Some(first) = r.type_params.as_ref().and_then(|a| a.params.first())
                 {
                     return if id.sym == "Awaited" {
-                        self.awaited_admits_undefined(file, first, depth + 1)
+                        self.awaited_admits_undefined(env, file, first, depth + 1)
                     } else {
-                        self.admits_undefined(file, first, depth + 1)
+                        self.admits_undefined_in(env, file, first, depth + 1)
                     };
                 }
                 let resolved = match &r.type_name {
@@ -1259,9 +1294,27 @@ impl<'a> SchemaCtx<'a> {
                     ),
                 };
                 match resolved {
-                    Some((decl_file, Symbol::TypeAlias(alias))) => {
-                        self.admits_undefined(&decl_file, &alias.type_ann, depth + 1)
-                    }
+                    Some((decl_file, Symbol::TypeAlias(alias))) => match &alias.type_params {
+                        Some(params) => {
+                            let scope = self.alias_scope(
+                                env,
+                                file,
+                                &decl_file,
+                                params,
+                                r.type_params.as_deref(),
+                                depth,
+                            );
+                            self.admits_undefined_in(
+                                Some(&scope),
+                                &decl_file,
+                                &alias.type_ann,
+                                depth + 1,
+                            )
+                        }
+                        None => {
+                            self.admits_undefined_in(env, &decl_file, &alias.type_ann, depth + 1)
+                        }
+                    },
                     _ => false,
                 }
             }
@@ -1280,40 +1333,89 @@ impl<'a> SchemaCtx<'a> {
         }
     }
 
+    /// The parameters of a generic alias bound to the arguments of a
+    /// reference to it, written in `file` under `env`, or to their defaults.
+    /// The alias body sees these alone: the referencing scope's bindings may
+    /// share its parameters' names.
+    fn alias_scope(
+        &self,
+        env: Option<&TypeEnv>,
+        file: &Path,
+        decl_file: &Path,
+        params: &swc_ecma_ast::TsTypeParamDecl,
+        args: Option<&TsTypeParamInstantiation>,
+        depth: usize,
+    ) -> TypeEnv {
+        let mut scope = TypeEnv::new();
+        for (i, param) in params.params.iter().enumerate() {
+            let (origin, ty, admits) = match (args.and_then(|a| a.params.get(i)), &param.default) {
+                (Some(arg), _) => (
+                    file,
+                    arg,
+                    self.admits_undefined_in(env, file, arg, depth + 1),
+                ),
+                (None, Some(default)) => (
+                    decl_file,
+                    default,
+                    self.admits_undefined_in(Some(&scope), decl_file, default, depth + 1),
+                ),
+                (None, None) => continue,
+            };
+            scope.insert(
+                param.name.sym.to_string(),
+                TypeBinding {
+                    origin_file: origin.to_path_buf(),
+                    ty: (**ty).clone(),
+                    resolved: None,
+                    admits_undefined: Some(admits),
+                },
+            );
+        }
+        scope
+    }
+
     /// `admits_undefined` for `Awaited<T>`: a `Promise` in `T`, written
     /// directly, in a union or through an alias, is unwrapped first.
-    fn awaited_admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+    fn awaited_admits_undefined(
+        &self,
+        env: Option<&TypeEnv>,
+        file: &Path,
+        ty: &TsType,
+        depth: usize,
+    ) -> bool {
         const MAX_ALIAS_DEPTH: usize = 8;
         if depth >= MAX_ALIAS_DEPTH {
             return false;
         }
         match ty {
             TsType::TsParenthesizedType(p) => {
-                self.awaited_admits_undefined(file, &p.type_ann, depth)
+                self.awaited_admits_undefined(env, file, &p.type_ann, depth)
             }
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => u
                 .types
                 .iter()
-                .any(|t| self.awaited_admits_undefined(file, t, depth)),
+                .any(|t| self.awaited_admits_undefined(env, file, t, depth)),
             TsType::TsTypeRef(r) => {
                 let TsEntityName::Ident(id) = &r.type_name else {
-                    return self.admits_undefined(file, ty, depth);
+                    return self.admits_undefined_in(env, file, ty, depth);
                 };
                 if id.sym == "Promise" {
                     return r
                         .type_params
                         .as_ref()
                         .and_then(|a| a.params.first())
-                        .is_some_and(|arg| self.awaited_admits_undefined(file, arg, depth + 1));
+                        .is_some_and(|arg| {
+                            self.awaited_admits_undefined(env, file, arg, depth + 1)
+                        });
                 }
                 match self.project.resolve(file, id.sym.as_ref()) {
                     Some((decl_file, Symbol::TypeAlias(alias))) if r.type_params.is_none() => {
-                        self.awaited_admits_undefined(&decl_file, &alias.type_ann, depth + 1)
+                        self.awaited_admits_undefined(env, &decl_file, &alias.type_ann, depth + 1)
                     }
-                    _ => self.admits_undefined(file, ty, depth),
+                    _ => self.admits_undefined_in(env, file, ty, depth),
                 }
             }
-            _ => self.admits_undefined(file, ty, depth),
+            _ => self.admits_undefined_in(env, file, ty, depth),
         }
     }
 
@@ -4977,5 +5079,94 @@ mod tests {
             schemas["Page"]["properties"]["items"]["items"],
             json!({"x-unresolved": "T"})
         );
+    }
+
+    #[test]
+    fn a_shared_component_ignores_the_bindings_it_is_reached_under() {
+        let (_, schemas) = lower_component(
+            "",
+            "export class Item { id: string; }\n\
+             export interface Metadata { item: Item; }\n\
+             export interface Box<Item> { value: Item; meta: Metadata; }\n\
+             export interface Holder { box: Box<number>; meta: Metadata; }",
+            "Holder",
+        );
+        assert_eq!(
+            schemas["Metadata"]["properties"]["item"],
+            json!({"$ref": "#/components/schemas/Item"})
+        );
+        assert_eq!(
+            schemas["BoxNumber"]["properties"]["value"],
+            json!({"type": "number"})
+        );
+    }
+
+    #[test]
+    fn interceptor_output_inlines_instantiations_lowered_elsewhere() {
+        let (project, dir) = project_from(&[(
+            "main.ts",
+            &format!(
+                "{GENERICS}\n\
+                 export interface Tree<T> {{ value: T; children: Tree<T>[]; }}\n\
+                 export interface Body {{ page: Page<Book>; tree: Tree<Book>; }}\n\
+                 export interface Out {{ page: Page<Book>; tree: Tree<Book>; }}"
+            ),
+        )]);
+        let file = dir.join("main.ts");
+        let mut components = ComponentSchemas::default();
+        for (name, inline) in [("Body", false), ("Out", true)] {
+            let mut ctx = SchemaCtx {
+                project: &project,
+                components: &mut components,
+                type_env: inline.then(TypeEnv::new),
+                inline_generics: inline,
+                current_owner: None,
+                instantiating: Vec::new(),
+                passthrough_types: &[],
+            };
+            let (decl_file, sym) = project.resolve(&file, name).unwrap();
+            let schema = ctx.symbol_to_schema(&decl_file, &sym);
+            if inline {
+                assert_eq!(
+                    schema["properties"]["page"]["properties"]["total"],
+                    json!({"type": "number"})
+                );
+                assert_eq!(
+                    schema["properties"]["tree"],
+                    json!({"$ref": "#/components/schemas/TreeBook"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_void_instantiation_is_no_component() {
+        let (_, schemas) = lower_component(
+            "",
+            "export type Identity<T> = T;\n\
+             export interface Holder { nothing: Identity<void>; name: Identity<string>; }",
+            "Holder",
+        );
+        assert!(!schemas.contains_key("Identity"), "got {schemas:?}");
+        assert!(schemas.values().all(|s| !s.is_null()));
+        assert_eq!(ref_name(&schemas["Holder"], "name"), "IdentityString");
+    }
+
+    #[test]
+    fn a_generic_alias_binds_its_own_parameters_for_optionality() {
+        let (_, schemas) = lower_component(
+            "",
+            "export type Id<T> = T;\n\
+             export interface Fixed<T> { value: Id<string>; other: T; }\n\
+             export interface Passed<T> { value: Id<T>; tag: string; }\n\
+             export interface Holder { fixed: Fixed<string | undefined>; passed: Passed<string | undefined>; }",
+            "Holder",
+        );
+        let instance = |p: &str| {
+            let name = ref_name(&schemas["Holder"], p);
+            schemas[&name].clone()
+        };
+        assert_eq!(required_names(&instance("fixed")), ["value"]);
+        assert_eq!(required_names(&instance("passed")), ["tag"]);
     }
 }
