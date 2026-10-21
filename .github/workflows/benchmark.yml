@@ -37,10 +37,13 @@ jobs:
         if: env.HAS_TOKEN != 'true'
         run: echo "::warning::BENCHMARK_TOKEN is not set (or not available to this pull request), benchmark skipped"
 
+      # Neither checkout keeps its token in .git/config: the build and the binaries run the pull
+      # request's code, which must not reuse BENCHMARK_TOKEN
       - uses: actions/checkout@v7
         if: env.HAS_TOKEN == 'true'
         with:
           fetch-depth: 0 # the base commit is built too
+          persist-credentials: false
 
       - name: Check out the benchmark
         if: env.HAS_TOKEN == 'true'
@@ -49,6 +52,7 @@ jobs:
           repository: algoan/nestjs-openapi-generation-benchmark
           token: ${{ secrets.BENCHMARK_TOKEN }}
           path: .benchmark
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         if: env.HAS_TOKEN == 'true'

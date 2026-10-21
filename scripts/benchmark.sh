@@ -42,17 +42,22 @@ summary() {
   fi
 }
 
-# require_document <name>: stop when a binary wrote no document (crash, wrong path)
-require_document() {
-  if [ ! -s "$OUT/$1.yaml" ]; then
+# require_run <name> <status>: stop when a binary crashed (any status but 0, or 1 for --strict) or
+# wrote no document
+require_run() {
+  if [ "$2" != 0 ] && [ "$2" != 1 ]; then
+    summary "❌ The $1 exited with status $2:"
+  elif [ ! -s "$OUT/$1.yaml" ]; then
     summary "❌ The $1 wrote no document:"
-    summary "$(printf '\n```\n%s\n```\n' "$(cat "$OUT/$1.yaml.log")")"
-    exit 2
+  else
+    return 0
   fi
+  summary "$(printf '\n```\n%s\n```\n' "$(cat "$OUT/$1.yaml.log")")"
+  exit 2
 }
 
 candidate_strict=$(generate "$CANDIDATE" "$OUT/candidate.yaml")
-require_document candidate
+require_run candidate "$candidate_strict"
 candidate_strict_2=$(generate "$CANDIDATE" "$OUT/candidate-2.yaml")
 if [ "$candidate_strict" != "$candidate_strict_2" ] || ! cmp -s "$OUT/candidate.yaml" "$OUT/candidate-2.yaml"; then
   summary "❌ Two runs of the candidate gave different documents or exit statuses."
@@ -61,25 +66,24 @@ fi
 
 if [ -n "$BASELINE" ]; then
   baseline_strict=$(generate "$BASELINE" "$OUT/baseline.yaml")
-  require_document baseline
+  require_run baseline "$baseline_strict"
   if [ "$candidate_strict" != 0 ] && [ "$baseline_strict" = 0 ]; then
     summary "❌ \`--strict\` fails with the candidate and passes with the baseline:"
     summary "$(printf '\n```\n%s\n```\n' "$(cat "$OUT/candidate.yaml.log")")"
     failed=1
   fi
-  status=0
-  node "$BENCH/bench/src/cli.ts" check "$OUT/candidate.yaml" --baseline "$OUT/baseline.yaml" \
-    ${BENCHMARK_SUMMARY:+--summary "$BENCHMARK_SUMMARY"} >"$OUT/check.md" || status=$?
-  cat "$OUT/check.md"
-  # `check` exits 1 on a regression, after printing its verdict; anything else is a crash
-  if [ "$status" = 1 ] && grep -q '^More differences' "$OUT/check.md"; then
-    failed=1
-  elif [ "$status" != 0 ]; then
-    summary "❌ The benchmark comparison failed (exit $status)."
-    exit 2
-  fi
-else
-  node "$BENCH/bench/src/cli.ts" check "$OUT/candidate.yaml" ${BENCHMARK_SUMMARY:+--summary "$BENCHMARK_SUMMARY"}
+fi
+
+status=0
+node "$BENCH/bench/src/cli.ts" check "$OUT/candidate.yaml" ${BASELINE:+--baseline "$OUT/baseline.yaml"} \
+  ${BENCHMARK_SUMMARY:+--summary "$BENCHMARK_SUMMARY"} >"$OUT/check.md" || status=$?
+cat "$OUT/check.md"
+# `check` exits 1 on a regression, after printing its verdict; anything else is a crash
+if [ "$status" = 1 ] && grep -q '^More differences' "$OUT/check.md"; then
+  failed=1
+elif [ "$status" != 0 ]; then
+  summary "❌ The benchmark comparison failed (exit $status)."
+  exit 2
 fi
 
 exit "$failed"
