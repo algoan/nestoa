@@ -149,20 +149,20 @@ pub fn rewrite_response(
 
         // Bind the interceptor's generics from the current (incoming) type.
         let mut local_env: TypeEnv = HashMap::new();
-        match &current_ty {
-            Some(current) => {
-                if !unify(&params, &in_ty, current, &current_file, &mut local_env) {
-                    // `In` doesn't describe the incoming type — leave it untransformed.
-                    continue;
-                }
-            }
-            None => {
-                if !(is_wildcard(&in_ty) || is_param(&params, &in_ty))
-                    || mentions_any(&out_ty, &params)
-                {
-                    continue;
-                }
-            }
+        let accepted = match &current_ty {
+            Some(current) => unify(&params, &in_ty, current, &current_file, &mut local_env),
+            None => is_wildcard(&in_ty) || is_param(&params, &in_ty),
+        };
+        // `In` doesn't describe the incoming type, or doesn't bind every
+        // parameter `Out` needs (`NestInterceptor<unknown, Envelope<T>>`):
+        // leave it untransformed.
+        let unbound: HashSet<String> = params
+            .iter()
+            .filter(|p| !local_env.contains_key(*p))
+            .cloned()
+            .collect();
+        if !accepted || mentions_any(&out_ty, &unbound) {
+            continue;
         }
         // Newer bindings win, but keep prior ones so chained substitutions resolve.
         env.extend(local_env);
@@ -1355,11 +1355,14 @@ mod tests {
         export declare class WrapInterceptor<T> implements NestInterceptor<T, Envelope<T>> {
             intercept(): unknown;
         }
+        export declare class UnboundInterceptor<T> implements NestInterceptor<unknown, Envelope<T>> {
+            intercept(): unknown;
+        }
     "#;
 
     fn envelope_routes(name: &str) -> Vec<Route> {
         let controller = r#"
-            import { StampInterceptor, AnyInterceptor, ConstInterceptor, WrapInterceptor } from './envelope';
+            import { StampInterceptor, AnyInterceptor, ConstInterceptor, WrapInterceptor, UnboundInterceptor } from './envelope';
             export class Item { id: string; }
             @Controller('items')
             export class ItemsController {
@@ -1368,6 +1371,7 @@ mod tests {
                 @Get('bare') @UseInterceptors(StampInterceptor) bare() { return null; }
                 @Get('const') @UseInterceptors(ConstInterceptor) constant() { return null; }
                 @Get('wrapped') @UseInterceptors(WrapInterceptor) wrapped() { return null; }
+                @Get('unbound') @UseInterceptors(UnboundInterceptor) unbound(): Item { return null as any; }
             }
         "#;
         let (project, _dir, paths) = build(
@@ -1389,6 +1393,12 @@ mod tests {
         };
         assert_eq!(data("/items/stamped"), Some(json!({"type": "string"})));
         assert_eq!(data("/items/any"), Some(json!({"type": "number"})));
+        // `T` is bound by nothing, so the declared type stays.
+        let unbound = routes.iter().find(|r| r.path == "/items/unbound").unwrap();
+        assert_eq!(
+            unbound.response,
+            Some(json!({"$ref": "#/components/schemas/Item"}))
+        );
     }
 
     #[test]
