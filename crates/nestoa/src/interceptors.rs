@@ -105,8 +105,17 @@ pub fn response_override(
     found
 }
 
-/// Compute the response schema after applying the route's interceptors, or
-/// `None` to keep the handler's declared return type unchanged.
+/// What a route's interceptors send instead of the handler's return value.
+pub enum Rewrite {
+    Schema(Value),
+    /// A file, as `is_file` recognizes it.
+    File,
+    /// `void` or `undefined`: no body.
+    Empty,
+}
+
+/// Compute the response after applying the route's interceptors, or `None`
+/// to keep the handler's declared return type unchanged.
 ///
 /// Interceptors are applied in declared order (class-level before method-level);
 /// each matching interceptor's `Out` becomes the input type for the next. A
@@ -120,7 +129,8 @@ pub fn rewrite_response(
     declared_return: Option<&TsType>,
     interceptor_names: &[String],
     components: &mut ComponentSchemas,
-) -> Option<Value> {
+    is_file: impl Fn(&Path, &TsType) -> bool,
+) -> Option<Rewrite> {
     let mut current_ty = declared_return.map(|t| unwrap_async(t).clone());
     let mut current_file = controller_file.to_path_buf();
     let mut env: TypeEnv = HashMap::new();
@@ -174,6 +184,24 @@ pub fn rewrite_response(
     if !matched {
         return None;
     }
+    // `NestInterceptor<T, T>` passes the handler's own value through.
+    let (mut out_file, mut out_ty) = (current_file.clone(), current_ty.clone()?);
+    for _ in 0..env.len() {
+        let TsType::TsTypeRef(r) = &out_ty else { break };
+        let Some(binding) = ref_ident(&r.type_name)
+            .filter(|_| r.type_params.is_none())
+            .and_then(|n| env.get(&n))
+        else {
+            break;
+        };
+        (out_file, out_ty) = (binding.origin_file.clone(), binding.ty.clone());
+    }
+    if is_file(&out_file, &out_ty) {
+        return Some(Rewrite::File);
+    }
+    if is_nullish(unwrap_async(&out_ty)) {
+        return Some(Rewrite::Empty);
+    }
 
     let mut ctx = SchemaCtx {
         project,
@@ -187,7 +215,7 @@ pub fn rewrite_response(
     if schema.is_null() || schema == json!({}) {
         None
     } else {
-        Some(schema)
+        Some(Rewrite::Schema(schema))
     }
 }
 

@@ -16,7 +16,7 @@ use crate::dialect;
 use crate::errors;
 use crate::globalprefix::{Bootstrap, Version, versions};
 use crate::interceptors::{
-    interceptor_class_names, request_body_transform, response_override, rewrite_response,
+    Rewrite, interceptor_class_names, request_body_transform, response_override, rewrite_response,
 };
 use crate::jsdoc::JsDoc;
 use crate::schema::{ComponentSchemas, SchemaCtx, decorator_name, describe};
@@ -583,6 +583,7 @@ impl<'a> Extractor<'a> {
                 "text/event-stream".to_string(),
             )
         } else {
+            let project = self.project;
             let rewritten = if interceptor_names.is_empty() {
                 None
             } else {
@@ -593,20 +594,26 @@ impl<'a> Extractor<'a> {
                     declared_return,
                     &interceptor_names,
                     self.components,
+                    |f, t| is_streamable_file(project, f, t),
                 )
             };
-            // An interceptor may wrap the file in a JSON payload.
-            if rewritten.is_none()
-                && declared_return.is_some_and(|t| self.is_streamable_file(file, t))
-            {
+            let binary = || {
                 (
                     Some(json!({ "type": "string", "format": "binary" })),
                     content_type
                         .clone()
                         .unwrap_or_else(|| "application/octet-stream".to_string()),
                 )
-            } else {
-                let response = rewritten.or_else(|| {
+            };
+            let json_type = || content_type.clone().unwrap_or_else(|| JSON.to_string());
+            match rewritten {
+                Some(Rewrite::Schema(schema)) => (Some(schema), json_type()),
+                Some(Rewrite::File) => binary(),
+                Some(Rewrite::Empty) => (None, json_type()),
+                None if declared_return.is_some_and(|t| is_streamable_file(project, file, t)) => {
+                    binary()
+                }
+                None => {
                     let mut ctx = SchemaCtx {
                         project: self.project,
                         components: self.components,
@@ -615,13 +622,12 @@ impl<'a> Extractor<'a> {
                         instantiating: Vec::new(),
                         passthrough_types: &self.config.passthrough_types,
                     };
-                    let schema = ctx.ts_type_to_schema(file, declared_return?);
-                    (!schema.is_null() && schema != json!({})).then_some(schema)
-                });
-                (
-                    response,
-                    content_type.clone().unwrap_or_else(|| JSON.to_string()),
-                )
+                    let response = declared_return.and_then(|t| {
+                        let schema = ctx.ts_type_to_schema(file, t);
+                        (!schema.is_null() && schema != json!({})).then_some(schema)
+                    });
+                    (response, json_type())
+                }
             }
         };
 
@@ -888,30 +894,6 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Whether a handler returns NestJS's `StreamableFile`, which is sent as
-    /// raw bytes. A project type of that name is a JSON schema like any other.
-    fn is_streamable_file(&self, file: &Path, ty: &TsType) -> bool {
-        let TsType::TsTypeRef(r) = crate::interceptors::unwrap_async(ty) else {
-            return false;
-        };
-        let name = entity_name(&r.type_name);
-        match self.package_origin(file, &name) {
-            Some((package, exported)) => {
-                package.starts_with("@nestjs/") && exported == "StreamableFile"
-            }
-            None => name == "StreamableFile" && self.project.resolve(file, &name).is_none(),
-        }
-    }
-
-    /// The package a name (`FileInterceptor`, or `ns.FileInterceptor`
-    /// through a namespace import) comes from, with its exported name there.
-    fn package_origin(&self, file: &Path, name: &str) -> Option<(String, String)> {
-        match name.rsplit_once('.') {
-            Some((ns, member)) => self.project.namespace_member_origin(file, ns, member),
-            None => self.project.import_origin(file, name),
-        }
-    }
-
     /// The file-upload interceptors of `@UseInterceptors(...)` decorators:
     /// `FileInterceptor('cover')`, `FilesInterceptor('photos', 5)`,
     /// `FileFieldsInterceptor([{ name, maxCount }])`, `AnyFilesInterceptor()`,
@@ -935,7 +917,7 @@ impl<'a> Extractor<'a> {
                 };
                 // Matched by the name it is exported as (`FileInterceptor as
                 // Upload`), and only from Nest's Express platform when imported.
-                let kind = match self.package_origin(file, &dotted) {
+                let kind = match package_origin(self.project, file, &dotted) {
                     Some((package, exported)) if package == "@nestjs/platform-express" => exported,
                     Some(_) => continue,
                     None => dotted.rsplit('.').next().unwrap_or_default().to_string(),
@@ -1342,6 +1324,30 @@ fn pipe_effects(
 
 /// The class an expression names, by its last segment: `ParseIntPipe` for
 /// `ParseIntPipe` or `Common.ParseIntPipe`.
+/// Whether a handler returns NestJS's `StreamableFile`, which is sent as raw
+/// bytes. A project type of that name is a JSON schema like any other.
+fn is_streamable_file(project: &Project, file: &Path, ty: &TsType) -> bool {
+    let TsType::TsTypeRef(r) = crate::interceptors::unwrap_async(ty) else {
+        return false;
+    };
+    let name = entity_name(&r.type_name);
+    match package_origin(project, file, &name) {
+        Some((package, exported)) => {
+            package.starts_with("@nestjs/") && exported == "StreamableFile"
+        }
+        None => name == "StreamableFile" && project.resolve(file, &name).is_none(),
+    }
+}
+
+/// The package a name (`FileInterceptor`, or `ns.FileInterceptor` through a
+/// namespace import) comes from, with its exported name there.
+fn package_origin(project: &Project, file: &Path, name: &str) -> Option<(String, String)> {
+    match name.rsplit_once('.') {
+        Some((ns, member)) => project.namespace_member_origin(file, ns, member),
+        None => project.import_origin(file, name),
+    }
+}
+
 /// `A` or `ns.A`.
 fn entity_name(name: &TsEntityName) -> String {
     match name {
@@ -4526,6 +4532,34 @@ mod tests {
                 .any(|w| w.contains("cannot read the fields of FileFieldsInterceptor")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn interceptors_passing_a_file_or_no_body_through_are_followed() {
+        let doc = document(
+            "interceptor-outputs",
+            r#"
+            export class Book { title: string; }
+            class PassInterceptor<T> implements NestInterceptor<T, T> {}
+            class DownloadInterceptor implements NestInterceptor<unknown, StreamableFile> {}
+            class MuteInterceptor implements NestInterceptor<unknown, void> {}
+            @Controller('books')
+            export class BooksController {
+                @Get('logged') @UseInterceptors(PassInterceptor)
+                logged(): StreamableFile { return null as any; }
+                @Get('download') @UseInterceptors(DownloadInterceptor)
+                download(): Book { return null as any; }
+                @Get('muted') @UseInterceptors(MuteInterceptor)
+                muted(): Book { return null as any; }
+            }
+            "#,
+        );
+        let success = |path: &str| doc["paths"][path]["get"]["responses"]["200"].clone();
+        let binary =
+            json!({"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}});
+        assert_eq!(success("/books/logged")["content"], binary);
+        assert_eq!(success("/books/download")["content"], binary);
+        assert_eq!(success("/books/muted"), json!({"description": "OK"}));
     }
 
     #[test]
