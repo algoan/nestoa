@@ -4620,4 +4620,24 @@ mod tests {
             json!({"const": "Read books"})
         );
     }
+
+    #[test]
+    fn an_aliased_void_interceptor_output_leaves_no_body() {
+        let doc = document(
+            "interceptor-void-alias",
+            r#"
+            export class Book { title: string; }
+            type NoContent = void;
+            class MuteInterceptor implements NestInterceptor<unknown, NoContent> {}
+            @Controller('books')
+            export class BooksController {
+                @Get() @UseInterceptors(MuteInterceptor) list(): Book { return null as any; }
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books"]["get"]["responses"]["200"],
+            json!({"description": "OK"})
+        );
+    }
 }

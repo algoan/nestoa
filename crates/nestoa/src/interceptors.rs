@@ -212,7 +212,10 @@ pub fn rewrite_response(
         passthrough_types: &config.passthrough_types,
     };
     let schema = lower_inline(&mut ctx, &current_file, current_ty.as_ref()?);
-    if schema.is_null() || schema == json!({}) {
+    // `void` through an alias (`type NoContent = void`) lowers to nothing.
+    if schema.is_null() {
+        Some(Rewrite::Empty)
+    } else if schema == json!({}) {
         None
     } else {
         Some(Rewrite::Schema(schema))
