@@ -21,7 +21,8 @@ including handlers inherited through `extends`:
   Pipes shape the parameter: `DefaultValuePipe` makes it optional with a
   `default`, and `ParseIntPipe`, `ParseFloatPipe`, `ParseBoolPipe` and
   `ParseUUIDPipe` set its type.
-- **Request body** from `@Body`.
+- **Request body** from `@Body`, as `application/json`. A file-upload
+  interceptor makes it `multipart/form-data`, see [File uploads](#file-uploads).
 - **Success response** from the return type, after unwrapping `Promise` and
   `Observable`, and after the route's [interceptors](options/interceptors.md).
   See [Success responses](#success-responses).
@@ -49,6 +50,28 @@ says otherwise. Its argument can be a number, a constant (`MULTI_STATUS`,
 A `StreamableFile` class of your own is lowered like any other type. A handler
 returning `{ url, statusCode }` from a `@Redirect` route changes the status at
 runtime, which nestoa doesn't follow.
+
+### File uploads
+
+A handler whose `@UseInterceptors(...)`, on it or on its controller, holds a
+file-upload interceptor from `@nestjs/platform-express` takes a
+`multipart/form-data` body. Each file is a `type: string`, `format: binary`
+property:
+
+| Interceptor | Properties |
+| --- | --- |
+| `FileInterceptor('cover')` | `cover`, one file |
+| `FilesInterceptor('photos', 5)` | `photos`, an array of files with `maxItems: 5` |
+| `FileFieldsInterceptor([{ name: 'front', maxCount: 1 }, { name: 'back' }])` | `front` and `back`, arrays of files |
+| `AnyFilesInterceptor()` | files under any other field name (`additionalProperties`) |
+| `NoFilesInterceptor()` | none: a multipart body of `@Body` fields only |
+
+The `@Body` DTO or `@Body('field')` properties sit beside the files: inline
+for `@Body('field')`, in an `allOf` with the DTO's `$ref` otherwise. The file
+of a `FileInterceptor` or `FilesInterceptor` is required when the
+`@UploadedFile()` / `@UploadedFiles()` parameter isn't optional (`file?:`).
+The `400` of [`validation`](options/error-responses.md#fields) still only
+applies to a route with a `@Body`.
 
 ## How types are lowered
 

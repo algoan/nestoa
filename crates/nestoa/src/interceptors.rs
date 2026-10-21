@@ -1332,6 +1332,7 @@ mod tests {
             schema: item.clone(),
             required: true,
             description: None,
+            media_type: "application/json",
         };
         request_body_transform(&config, &["BulkInterceptor".into()], &mut body);
         assert_eq!(

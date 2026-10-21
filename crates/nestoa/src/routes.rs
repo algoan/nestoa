@@ -163,9 +163,30 @@ pub struct RequestBody {
     pub schema: Value,
     pub required: bool,
     pub description: Option<String>,
+    pub media_type: &'static str,
 }
 
 const JSON: &str = "application/json";
+const MULTIPART: &str = "multipart/form-data";
+
+/// What a file-upload interceptor (`FileInterceptor('cover')`) reads from a
+/// multipart body.
+#[derive(Clone)]
+enum Upload {
+    Fields(Vec<FileField>),
+    /// `AnyFilesInterceptor`: files under any field name.
+    Any,
+}
+
+#[derive(Clone)]
+struct FileField {
+    name: String,
+    array: bool,
+    max_count: Option<Value>,
+    /// The single field of a `FileInterceptor`/`FilesInterceptor`, which a
+    /// non-optional `@UploadedFile()`/`@UploadedFiles()` parameter requires.
+    single: bool,
+}
 
 /// What a controller contributes to each of its handlers' routes.
 struct ClassCtx<'c> {
@@ -180,6 +201,8 @@ struct ClassCtx<'c> {
     opted_out: bool,
     has_roles: bool,
     guarded: bool,
+    /// File-upload interceptors in the controller's `@UseInterceptors`.
+    uploads: Vec<Upload>,
 }
 
 pub struct Extractor<'a> {
@@ -266,6 +289,7 @@ impl<'a> Extractor<'a> {
             opted_out: has_any_decorator(&class.decorators, &er.auth_opt_out),
             has_roles: has_any_decorator(&class.decorators, &er.role_decorators),
             guarded: has_use_guards(&class.decorators, &er.auth_guards),
+            uploads: self.uploads(file, &class.decorators),
         };
         let mut seen = std::collections::HashSet::new();
         let mut owner = (file.to_path_buf(), None::<crate::symbols::Shared<Class>>);
@@ -467,7 +491,14 @@ impl<'a> Extractor<'a> {
         let mut params: Vec<RouteParam> = Vec::new();
         let mut request_body: Option<RequestBody> = None;
         let mut body_fields: Vec<BodyField> = Vec::new();
+        let mut file_param_required = false;
         for p in &m.function.params {
+            if p.decorators
+                .iter()
+                .any(|d| matches!(decorator_name(d).as_str(), "UploadedFile" | "UploadedFiles"))
+            {
+                file_param_required |= !extract_pat(&p.pat).optional;
+            }
             if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                 match parsed {
                     ParsedParam::Routed(rps) => {
@@ -506,6 +537,13 @@ impl<'a> Extractor<'a> {
         // the handler's `@Body` parameter (e.g. single-object-or-array).
         if let Some(body) = request_body.as_mut() {
             request_body_transform(self.config, &interceptor_names, body);
+        }
+        // A global `ValidationPipe` validates the `@Body`, not the files.
+        let has_body = request_body.is_some();
+        let mut uploads = class.uploads.clone();
+        uploads.extend(self.uploads(file, &m.function.decorators));
+        if !uploads.is_empty() {
+            request_body = Some(multipart_body(request_body, &uploads, file_param_required));
         }
 
         // Response type. An interceptor may reshape the wire response (e.g.
@@ -628,7 +666,6 @@ impl<'a> Extractor<'a> {
             handler,
             file: file.to_path_buf(),
         };
-        let has_body = template.request_body.is_some();
         for (method, concrete) in &full_paths {
             let method = *method;
             let full_path = concrete.path.clone();
@@ -821,6 +858,95 @@ impl<'a> Extractor<'a> {
         }
     }
 
+    /// The file-upload interceptors of `@UseInterceptors(...)` decorators:
+    /// `FileInterceptor('cover')`, `FilesInterceptor('photos', 5)`,
+    /// `FileFieldsInterceptor([{ name, maxCount }])`, `AnyFilesInterceptor()`,
+    /// and `NoFilesInterceptor()`, a multipart body without files.
+    fn uploads(&self, file: &Path, decorators: &[Decorator]) -> Vec<Upload> {
+        let mut out = Vec::new();
+        for d in decorators {
+            let Expr::Call(call) = &*d.expr else { continue };
+            if decorator_name(d) != "UseInterceptors" {
+                continue;
+            }
+            for arg in &call.args {
+                let Expr::Call(c) = crate::constval::unwrap(&arg.expr) else {
+                    continue;
+                };
+                let Callee::Expr(callee) = &c.callee else {
+                    continue;
+                };
+                let Some(kind) = class_name(callee) else {
+                    continue;
+                };
+                let arg = |i: usize| c.args.get(i).map(|a| &*a.expr);
+                let name = |e: Option<&Expr>| {
+                    let e = e?;
+                    let name = crate::constval::string(self.project, file, e);
+                    if name.is_none() {
+                        crate::diag::warn(format!(
+                            "cannot evaluate a field name of {kind}(…); the file is left out"
+                        ));
+                    }
+                    name
+                };
+                let count = |e: Option<&Expr>| match crate::constval::value(self.project, file, e?)?
+                {
+                    crate::symbols::EnumValue::Num(n) => Some(crate::schema::number_json(n)),
+                    crate::symbols::EnumValue::Str(_) => None,
+                };
+                let field = |name, array, max_count, single| FileField {
+                    name,
+                    array,
+                    max_count,
+                    single,
+                };
+                out.push(match kind.as_str() {
+                    "FileInterceptor" => Upload::Fields(
+                        name(arg(0))
+                            .map(|n| field(n, false, None, true))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "FilesInterceptor" => Upload::Fields(
+                        name(arg(0))
+                            .map(|n| field(n, true, count(arg(1)), true))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "FileFieldsInterceptor" => {
+                        let Some(Expr::Array(fields)) = arg(0).map(crate::constval::unwrap) else {
+                            continue;
+                        };
+                        Upload::Fields(
+                            fields
+                                .elems
+                                .iter()
+                                .flatten()
+                                .filter_map(|e| match crate::constval::unwrap(&e.expr) {
+                                    Expr::Object(o) => {
+                                        let n = name(object_value(o, "name").as_ref())?;
+                                        Some(field(
+                                            n,
+                                            true,
+                                            count(object_value(o, "maxCount").as_ref()),
+                                            false,
+                                        ))
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                        )
+                    }
+                    "AnyFilesInterceptor" => Upload::Any,
+                    "NoFilesInterceptor" => Upload::Fields(Vec::new()),
+                    _ => continue,
+                });
+            }
+        }
+        out
+    }
+
     /// The status named by `@HttpCode(<Enum>.<MEMBER>)`: a member of an enum
     /// in the symbol table, or of NestJS's `HttpStatus`, whose declarations are
     /// not parsed unless `@nestjs/common` is in `resolvePackages`.
@@ -982,6 +1108,7 @@ impl<'a> Extractor<'a> {
                 schema,
                 required: !pat_info.optional,
                 description,
+                media_type: JSON,
             })),
             DecoratorKind::Param | DecoratorKind::Query if body_field.is_none() => {
                 let location = match location {
@@ -1313,6 +1440,84 @@ struct BodyField {
     description: Option<String>,
 }
 
+/// The `multipart/form-data` body of a handler with file-upload interceptors:
+/// the JSON `body`'s fields, if any, beside the files.
+fn multipart_body(
+    body: Option<RequestBody>,
+    uploads: &[Upload],
+    file_param_required: bool,
+) -> RequestBody {
+    let binary = json!({ "type": "string", "format": "binary" });
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    let mut any_file = false;
+    for upload in uploads {
+        match upload {
+            Upload::Any => any_file = true,
+            Upload::Fields(fields) => {
+                for f in fields {
+                    let mut schema = binary.clone();
+                    if f.array {
+                        schema = json!({ "type": "array", "items": schema });
+                        if let Some(max) = &f.max_count {
+                            schema["maxItems"] = max.clone();
+                        }
+                    }
+                    if f.single && file_param_required {
+                        required.push(Value::String(f.name.clone()));
+                    }
+                    properties.insert(f.name.clone(), schema);
+                }
+            }
+        }
+    }
+    let files_required = !required.is_empty();
+    let (schema, body_required, description) = match body {
+        Some(b) => (b.schema, b.required, b.description),
+        None => (json!({ "type": "object" }), false, None),
+    };
+    let inline = schema.get("type") == Some(&json!("object")) && schema.get("$ref").is_none();
+    let schema = if inline {
+        let mut schema = schema;
+        let object = schema.as_object_mut().expect("an object schema");
+        if !properties.is_empty() {
+            let props = object
+                .entry("properties")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(props) = props.as_object_mut() {
+                props.extend(properties);
+            }
+        }
+        if files_required {
+            let req = object
+                .entry("required")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(req) = req.as_array_mut() {
+                req.extend(required);
+            }
+        }
+        // Applies to the fields `properties` doesn't name.
+        if any_file {
+            object.insert("additionalProperties".into(), binary);
+        }
+        schema
+    } else if properties.is_empty() {
+        schema
+    } else {
+        let mut files = json!({ "type": "object", "properties": properties });
+        if files_required {
+            files["required"] = Value::Array(required);
+        }
+        json!({ "allOf": [schema, files] })
+    };
+    RequestBody {
+        schema,
+        required: body_required || files_required,
+        description,
+        media_type: MULTIPART,
+    }
+}
+
 /// The object body assembled from a handler's `@Body('field')` parameters.
 fn body_from_fields(fields: Vec<BodyField>) -> RequestBody {
     let mut properties = Map::new();
@@ -1345,6 +1550,7 @@ fn body_from_fields(fields: Vec<BodyField>) -> RequestBody {
         schema,
         required: any_required,
         description: None,
+        media_type: JSON,
     }
 }
 
@@ -1931,7 +2137,7 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             let mut content = Map::new();
             let mut media = Map::new();
             media.insert("schema".into(), body.schema.clone());
-            content.insert("application/json".into(), Value::Object(media));
+            content.insert(body.media_type.into(), Value::Object(media));
             let mut rb = Map::new();
             rb.insert("required".into(), Value::Bool(body.required));
             if let Some(d) = &body.description {
@@ -3830,6 +4036,69 @@ mod tests {
             doc["paths"]["/books/export"]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"],
             json!({"$ref": "#/components/schemas/StreamableFile"})
+        );
+    }
+
+    #[test]
+    fn file_uploads_are_multipart_bodies() {
+        let doc = document(
+            "uploads",
+            r#"
+            export class CoverDto { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Post('cover') @UseInterceptors(FileInterceptor('cover'))
+                cover(@UploadedFile() cover: Express.Multer.File, @Body() dto: CoverDto): void {}
+
+                @Post('photos') @UseInterceptors(FilesInterceptor('photos', 5))
+                photos(@UploadedFiles() photos?: Express.Multer.File[]): void {}
+
+                @Post('scan')
+                @UseInterceptors(FileFieldsInterceptor([{ name: 'front', maxCount: 1 }, { name: 'back' }]))
+                scan(@UploadedFiles() files: { front?: Express.Multer.File[] }, @Body('note') note: string): void {}
+
+                @Post('any') @UseInterceptors(AnyFilesInterceptor())
+                any(@UploadedFiles() files: Express.Multer.File[]): void {}
+            }
+            "#,
+        );
+        let body = |path: &str| doc["paths"][path]["post"]["requestBody"].clone();
+        let binary = json!({"type": "string", "format": "binary"});
+        assert_eq!(
+            body("/books/cover"),
+            json!({"required": true, "content": {"multipart/form-data": {"schema": {"allOf": [
+                {"$ref": "#/components/schemas/CoverDto"},
+                {"type": "object", "properties": {"cover": binary}, "required": ["cover"]},
+            ]}}}})
+        );
+        assert_eq!(
+            body("/books/photos"),
+            json!({"required": false, "content": {"multipart/form-data": {"schema": {
+                "type": "object",
+                "properties": {"photos": {"type": "array", "items": binary, "maxItems": 5}},
+            }}}})
+        );
+        assert_eq!(
+            body("/books/scan")["content"]["multipart/form-data"]["schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string"},
+                    "front": {"type": "array", "items": binary, "maxItems": 1},
+                    "back": {"type": "array", "items": binary},
+                },
+                "required": ["note"],
+            })
+        );
+        assert_eq!(
+            body("/books/any")["content"]["multipart/form-data"]["schema"],
+            json!({"type": "object", "additionalProperties": binary})
+        );
+        // Only a `@Body` is validated.
+        assert_eq!(status_codes(&doc, "/books/photos", "post"), ["201", "401"]);
+        assert_eq!(
+            status_codes(&doc, "/books/cover", "post"),
+            ["201", "400", "401"]
         );
     }
 
