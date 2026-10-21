@@ -537,9 +537,10 @@ impl<'a> SchemaCtx<'a> {
         let name = entity_name(&r.type_name);
         // Generic substitution: a bare reference to a bound interceptor type
         // parameter (e.g. `T`) lowers to the bound concrete type, resolved in
-        // the file that type came from. The env is cleared for the recursion
-        // because bound types come from the concrete side and never reference
-        // the interceptor's own parameters (avoids param->param loops).
+        // the file that type came from, under the bindings in effect where it
+        // was written: none for the handler's type, an earlier interceptor's
+        // for a chained one. Never the current env, which would loop on a
+        // parameter bound to a type of the same name.
         if r.type_params.is_none()
             && let Some(binding) = self
                 .type_env
@@ -551,7 +552,7 @@ impl<'a> SchemaCtx<'a> {
             if let Some(resolved) = binding.resolved {
                 return resolved;
             }
-            let saved = self.type_env.take();
+            let saved = std::mem::replace(&mut self.type_env, binding.scope.as_deref().cloned());
             let schema = self.ts_type_to_schema(&binding.origin_file, &binding.ty);
             self.type_env = saved;
             return schema;

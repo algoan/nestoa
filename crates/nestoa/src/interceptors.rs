@@ -180,7 +180,14 @@ pub fn rewrite_response(
         if !accepted || mentions_any(&out_ty, &unbound) {
             continue;
         }
-        // Newer bindings win, but keep prior ones so chained substitutions resolve.
+        // Newer bindings win, but keep prior ones so chained substitutions
+        // resolve; a new binding may name an earlier interceptor's parameter.
+        if !env.is_empty() {
+            let prior = std::rc::Rc::new(env.clone());
+            for binding in local_env.values_mut() {
+                binding.scope = Some(prior.clone());
+            }
+        }
         env.extend(local_env);
         current_ty = Some(out_ty);
         current_file = decl_file;
@@ -1332,6 +1339,41 @@ mod tests {
         // components (which would collide across controllers with a different T).
         assert!(!components.schemas.contains_key("Envelope"));
         assert!(!components.schemas.contains_key("Element"));
+    }
+
+    #[test]
+    fn chained_interceptor_bindings_keep_the_earlier_scope() {
+        let (project, _dir, paths) = build(
+            "chained",
+            &[
+                (
+                    "interceptors.ts",
+                    "export interface Box<A> { items: A[]; }\n\
+                     export class Boxing<A> implements NestInterceptor<A[], Box<A>> {}\n\
+                     export class Unboxing<B> implements NestInterceptor<Box<B>, { value: B }> {}",
+                ),
+                (
+                    "books.controller.ts",
+                    r#"
+                    import { Boxing, Unboxing } from './interceptors';
+                    @Controller('books')
+                    export class BooksController {
+                        @Get()
+                        @UseInterceptors(Boxing, Unboxing)
+                        public list(): (string | undefined)[] { return []; }
+                    }
+                    "#,
+                ),
+            ],
+        );
+        let (routes, _) = extract(&Config::default(), &project, &[paths[1].clone()]);
+        let resp = routes[0].response.as_ref().expect("response schema");
+        assert_eq!(
+            resp["properties"]["value"],
+            json!({"type": "string"}),
+            "got {resp}"
+        );
+        assert!(resp.get("required").is_none(), "got {resp}");
     }
 
     #[test]
