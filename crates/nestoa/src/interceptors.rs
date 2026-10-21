@@ -155,6 +155,11 @@ pub fn rewrite_response(
         let Some((in_ty, out_ty)) = nest_interceptor_args(class) else {
             continue;
         };
+        // `NestInterceptor<any, any>` (logging, tracing) says nothing about
+        // the payload: keep what the earlier interceptors made of it.
+        if is_wildcard(&out_ty) {
+            continue;
+        }
         let params = type_param_names(class);
 
         // Bind the interceptor's generics from the current (incoming) type.
@@ -187,7 +192,9 @@ pub fn rewrite_response(
     // `NestInterceptor<T, T>` passes the handler's own value through.
     let (mut out_file, mut out_ty) = (current_file.clone(), current_ty.clone()?);
     for _ in 0..env.len() {
-        let TsType::TsTypeRef(r) = &out_ty else { break };
+        let TsType::TsTypeRef(r) = unwrap_async(&out_ty) else {
+            break;
+        };
         let Some(binding) = ref_ident(&r.type_name)
             .filter(|_| r.type_params.is_none())
             .and_then(|n| env.get(&n))

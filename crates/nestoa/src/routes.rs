@@ -4640,4 +4640,34 @@ mod tests {
             json!({"description": "OK"})
         );
     }
+
+    #[test]
+    fn pass_through_interceptors_keep_the_payload() {
+        let doc = document(
+            "interceptor-chain",
+            r#"
+            export class Book { title: string; }
+            interface Envelope<D> { data: D; }
+            class StampInterceptor implements NestInterceptor<unknown, Envelope<string>> {}
+            class LoggingInterceptor implements NestInterceptor<any, any> {}
+            class DeferInterceptor<T> implements NestInterceptor<T, Observable<T>> {}
+            @Controller('books')
+            export class BooksController {
+                @Get() @UseInterceptors(StampInterceptor, LoggingInterceptor)
+                list(): Book { return null as any; }
+                @Get('export') @UseInterceptors(DeferInterceptor)
+                export(): StreamableFile { return null as any; }
+            }
+            "#,
+        );
+        let content = |path: &str| doc["paths"][path]["get"]["responses"]["200"]["content"].clone();
+        assert_eq!(
+            content("/books")["application/json"]["schema"]["properties"]["data"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            content("/books/export"),
+            json!({"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}})
+        );
+    }
 }
