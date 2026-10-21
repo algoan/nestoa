@@ -31,6 +31,7 @@ paths:
   /books/{id}:
     get:
       summary: Find a book
+      operationId: BooksController_findOne
       tags: [Books]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }

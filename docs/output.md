@@ -8,6 +8,9 @@ including handlers inherited through `extends`:
 - **Operations** from `@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`, `@Head`,
   `@Options`, `@All` (expanded to every method) and `@Sse` (a `GET`). When
   several verb decorators are stacked, the topmost one wins, as in NestJS.
+  Each operation's `operationId` is `<Controller>_<method>`
+  (`BooksController_findOne`); when one handler serves several paths or
+  methods, the later ones in the document get `_2`, `_3`, ….
 - **Paths** built from the [base path](options/base-path.md), the version, the
   controller path and the route path. A path can be a literal or a constant
   (`ROUTES.LIST`, `` `redirect/${Species.CAT}` ``, `BASE + '/x'`, a string enum

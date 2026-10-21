@@ -2096,6 +2096,11 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
         if let Some(d) = &r.description {
             op.insert("description".into(), Value::String(d.clone()));
         }
+        // Made unique once the paths are sorted.
+        op.insert(
+            "operationId".into(),
+            Value::String(r.handler.replace('.', "_")),
+        );
         if r.deprecated {
             op.insert("deprecated".into(), Value::Bool(true));
         }
@@ -2200,9 +2205,22 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
     sorted_paths.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut paths_json: Map<String, Value> = Map::new();
+    let mut operation_ids = std::collections::HashSet::new();
     for (p, ops) in sorted_paths {
         let mut sorted_ops: Vec<(String, Value)> = ops.into_iter().collect();
         sorted_ops.sort_by(|a, b| a.0.cmp(&b.0));
+        // A handler serving several paths or methods numbers its later
+        // operations, in document order.
+        for (_, op) in &mut sorted_ops {
+            let base = op["operationId"].as_str().unwrap_or_default().to_string();
+            let mut id = base.clone();
+            let mut n = 1;
+            while !operation_ids.insert(id.clone()) {
+                n += 1;
+                id = format!("{base}_{n}");
+            }
+            op["operationId"] = Value::String(id);
+        }
         paths_json.insert(p, Value::Object(sorted_ops.into_iter().collect()));
     }
 
@@ -4155,5 +4173,36 @@ mod tests {
             doc["paths"]["/books"]["get"]["responses"]["401"]["content"]["application/json"]["schema"],
             json!({"$ref": "#/components/schemas/HttpError"})
         );
+    }
+
+    #[test]
+    fn operation_ids_name_the_handler_and_are_unique() {
+        let (routes, components) = extract_with(
+            "operation-ids",
+            &[
+                (
+                    "books.ts",
+                    r#"
+                    @Controller('books')
+                    export class BooksController {
+                        @Get() list(): string { return ''; }
+                        @Get([':id', 'by-slug/:id']) get(@Param('id') id: string): string { return ''; }
+                    }
+                    "#,
+                ),
+                (
+                    "authors.ts",
+                    "@Controller('authors') export class AuthorsController { @Get() list(): string { return ''; } }",
+                ),
+            ],
+            &["books.ts", "authors.ts"],
+            Config::default(),
+        );
+        let doc = to_openapi(&Config::default(), &routes, components);
+        let id = |path: &str| doc["paths"][path]["get"]["operationId"].clone();
+        assert_eq!(id("/books"), "BooksController_list");
+        assert_eq!(id("/books/by-slug/{id}"), "BooksController_get");
+        assert_eq!(id("/books/{id}"), "BooksController_get_2");
+        assert_eq!(id("/authors"), "AuthorsController_list");
     }
 }
