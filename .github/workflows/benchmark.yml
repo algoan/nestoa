@@ -111,7 +111,8 @@ jobs:
           GH_TOKEN: ${{ secrets.BENCHMARK_TOKEN }}
         run: |
           gh api repos/algoan/nestjs-openapi-generation-benchmark/dispatches \
-            -f event_type=nestoa-main -f "client_payload[sha]=$GITHUB_SHA"
+            -f event_type=nestoa-main -f "client_payload[sha]=$GITHUB_SHA" \
+            || echo "::warning::The benchmark refresh dispatch failed"
 
       - name: Missing token
         if: env.HAS_TOKEN != 'true'

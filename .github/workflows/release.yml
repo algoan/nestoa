@@ -169,7 +169,8 @@ jobs:
           git push origin "v$VERSION"
 
       # Ask the benchmark (algoan/nestjs-openapi-generation-benchmark) to re-run its `nestoa` variant
-      # on the published version; it opens a pull request with the results.
+      # on the published version; it opens a pull request with the results. A failure only warns: the
+      # release is published, and re-running this job would publish it again.
       - name: Refresh the benchmark results
         env:
           GH_TOKEN: ${{ secrets.BENCHMARK_TOKEN }}
@@ -179,4 +180,5 @@ jobs:
             exit 0
           fi
           gh api repos/algoan/nestjs-openapi-generation-benchmark/dispatches \
-            -f event_type=nestoa-release -f "client_payload[version]=${{ needs.validate.outputs.version }}"
+            -f event_type=nestoa-release -f "client_payload[version]=${{ needs.validate.outputs.version }}" \
+            || echo "::warning::The benchmark refresh dispatch failed; the release itself succeeded"
