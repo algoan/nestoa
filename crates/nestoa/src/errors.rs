@@ -22,8 +22,15 @@ use serde_json::{Value, json};
 
 use crate::config::{ErrorResponses, GlobalError, RouteErrors};
 
-/// Component-schema name for the shared error body.
-pub const ERROR_SCHEMA_NAME: &str = "Error";
+/// The component name of the shared error body: `Error`, or `HttpError`
+/// (then `HttpError2`, …) when a project schema already has the name.
+pub fn error_schema_name(taken: impl Fn(&str) -> bool) -> String {
+    ["Error".to_string(), "HttpError".to_string()]
+        .into_iter()
+        .chain((2..).map(|n| format!("HttpError{n}")))
+        .find(|name| !taken(name))
+        .expect("an unbounded sequence of names")
+}
 
 /// The literal error-body schema emitted by the global `HttpExceptionFilter`
 /// (`{ code, message, status }`). Not NestJS's stock `{ statusCode, message,

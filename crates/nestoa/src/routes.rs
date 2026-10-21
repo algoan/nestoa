@@ -13,7 +13,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
 use crate::constval::object_value;
 use crate::dialect;
-use crate::errors::{self, ERROR_SCHEMA_NAME};
+use crate::errors;
 use crate::globalprefix::{Bootstrap, Version, versions};
 use crate::interceptors::{
     interceptor_class_names, request_body_transform, response_override, rewrite_response,
@@ -2042,13 +2042,15 @@ fn normalize_segment(s: &str) -> String {
 pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
     components.resolve_deferred();
     // Register the shared error-body schema once, if any route emits an error
-    // response. Tree-shaking below drops it if nothing ends up referencing it.
+    // response, under a name no project schema takes. Tree-shaking below
+    // drops it if nothing ends up referencing it.
+    let error_schema_name = errors::error_schema_name(|n| components.schemas.contains_key(n));
     if routes.iter().any(|r| !r.errors.is_empty()) {
         components
             .schemas
-            .entry(ERROR_SCHEMA_NAME.to_string())
-            .or_insert_with(errors::error_schema);
+            .insert(error_schema_name.clone(), errors::error_schema());
     }
+    let error_ref = json!({ "$ref": format!("#/components/schemas/{error_schema_name}") });
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
     // NestJS registers handlers in declaration order and the router serves the
     // first match, so an `@All` and an explicit verb on the same method and path
@@ -2179,10 +2181,7 @@ pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSc
             status.insert("description".into(), Value::String(description.clone()));
             let mut content = Map::new();
             let mut media = Map::new();
-            media.insert(
-                "schema".into(),
-                json!({ "$ref": format!("#/components/schemas/{ERROR_SCHEMA_NAME}") }),
-            );
+            media.insert("schema".into(), error_ref.clone());
             content.insert("application/json".into(), Value::Object(media));
             status.insert("content".into(), Value::Object(content));
             responses.insert(code.to_string(), Value::Object(status));
@@ -4128,6 +4127,33 @@ mod tests {
             doc.get("components")
                 .and_then(|c| c["schemas"].get("Book"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_error_component_gives_way_to_a_project_error() {
+        let doc = document(
+            "error-clash",
+            r#"
+            export class Error { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Get() list(): Error { return null as any; }
+            }
+            "#,
+        );
+        let schemas = &doc["components"]["schemas"];
+        assert_eq!(
+            schemas["Error"]["properties"]["title"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            schemas["HttpError"]["properties"]["code"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            doc["paths"]["/books"]["get"]["responses"]["401"]["content"]["application/json"]["schema"],
+            json!({"$ref": "#/components/schemas/HttpError"})
         );
     }
 }

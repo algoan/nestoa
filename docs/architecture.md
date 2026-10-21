@@ -89,7 +89,7 @@ applies NestJS interceptor transforms to a route's request/response (called from
 
 ### `errors.rs`
 
-Reconstructs the `400`/`401`/`403`/`404`/`409`/`413`/`422` responses NestJS produces but that never appear in a handler's return type. `routes.rs::extract_class` gathers the AST signals (guards, opt-out and role decorators, a `@Body`, pipes, `throw new <HttpException>(…)` in the handler body, `@throws` tags, the method and full path) into `errors::RouteSignals`; `errors::compute` is the pure mapping from those signals and the [`errorResponses`](options/error-responses.md) config to a `status -> description` map, ordered and deduped by status, with the most specific source inserted first. Every error response `$ref`s one shared `Error` component (`error_schema`).
+Reconstructs the `400`/`401`/`403`/`404`/`409`/`413`/`422` responses NestJS produces but that never appear in a handler's return type. `routes.rs::extract_class` gathers the AST signals (guards, opt-out and role decorators, a `@Body`, pipes, `throw new <HttpException>(…)` in the handler body, `@throws` tags, the method and full path) into `errors::RouteSignals`; `errors::compute` is the pure mapping from those signals and the [`errorResponses`](options/error-responses.md) config to a `status -> description` map, ordered and deduped by status, with the most specific source inserted first. Every error response `$ref`s one shared `Error` component (`error_schema`), renamed by `error_schema_name` when a project schema already has the name.
 
 ### `dialect.rs`
 

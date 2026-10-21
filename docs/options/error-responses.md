@@ -19,7 +19,8 @@ return type.
 }
 ```
 
-Every error response references one shared `Error` component:
+Every error response references one shared `Error` component, named
+`HttpError` instead when one of your own schemas is called `Error`:
 
 ```yaml
 Error:
