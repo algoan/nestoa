@@ -29,6 +29,7 @@ make ci                                # mirrors the CI jobs: fmt check, clippy 
 cargo test --package nestoa routes     # tests of one module
 cargo test test_name                   # one test
 cargo build --release
+make bench BASELINE=<base binary>       # benchmark check, see docs/development.md#benchmark
 ./target/release/nestoa <project> -o out.yaml --strict
 ./target/release/nestoa <project> --print-config
 ```
@@ -56,7 +57,14 @@ A change is done when all of the following hold. Report each result, including f
    difference: intended by the change, or a regression. Compare `--strict` warnings and
    `x-unresolved` counts too. Summarise the effect in the PR with counts only, never the projects'
    names or code (see Confidentiality).
-6. **The docs match.** A new or changed option updates its page in `docs/options/` and the index;
+6. **The benchmark does not regress.** Run `make bench BASELINE=<base branch binary>` against the
+   [NestJS OpenAPI generation benchmark](https://github.com/algoan/nestjs-openapi-generation-benchmark)
+   (see [development](docs/development.md#benchmark)); the `Benchmark` CI job runs the same check.
+   Report the core and total differences before and after. A category that gets more differences is a
+   regression unless the change is meant to trade it, which the PR explains (`benchmark-regression`
+   label). A change that closes a gap listed in the notes of the benchmark's `nestoa-main` variant
+   updates those notes in the refresh pull request opened there after the merge.
+7. **The docs match.** A new or changed option updates its page in `docs/options/` and the index;
    a new module or pipeline stage updates `docs/architecture.md`; a user-visible behaviour updates
    the matching guide.
 

@@ -23,7 +23,7 @@ assert on the emitted schema or route.
 
 Unit tests are only part of validating a change: see the
 [validation checklist in `CLAUDE.md`](../CLAUDE.md#validating-a-change) for the
-end-to-end, `--strict`, determinism and OpenAPI checks.
+end-to-end, `--strict`, determinism, OpenAPI and [benchmark](#benchmark) checks.
 
 ```sh
 cargo test                             # everything
@@ -42,7 +42,35 @@ make test        # cargo test --workspace --locked
 make build       # cargo build --release --workspace --locked
 make lint        # fmt check + clippy
 make fmt-fix     # apply formatting
+make bench       # check against the benchmark, see below
 ```
+
+## Benchmark
+
+The [NestJS OpenAPI generation benchmark](https://github.com/algoan/nestjs-openapi-generation-benchmark)
+compares nestoa with the other generators on a realistic NestJS app whose expected document is checked
+against the running app. Its `nestoa-main` variant is the app configured for nestoa's main branch.
+
+`scripts/benchmark.sh` generates that variant's document with a candidate binary and, when given, a
+baseline one. It fails when the candidate has more differences with the expected document than the
+baseline in any category (operations, parameters, request bodies, responses, errors, constraints,
+security, docs), is not deterministic, or fails `--strict` where the baseline passes. The report lists
+the new and fixed differences.
+
+```sh
+git clone git@github.com:algoan/nestjs-openapi-generation-benchmark.git ../nestjs-openapi-generation-benchmark
+npm --prefix ../nestjs-openapi-generation-benchmark/bench ci
+make bench                                        # differences of this branch
+make bench BASELINE=path/to/main/nestoa           # fail on a regression against main's binary
+make bench BENCHMARK_DIR=path/to/the/benchmark    # another checkout
+```
+
+The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs it on every pull request, against
+a build of the base commit. To accept a regression on purpose, explain it in the pull request and add
+the `benchmark-regression` label. On a merge to main, and in the release workflow, it dispatches the
+benchmark's refresh workflow, which opens a pull request there with the results of `nestoa-main` or of
+the released version. Both need the `BENCHMARK_TOKEN` secret, a token with read and write access to the
+contents of the benchmark repository; without it the jobs are skipped with a warning.
 
 ## Where to make a change
 

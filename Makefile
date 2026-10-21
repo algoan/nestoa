@@ -8,7 +8,7 @@ export RUST_BACKTRACE
 
 .DEFAULT_GOAL := help
 
-.PHONY: help ci check test build build-debug lint fmt fmt-fix clippy clean
+.PHONY: help ci check test build build-debug lint fmt fmt-fix clippy bench clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -43,6 +43,14 @@ fmt-fix: ## Apply formatting fixes
 
 clippy: ## Run clippy, denying warnings
 	cargo clippy --workspace --all-targets -- -D warnings
+
+## --- benchmark (benchmark.yml) ---
+
+BENCHMARK_DIR ?= ../nestjs-openapi-generation-benchmark
+export BENCHMARK_DIR
+
+bench: build ## Check against the benchmark; BASELINE=<binary> to fail on a regression
+	scripts/benchmark.sh target/release/nestoa $(BASELINE)
 
 ## --- housekeeping ---
 
