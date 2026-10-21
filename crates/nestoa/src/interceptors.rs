@@ -155,9 +155,10 @@ pub fn rewrite_response(
         let Some((in_ty, out_ty)) = nest_interceptor_args(class) else {
             continue;
         };
-        // `NestInterceptor<any, any>` (logging, tracing) says nothing about
-        // the payload: keep what the earlier interceptors made of it.
-        if is_wildcard(&out_ty) {
+        // `NestInterceptor<any, any>` or `<any, Observable<any>>` (logging,
+        // tracing) says nothing about the payload: keep what the earlier
+        // interceptors made of it.
+        if is_wildcard(unwrap_async(&out_ty)) {
             continue;
         }
         let params = type_param_names(class);

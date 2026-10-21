@@ -390,7 +390,8 @@ impl<'a> Extractor<'a> {
             }
             match name.as_str() {
                 "HttpCode" => http_code = first_arg(d).and_then(|e| self.status_value(file, e)),
-                "Redirect" => {
+                // Decorators apply bottom-up: the topmost redirect is sent.
+                "Redirect" if redirect_code.is_none() => {
                     redirect_code = Some(
                         nth_arg(d, 1)
                             .and_then(|e| self.status_value(file, e))
@@ -4112,6 +4113,7 @@ mod tests {
             export class LinksController {
                 @Get('docs') @Redirect('https://docs.example.com', MOVED) docs(): void {}
                 @Get('home') @Redirect('/') home(): void {}
+                @Get('stacked') @Redirect('/a', 301) @Redirect('/b', 307) stacked(): void {}
                 @Get('next') @HttpCode(200) @Redirect('/new', HttpStatus.TEMPORARY_REDIRECT)
                 next(): { url: string } { return { url: '/x' }; }
             }
@@ -4121,6 +4123,7 @@ mod tests {
             ("/links/docs", "301"),
             ("/links/home", "302"),
             ("/links/next", "307"),
+            ("/links/stacked", "301"),
         ] {
             assert_eq!(status_codes(&doc, path, "get"), [code, "401"], "{path}");
             let success = &doc["paths"][path]["get"]["responses"][code];
@@ -4665,10 +4668,11 @@ mod tests {
             interface Envelope<D> { data: D; }
             class StampInterceptor implements NestInterceptor<unknown, Envelope<string>> {}
             class LoggingInterceptor implements NestInterceptor<any, any> {}
+            class TraceInterceptor implements NestInterceptor<unknown, Observable<unknown>> {}
             class DeferInterceptor<T> implements NestInterceptor<T, Observable<T>> {}
             @Controller('books')
             export class BooksController {
-                @Get() @UseInterceptors(StampInterceptor, LoggingInterceptor)
+                @Get() @UseInterceptors(StampInterceptor, LoggingInterceptor, TraceInterceptor)
                 list(): Book { return null as any; }
                 @Get('export') @UseInterceptors(DeferInterceptor)
                 export(): StreamableFile { return null as any; }
