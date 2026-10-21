@@ -50,8 +50,9 @@ pub struct ComponentSchemas {
     /// The bindings of a reference leaving parameters to their defaults, keyed
     /// by the declaration and the arguments it supplies, so a reference
     /// reached again skips lowering the defaults (which may reach further
-    /// defaulted references, exponentially).
-    by_supplied: HashMap<InstantiationKey, TypeEnv>,
+    /// defaulted references, exponentially). Keyed by `inline_generics` too,
+    /// which decides what the bindings hold.
+    by_supplied: HashMap<(bool, InstantiationKey), TypeEnv>,
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
@@ -847,7 +848,7 @@ impl<'a> SchemaCtx<'a> {
         // Names references back to this instance reserved while its defaults
         // were lowered.
         let mut closed: Vec<String> = Vec::new();
-        let mut supplied: Option<InstantiationKey> = None;
+        let mut supplied: Option<(bool, InstantiationKey)> = None;
         for (i, (param, default)) in declared.iter().enumerate() {
             let defaulted = args.get(i).is_none();
             let default_key = defaulted.then(|| {
@@ -865,7 +866,10 @@ impl<'a> SchemaCtx<'a> {
                 return closing;
             }
             if i == args.len() {
-                let key = instantiation_key(decl_file, &sym.name(), &params[..i], &new_env);
+                let key = (
+                    self.inline_generics,
+                    instantiation_key(decl_file, &sym.name(), &params[..i], &new_env),
+                );
                 if let Some(env) = self.components.by_supplied.get(&key) {
                     new_env = env.clone();
                     break;
@@ -5644,5 +5648,45 @@ mod tests {
             instance("explicit")["properties"]["extra"],
             json!({"type": "boolean"})
         );
+    }
+
+    #[test]
+    fn cached_defaults_keep_each_lowering_mode() {
+        let dto = "export interface Box<T> { value: T; }\n\
+                   export interface Envelope<T, U = Box<T>> { data: U; }\n\
+                   export interface Body { e: Envelope<string>; }\n\
+                   export interface Out { e: Envelope<string>; }";
+        for order in [[false, true], [true, false]] {
+            let (project, dir) = project_from(&[("main.ts", dto)]);
+            let file = dir.join("main.ts");
+            let mut components = ComponentSchemas::default();
+            for inline in order {
+                let mut ctx = SchemaCtx {
+                    project: &project,
+                    components: &mut components,
+                    type_env: inline.then(TypeEnv::new),
+                    inline_generics: inline,
+                    current_owner: None,
+                    instantiating: Vec::new(),
+                    passthrough_types: &[],
+                };
+                let name = if inline { "Out" } else { "Body" };
+                let (decl_file, sym) = project.resolve(&file, name).unwrap();
+                let schema = ctx.symbol_to_schema(&decl_file, &sym);
+                if inline {
+                    assert_eq!(
+                        schema["properties"]["e"]["properties"]["data"]["properties"]["value"],
+                        json!({"type": "string"}),
+                        "order {order:?}: {schema}"
+                    );
+                }
+            }
+            let envelope = &components.schemas["EnvelopeString"];
+            assert_eq!(
+                envelope["properties"]["data"],
+                json!({"$ref": "#/components/schemas/BoxString"}),
+                "order {order:?}"
+            );
+        }
     }
 }
