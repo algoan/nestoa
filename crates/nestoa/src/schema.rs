@@ -47,11 +47,11 @@ pub struct ComponentSchemas {
     /// one of them again (`Link<T, U = Node<T>>`, `Node<T>` holding
     /// `Link<T>`; `A<T = B>`, `B<U = A>`) is the instance in flight.
     defaulting: HashMap<(std::path::PathBuf, String, usize, String), Option<String>>,
-    /// The instantiation a reference leaving parameters to their defaults
-    /// expands to, keyed by the declaration and the arguments it supplies,
-    /// so a reference reached again skips lowering the defaults (which may
-    /// reach further defaulted references, exponentially).
-    by_supplied: HashMap<InstantiationKey, InstantiationKey>,
+    /// The bindings of a reference leaving parameters to their defaults, keyed
+    /// by the declaration and the arguments it supplies, so a reference
+    /// reached again skips lowering the defaults (which may reach further
+    /// defaulted references, exponentially).
+    by_supplied: HashMap<InstantiationKey, TypeEnv>,
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
@@ -866,14 +866,9 @@ impl<'a> SchemaCtx<'a> {
             }
             if i == args.len() {
                 let key = instantiation_key(decl_file, &sym.name(), &params[..i], &new_env);
-                if !self.inline_generics
-                    && let Some(name) = self
-                        .components
-                        .by_supplied
-                        .get(&key)
-                        .and_then(|full| self.components.instantiated.get(full))
-                {
-                    return Some(ref_value(name));
+                if let Some(env) = self.components.by_supplied.get(&key) {
+                    new_env = env.clone();
+                    break;
                 }
                 supplied = Some(key);
             }
@@ -912,12 +907,12 @@ impl<'a> SchemaCtx<'a> {
         if new_env.is_empty() {
             return None;
         }
-        let key = instantiation_key(decl_file, &sym.name(), &params, &new_env);
-        if let Some(supplied) = supplied
-            && !self.inline_generics
-        {
-            self.components.by_supplied.insert(supplied, key.clone());
+        if let Some(supplied) = supplied {
+            self.components
+                .by_supplied
+                .insert(supplied, new_env.clone());
         }
+        let key = instantiation_key(decl_file, &sym.name(), &params, &new_env);
         if let Some(name) = closed.first() {
             let hint = name.clone();
             return Some(self.lower_instance(decl_file, sym, key, hint, new_env, &closed));
@@ -2070,8 +2065,8 @@ fn string_enum_keys(
 /// A declaration's own generic type parameters, in order, with their
 /// defaults (`[("T", None)]` for `interface Foo<T>`). Empty for a non-generic
 /// declaration.
-/// The parameters of merged interface declarations are the same, but any of
-/// them may add the defaults.
+/// Merged interface declarations share their parameters, and any of them may
+/// add defaults or defaulted parameters.
 fn generic_params(sym: &Symbol) -> Vec<(String, Option<Box<TsType>>)> {
     let decls: Vec<&swc_ecma_ast::TsTypeParamDecl> = match sym {
         Symbol::Interface(i) => i.decls().filter_map(|d| d.type_params.as_deref()).collect(),
@@ -2079,10 +2074,11 @@ fn generic_params(sym: &Symbol) -> Vec<(String, Option<Box<TsType>>)> {
         Symbol::Class(c) => c.type_params.as_deref().into_iter().collect(),
         Symbol::Enum(_) => Vec::new(),
     };
-    let Some(first) = decls.first() else {
+    // A later declaration may add parameters, as long as they have defaults.
+    let Some(longest) = decls.iter().max_by_key(|d| d.params.len()) else {
         return Vec::new();
     };
-    first
+    longest
         .params
         .iter()
         .enumerate()
@@ -5560,6 +5556,13 @@ mod tests {
         let (_, schemas) = lower_component("", &dto, "Holder");
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(required_names(&schemas["Holder"]), ["a"]);
+        let start = std::time::Instant::now();
+        let (holder, _) = lower_under_env(&dto, "Holder");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            holder["properties"]["a"]["properties"]["x"],
+            json!({"type": "string"})
+        );
     }
 
     #[test]
@@ -5621,5 +5624,25 @@ mod tests {
             "Holder",
         );
         assert!(schemas.contains_key(&ref_name(&schemas["Holder"], "grow")));
+    }
+
+    #[test]
+    fn a_merged_interface_declaration_may_add_a_defaulted_parameter() {
+        let (_, schemas) = lower_component(
+            "",
+            "export interface Box<T> { value: T; }\n\
+             export interface Box<T, U = string> { extra: U; }\n\
+             export interface Holder { omitted: Box<number>; explicit: Box<number, boolean>; }",
+            "Holder",
+        );
+        let instance = |p: &str| schemas[&ref_name(&schemas["Holder"], p)].clone();
+        assert_eq!(
+            instance("omitted")["properties"]["extra"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            instance("explicit")["properties"]["extra"],
+            json!({"type": "boolean"})
+        );
     }
 }

@@ -1086,9 +1086,8 @@ mod tests {
         assert_eq!(items, "#/components/schemas/Project");
 
         // The element DTO is registered; the generic wrappers are inlined, not refs.
-        assert!(components.schemas.contains_key("Project"));
-        assert!(!components.schemas.contains_key("PaginatedData"));
-        assert!(!components.schemas.contains_key("DataToPaginate"));
+        let names: Vec<&str> = components.schemas.keys().map(String::as_str).collect();
+        assert_eq!(names, ["Project"], "got {names:?}");
     }
 
     #[test]
