@@ -559,7 +559,12 @@ impl<'a> Extractor<'a> {
         let mut uploads = class.uploads.clone();
         uploads.extend(self.uploads(file, &m.function.decorators));
         if !uploads.is_empty() {
-            request_body = Some(multipart_body(request_body, &uploads, file_param_required));
+            request_body = Some(multipart_body(
+                request_body,
+                &uploads,
+                file_param_required,
+                self.components,
+            ));
         }
 
         // Response type. An interceptor may reshape the wire response (e.g.
@@ -904,8 +909,16 @@ impl<'a> Extractor<'a> {
                 let Callee::Expr(callee) = &c.callee else {
                     continue;
                 };
-                let Some(kind) = class_name(callee) else {
+                let Some(local) = class_name(callee) else {
                     continue;
+                };
+                // Matched by the name it is exported as (`FileInterceptor as Upload`).
+                let kind = match callee.as_ref() {
+                    Expr::Ident(_) => self
+                        .project
+                        .import_origin(file, &local)
+                        .map_or(local, |(_, exported)| exported),
+                    _ => local,
                 };
                 let arg = |i: usize| c.args.get(i).map(|a| &*a.expr);
                 let name = |e: Option<&Expr>| {
@@ -1484,6 +1497,7 @@ fn multipart_body(
     body: Option<RequestBody>,
     uploads: &[Upload],
     file_param_required: bool,
+    components: &ComponentSchemas,
 ) -> RequestBody {
     let binary = json!({ "type": "string", "format": "binary" });
     let mut properties = Map::new();
@@ -1539,14 +1553,33 @@ fn multipart_body(
             object.insert("additionalProperties".into(), binary);
         }
         schema
-    } else if properties.is_empty() {
-        schema
     } else {
         let mut files = json!({ "type": "object", "properties": properties });
         if files_required {
             files["required"] = Value::Array(required);
         }
-        json!({ "allOf": [schema, files] })
+        // `additionalProperties` only spares the fields its own branch names,
+        // so the body's fields are named there too, unconstrained.
+        let body_fields = any_file
+            .then(|| object_members(&schema, components))
+            .flatten();
+        if let Some((fields, _)) = body_fields {
+            for (name, _) in fields {
+                files["properties"]
+                    .as_object_mut()
+                    .expect("an object")
+                    .entry(name)
+                    .or_insert_with(|| json!({}));
+            }
+            files["additionalProperties"] = binary;
+        }
+        if files["properties"].as_object().is_some_and(Map::is_empty)
+            && files.get("additionalProperties").is_none()
+        {
+            schema
+        } else {
+            json!({ "allOf": [schema, files] })
+        }
     };
     RequestBody {
         schema,
@@ -4342,6 +4375,42 @@ mod tests {
             content["application/json"]["schema"]["properties"]["data"],
             json!({"type": "string"}),
             "{content}"
+        );
+    }
+
+    #[test]
+    fn aliased_and_any_file_uploads_keep_their_files() {
+        let doc = document(
+            "uploads-aliased",
+            r#"
+            import { FileInterceptor as Upload, AnyFilesInterceptor } from '@nestjs/platform-express';
+            export class Base { owner: string; }
+            export class CoverDto extends Base { title: string; }
+            @Controller('books')
+            export class BooksController {
+                @Post('cover') @UseInterceptors(Upload('cover'))
+                cover(@UploadedFile() cover: Express.Multer.File): void {}
+
+                @Post('any') @UseInterceptors(AnyFilesInterceptor())
+                any(@Body() dto: CoverDto): void {}
+            }
+            "#,
+        );
+        let schema = |path: &str| {
+            doc["paths"][path]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+                .clone()
+        };
+        let binary = json!({"type": "string", "format": "binary"});
+        assert_eq!(
+            schema("/books/cover"),
+            json!({"type": "object", "properties": {"cover": binary}, "required": ["cover"]})
+        );
+        assert_eq!(
+            schema("/books/any"),
+            json!({"allOf": [
+                {"$ref": "#/components/schemas/CoverDto"},
+                {"type": "object", "properties": {"owner": {}, "title": {}}, "additionalProperties": binary},
+            ]})
         );
     }
 }
