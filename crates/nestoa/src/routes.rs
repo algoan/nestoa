@@ -930,16 +930,15 @@ impl<'a> Extractor<'a> {
                 let Callee::Expr(callee) = &c.callee else {
                     continue;
                 };
-                let Some(local) = class_name(callee) else {
+                let Some(dotted) = crate::constval::dotted_name(callee) else {
                     continue;
                 };
-                // Matched by the name it is exported as (`FileInterceptor as Upload`).
-                let kind = match callee.as_ref() {
-                    Expr::Ident(_) => self
-                        .project
-                        .import_origin(file, &local)
-                        .map_or(local, |(_, exported)| exported),
-                    _ => local,
+                // Matched by the name it is exported as (`FileInterceptor as
+                // Upload`), and only from Nest's Express platform when imported.
+                let kind = match self.package_origin(file, &dotted) {
+                    Some((package, exported)) if package == "@nestjs/platform-express" => exported,
+                    Some(_) => continue,
+                    None => dotted.rsplit('.').next().unwrap_or_default().to_string(),
                 };
                 let arg = |i: usize| c.args.get(i).map(|a| &*a.expr);
                 let name = |e: Option<&Expr>| {
@@ -978,6 +977,10 @@ impl<'a> Extractor<'a> {
                     ),
                     "FileFieldsInterceptor" => {
                         let Some(Expr::Array(fields)) = arg(0).map(crate::constval::unwrap) else {
+                            crate::diag::warn(format!(
+                                "cannot read the fields of {kind}(…); the files are left out"
+                            ));
+                            out.push(Upload::Fields(Vec::new()));
                             continue;
                         };
                         Upload::Fields(
@@ -4489,5 +4492,39 @@ mod tests {
         );
         assert_eq!(keys("/books/qualified"), ["application/octet-stream"]);
         assert_eq!(keys("/books/foreign"), ["application/json"]);
+    }
+
+    #[test]
+    fn only_nest_upload_interceptors_make_a_multipart_body() {
+        crate::diag::take_warnings();
+        let doc = document(
+            "uploads-origin",
+            r#"
+            import { FileInterceptor } from '@acme/uploads';
+            import { FileFieldsInterceptor } from '@nestjs/platform-express';
+            const FIELDS = [{ name: 'front' }];
+            @Controller('books')
+            export class BooksController {
+                @Post('foreign') @UseInterceptors(FileInterceptor('cover')) foreign(): void {}
+                @Post('fields') @UseInterceptors(FileFieldsInterceptor(FIELDS)) fields(): void {}
+            }
+            "#,
+        );
+        assert!(
+            doc["paths"]["/books/foreign"]["post"]
+                .get("requestBody")
+                .is_none()
+        );
+        assert_eq!(
+            doc["paths"]["/books/fields"]["post"]["requestBody"]["content"],
+            json!({"multipart/form-data": {"schema": {"type": "object"}}})
+        );
+        let warnings = crate::diag::take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("cannot read the fields of FileFieldsInterceptor")),
+            "{warnings:?}"
+        );
     }
 }
