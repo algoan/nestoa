@@ -574,10 +574,16 @@ impl<'a> Extractor<'a> {
         // pagination); when it does, the rewritten schema replaces the
         // declared return type — and we skip lowering the declared type at
         // all so its now-unreferenced components don't leak into the doc.
+        // `@Sse` marks an event stream even under another verb decorator.
+        let sse = m
+            .function
+            .decorators
+            .iter()
+            .any(|d| decorator_name(d) == "Sse");
         let declared_return = m.function.return_type.as_ref().map(|r| &*r.type_ann);
         let (response_value, response_media_type) = if redirect_code.is_some() {
             (None, JSON.to_string())
-        } else if matches!(verb, VerbDecorator::Sse) {
+        } else if sse {
             (
                 Some(json!({ "type": "string" })),
                 "text/event-stream".to_string(),
@@ -655,7 +661,11 @@ impl<'a> Extractor<'a> {
                 .collect()
         };
 
-        let status_code = redirect_code.or(http_code).unwrap_or(verb.default_status());
+        // Nest writes an event stream's head with 200, whatever `@HttpCode` says.
+        let status_code = redirect_code
+            .or(sse.then_some(200))
+            .or(http_code)
+            .unwrap_or(verb.default_status());
 
         // Error-response signals for this method (path-independent parts).
         // The auth opt-out and role decorators apply if present on either the
@@ -4693,5 +4703,26 @@ mod tests {
                 ["additionalProperties"],
             json!({"anyOf": [{"type": "number"}, {"type": "string", "format": "binary"}]})
         );
+    }
+
+    #[test]
+    fn sse_streams_with_200_under_any_stacking() {
+        let doc = document(
+            "sse-stacked",
+            r#"
+            @Controller('feed')
+            export class FeedController {
+                @Get('events') @Sse() events(): Observable<MessageEvent> { return null as any; }
+                @Sse('quiet') @HttpCode(204) quiet(): Observable<MessageEvent> { return null as any; }
+            }
+            "#,
+        );
+        let stream = json!({"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}});
+        for path in ["/feed/events", "/feed/quiet"] {
+            assert_eq!(
+                doc["paths"][path]["get"]["responses"]["200"], stream,
+                "{path}"
+            );
+        }
     }
 }

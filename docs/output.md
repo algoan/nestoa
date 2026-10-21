@@ -48,7 +48,7 @@ says otherwise. Its argument can be a number, a constant (`MULTI_STATUS`,
 | returns a type | that type, as `application/json` |
 | `@Header('Content-Type', 'text/csv')` | the same schema under that media type |
 | returns `StreamableFile` | `type: string`, `format: binary`, as `application/octet-stream` or the `@Header('Content-Type', …)` type |
-| `@Sse()` | `type: string` as `text/event-stream` |
+| `@Sse()`, even under another verb decorator | `200`, whatever `@HttpCode` says, with `type: string` as `text/event-stream` |
 | `@Redirect(url, status)` | the redirect status (`302` by default, whatever `@HttpCode` says), with a `Location` header and no body |
 | status `204`, `205` or `304` | no body, whatever the return type |
 | no return type | no body, unless an interceptor's output doesn't depend on its input |
