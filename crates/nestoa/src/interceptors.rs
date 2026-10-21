@@ -215,6 +215,7 @@ pub fn rewrite_response(
         project,
         components,
         type_env: Some(env),
+        inline_generics: true,
         current_owner: None,
         instantiating: Vec::new(),
         passthrough_types: &config.passthrough_types,
@@ -1152,7 +1153,7 @@ mod tests {
         let resp = route.response.as_ref().expect("response schema");
         // Untransformed: the declared DataToPaginate<Project> is emitted as a $ref.
         let refstr = resp.get("$ref").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(refstr, "#/components/schemas/DataToPaginate");
+        assert_eq!(refstr, "#/components/schemas/DataToPaginateProject");
     }
 
     fn signed_controller() -> String {

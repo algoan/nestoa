@@ -176,18 +176,38 @@ fn instantiation_key(
     )
 }
 
-/// Name a recursive instantiation after the components its arguments resolved
-/// to (`TreeNode` + `Project` -> `TreeNodeProject`), so sibling instantiations
-/// read apart instead of colliding on a numeric suffix.
+/// Name an instantiation after what its arguments resolved to
+/// (`TreeNode` + `Project` -> `TreeNodeProject`, `Box<string[]>` ->
+/// `BoxStringArray`), so sibling instantiations read apart instead of
+/// colliding on a numeric suffix.
 fn instantiation_suffix(params: &[String], env: &TypeEnv) -> String {
     params
         .iter()
-        .filter_map(|p| {
-            let r = env.get(p)?.resolved.as_ref()?;
-            let name = r.get("$ref")?.as_str()?.rsplit('/').next()?;
-            Some(sanitize_name(name))
-        })
+        .filter_map(|p| argument_label(env.get(p)?.resolved.as_ref()?))
         .collect()
+}
+
+/// A name for a lowered type argument: the component it references, a
+/// primitive type, or an array of either. `None` for any other shape.
+fn argument_label(schema: &Value) -> Option<String> {
+    if let Some(r) = schema.get("$ref") {
+        return Some(sanitize_name(r.as_str()?.rsplit('/').next()?));
+    }
+    let obj = schema.as_object()?;
+    match obj.get("type")?.as_str()? {
+        "array" if obj.len() == 2 => Some(format!("{}Array", argument_label(obj.get("items")?)?)),
+        "string"
+            if obj.get("format").and_then(Value::as_str) == Some("date-time") && obj.len() == 2 =>
+        {
+            Some("Date".into())
+        }
+        t @ ("string" | "number" | "integer" | "boolean") if obj.len() == 1 => {
+            let mut label = t.to_string();
+            label[..1].make_ascii_uppercase();
+            Some(label)
+        }
+        _ => None,
+    }
 }
 
 /// What `SchemaCtx::class_member` reads off a class field or a constructor
@@ -204,10 +224,14 @@ struct ClassMember<'a> {
 pub struct SchemaCtx<'a> {
     pub project: &'a Project,
     pub components: &'a mut ComponentSchemas,
-    /// Active generic substitutions. `None` outside interceptor lowering.
-    /// Owned so it can be temporarily replaced when instantiating a nested
-    /// generic type (whose own parameters shadow the outer ones).
+    /// Active generic substitutions: an interceptor's bindings, or those of
+    /// the generic instantiation being lowered. Owned so it can be temporarily
+    /// replaced when instantiating a nested generic type (whose own parameters
+    /// shadow the outer ones).
     pub type_env: Option<TypeEnv>,
+    /// Inline generic instantiations instead of registering one component per
+    /// instantiation. Set by interceptor rewrites, whose output is per route.
+    pub inline_generics: bool,
     /// User-configured transparent wrapper types (`Config::passthrough_types`),
     /// each lowered to its first type argument. Extends the built-in passthrough
     /// set (`Promise`, `Observable`, `Partial`, …).
@@ -464,7 +488,13 @@ impl<'a> SchemaCtx<'a> {
                 .project
                 .resolve_namespace_member(file, &parent, &member)
             {
-                return self.component_ref(&decl_file, &member, &sym);
+                return self.declaration_ref(
+                    file,
+                    &decl_file,
+                    &member,
+                    &sym,
+                    r.type_params.as_deref(),
+                );
             }
             // Unknown — fall through and return placeholder.
             return json!({ "x-unresolved": format!("{}.{}", parent, member) });
@@ -634,18 +664,7 @@ impl<'a> SchemaCtx<'a> {
 
         // Resolve to a project symbol.
         if let Some((decl_file, sym)) = self.project.resolve(file, &name) {
-            // During interceptor response lowering, a named reference carrying
-            // type arguments (e.g. `MultiStatusResponse<Omit<T, ...>>`) is
-            // instantiated: the declaration's own generic parameters are bound
-            // to the arguments and its body inlined per route, so distinct
-            // element types never collapse onto one shared `$ref` component.
-            if self.type_env.is_some()
-                && let Some(args) = &r.type_params
-                && let Some(inlined) = self.instantiate_generic(file, &decl_file, &name, &sym, args)
-            {
-                return inlined;
-            }
-            return self.component_ref(&decl_file, &name, &sym);
+            return self.declaration_ref(file, &decl_file, &name, &sym, r.type_params.as_deref());
         }
         // Unknown — leave a permissive placeholder annotated with the name.
         json!({ "x-unresolved": name })
@@ -658,10 +677,29 @@ impl<'a> SchemaCtx<'a> {
     /// where the type is named in JSDoc rather than in the AST.
     pub fn named_type_to_schema(&mut self, file: &Path, type_name: &str) -> Value {
         if let Some((decl_file, sym)) = self.project.resolve(file, type_name) {
-            self.component_ref(&decl_file, type_name, &sym)
+            self.declaration_ref(file, &decl_file, type_name, &sym, None)
         } else {
             json!({ "x-unresolved": type_name })
         }
+    }
+
+    /// A reference to a project declaration, written in `file` with `args`. A
+    /// generic declaration is instantiated with the arguments, its defaults
+    /// filling the missing ones; a reference that binds none of its parameters
+    /// (no arguments, no defaults) is a plain `component_ref`.
+    fn declaration_ref(
+        &mut self,
+        file: &Path,
+        decl_file: &Path,
+        type_name: &str,
+        sym: &Symbol,
+        args: Option<&TsTypeParamInstantiation>,
+    ) -> Value {
+        let args: Vec<&TsType> = args
+            .map(|a| a.params.iter().map(|p| &**p).collect())
+            .unwrap_or_default();
+        self.instantiate_generic(file, decl_file, type_name, sym, &args)
+            .unwrap_or_else(|| self.component_ref(decl_file, type_name, sym))
     }
 
     /// Resolve a reference to a named project type into a `$ref`, registering
@@ -734,54 +772,69 @@ impl<'a> SchemaCtx<'a> {
     }
 
     /// Instantiate a generic project type reference (`Name<Arg1, ...>`) by
-    /// binding the declaration's own type parameters to the supplied arguments
-    /// and inlining its body. Returns `None` when the declaration has no type
-    /// parameters (a non-generic reference, which keeps its shared `$ref`).
+    /// binding the declaration's own type parameters to the supplied
+    /// arguments, or to their defaults. Returns `None` when this binds nothing:
+    /// a non-generic declaration, or a bare reference to a generic one without
+    /// defaults, which keeps its shared `$ref`.
     ///
     /// Each argument is lowered eagerly under the *current* env before the new
     /// bindings take effect, so an argument that references an outer parameter
     /// (`Omit<T, ...>` where `T` is bound by an interceptor) resolves in the
     /// scope it was written in even though the callee reuses the name `T` for
-    /// its own parameter. The body is then lowered under only the fresh
-    /// bindings, and inlined rather than `$ref`d so distinct instantiations
-    /// (different element types) do not collide on one component. The exception
-    /// is a declaration that reaches itself, which cannot be inlined finitely:
-    /// it becomes one component per distinct argument binding.
+    /// its own parameter. A default is lowered in the declaration's scope,
+    /// under the parameters bound before it. The body is then lowered under
+    /// only the fresh bindings, as one component per distinct binding
+    /// (`Page<Book>` -> `PageBook`), or inlined under `inline_generics`. A
+    /// declaration that reaches itself cannot be inlined finitely, so it is a
+    /// component either way.
     fn instantiate_generic(
         &mut self,
         file: &Path,
         decl_file: &Path,
         type_name: &str,
         sym: &Symbol,
-        args: &TsTypeParamInstantiation,
+        args: &[&TsType],
     ) -> Option<Value> {
-        let params = generic_param_names(sym);
-        if params.is_empty() {
-            return None;
-        }
+        let declared = generic_params(sym);
         // Arguments are lowered in the *caller's* scope, before this
         // declaration is marked active: they belong to the reference site, not
         // to the body about to be expanded. Marking first would read a finite
         // nesting like `Box<Box<T>>` as recursion and leave the inner
         // argument's own parameter unbound.
         let mut new_env: TypeEnv = HashMap::new();
-        for (param, arg) in params.iter().zip(args.params.iter()) {
-            let resolved = self.ts_type_to_schema(file, arg);
-            let admits_undefined = self.admits_undefined(file, arg, 0);
+        for (i, (param, default)) in declared.iter().enumerate() {
+            let (origin, arg) = match (args.get(i), default) {
+                (Some(arg), _) => (file, *arg),
+                (None, Some(default)) => (decl_file, &**default),
+                (None, None) => continue,
+            };
+            let caller_env = args
+                .get(i)
+                .is_none()
+                .then(|| self.type_env.replace(new_env.clone()));
+            let resolved = self.ts_type_to_schema(origin, arg);
+            let admits_undefined = self.admits_undefined(origin, arg, 0);
+            if let Some(env) = caller_env {
+                self.type_env = env;
+            }
             new_env.insert(
                 param.clone(),
                 TypeBinding {
-                    origin_file: file.to_path_buf(),
-                    ty: (**arg).clone(),
+                    origin_file: origin.to_path_buf(),
+                    ty: arg.clone(),
                     resolved: Some(resolved),
                     admits_undefined: Some(admits_undefined),
                 },
             );
         }
-        let key = instantiation_key(decl_file, type_name, &params, &new_env);
-        // Already lowered — by an earlier route, or an earlier field of this
-        // one. Recursive instantiations are components, so reuse the existing
-        // one rather than lowering a duplicate under a fresh name.
+        if new_env.is_empty() {
+            return None;
+        }
+        let params: Vec<String> = declared.into_iter().map(|(p, _)| p).collect();
+        let key = instantiation_key(decl_file, &sym.name(), &params, &new_env);
+        // Already lowered as a component — by an earlier route, or an earlier
+        // field of this one — so reuse it rather than lowering a duplicate
+        // under a fresh name.
         if let Some(name) = self.components.instantiated.get(&key) {
             return Some(ref_value(name));
         }
@@ -801,14 +854,14 @@ impl<'a> SchemaCtx<'a> {
         let deep = self
             .instantiating
             .iter()
-            .filter(|(k, ..)| k.0 == decl_file && k.1 == type_name)
+            .filter(|(k, ..)| (&k.0, &k.1) == (&key.0, &key.1))
             .count()
             >= MAX_INSTANTIATION_DEPTH;
         if deep
             && let Some(i) = self
                 .instantiating
                 .iter()
-                .position(|(k, ..)| k.0 == decl_file && k.1 == type_name)
+                .position(|(k, ..)| (&k.0, &k.1) == (&key.0, &key.1))
         {
             let name = self.reserve_instantiation_name(i);
             return Some(ref_value(&name));
@@ -822,9 +875,21 @@ impl<'a> SchemaCtx<'a> {
             instantiation_suffix(&params, &new_env)
         );
         self.instantiating.push((key.clone(), hint, None));
+        if !self.inline_generics {
+            self.reserve_instantiation_name(self.instantiating.len() - 1);
+        }
+        let owner = self
+            .instantiating
+            .last()
+            .and_then(|(_, _, name)| name.clone());
+        let saved_owner = match owner {
+            Some(name) => self.current_owner.replace(name),
+            None => self.current_owner.clone(),
+        };
         let saved = self.type_env.replace(new_env);
         let schema = self.symbol_to_schema(decl_file, sym);
         self.type_env = saved;
+        self.current_owner = saved_owner;
         // A name is present only if something referred back to this instance.
         // Registering the finished schema under it makes every level of the
         // recursion share one component, and recording the instantiation makes
@@ -1689,9 +1754,10 @@ fn entity_name(e: &TsEntityName) -> String {
     }
 }
 
-/// The names of a declaration's own generic type parameters, in order
-/// (`["T"]` for `interface Foo<T>`). Empty for a non-generic declaration.
-fn generic_param_names(sym: &Symbol) -> Vec<String> {
+/// A declaration's own generic type parameters, in order, with their
+/// defaults (`[("T", None)]` for `interface Foo<T>`). Empty for a non-generic
+/// declaration.
+fn generic_params(sym: &Symbol) -> Vec<(String, Option<Box<TsType>>)> {
     let type_params = match sym {
         Symbol::Interface(i) => i.type_params.as_ref(),
         Symbol::TypeAlias(a) => a.type_params.as_ref(),
@@ -1699,7 +1765,12 @@ fn generic_param_names(sym: &Symbol) -> Vec<String> {
         Symbol::Enum(_) => None,
     };
     type_params
-        .map(|tp| tp.params.iter().map(|p| p.name.sym.to_string()).collect())
+        .map(|tp| {
+            tp.params
+                .iter()
+                .map(|p| (p.name.sym.to_string(), p.default.clone()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -2523,6 +2594,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -2774,6 +2846,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3005,6 +3078,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3097,6 +3171,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3202,6 +3277,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &passthrough,
@@ -3239,6 +3315,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3301,6 +3378,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3359,6 +3437,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3395,6 +3474,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3442,6 +3522,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3476,6 +3557,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3505,6 +3587,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3545,6 +3628,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3582,6 +3666,7 @@ mod tests {
             project: &project2,
             components: &mut components2,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3614,6 +3699,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3649,6 +3735,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3682,6 +3769,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -3804,6 +3892,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -4294,6 +4383,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: Some(env),
+            inline_generics: true,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -4326,6 +4416,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: Some(env),
+            inline_generics: true,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &[],
@@ -4614,6 +4705,7 @@ mod tests {
             project: &project,
             components: &mut components,
             type_env: None,
+            inline_generics: false,
             current_owner: None,
             instantiating: Vec::new(),
             passthrough_types: &passthrough,
@@ -4713,11 +4805,14 @@ mod tests {
         let p = &holder["properties"];
         assert_eq!(
             p["a"],
-            json!({"$ref": "#/components/schemas/Set"}),
+            json!({"$ref": "#/components/schemas/SetNumber"}),
             "got {holder}"
         );
         assert_eq!(p["b"], json!({"$ref": "#/components/schemas/Awaited"}));
-        assert_eq!(p["c"], json!({"$ref": "#/components/schemas/Map"}));
+        assert_eq!(
+            p["c"],
+            json!({"$ref": "#/components/schemas/MapStringNumber"})
+        );
         assert_eq!(required_names(&holder), ["a", "b", "c"]);
     }
 
@@ -4734,5 +4829,153 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(prop_names(&user), ["input"]);
+    }
+
+    /// Lower `name` from `main.ts`, after writing `dto.ts` next to it, as a
+    /// component, returning its `$ref` and every component.
+    fn lower_component(dto: &str, main: &str, name: &str) -> (Value, IndexMap<String, Value>) {
+        let (project, dir) = project_from(&[("dto.ts", dto), ("main.ts", main)]);
+        let mut components = ComponentSchemas::default();
+        let mut ctx = SchemaCtx {
+            project: &project,
+            components: &mut components,
+            type_env: None,
+            inline_generics: false,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &[],
+        };
+        let (decl_file, sym) = project.resolve(&dir.join("main.ts"), name).unwrap();
+        let schema = ctx.component_ref(&decl_file, name, &sym);
+        (schema, components.schemas)
+    }
+
+    const GENERICS: &str = "export class Book { title: string; }\n\
+         export class Author { name: string; }\n\
+         export interface Page<T> { items: T[]; total: number; }\n\
+         export interface Box<T> { value: T; }";
+
+    #[test]
+    fn each_instantiation_of_a_generic_is_its_own_component() {
+        let (_, schemas) = lower_component(
+            GENERICS,
+            "import { Author, Book, Box, Page } from './dto';\n\
+             export interface Shelf {\n\
+               books: Page<Book>; authors: Page<Author>; again: Page<Book>;\n\
+               label: Box<string>; tags: Box<number[]>;\n\
+             }",
+            "Shelf",
+        );
+        let shelf = &schemas["Shelf"]["properties"];
+        assert_eq!(ref_name(&schemas["Shelf"], "books"), "PageBook");
+        assert_eq!(ref_name(&schemas["Shelf"], "authors"), "PageAuthor");
+        assert_eq!(ref_name(&schemas["Shelf"], "again"), "PageBook");
+        assert_eq!(ref_name(&schemas["Shelf"], "label"), "BoxString");
+        assert_eq!(
+            ref_name(&schemas["Shelf"], "tags"),
+            "BoxNumberArray",
+            "got {shelf}"
+        );
+        assert_eq!(
+            schemas["PageBook"]["properties"]["items"],
+            json!({"type": "array", "items": {"$ref": "#/components/schemas/Book"}})
+        );
+        assert_eq!(
+            schemas["PageAuthor"]["properties"]["items"]["items"],
+            json!({"$ref": "#/components/schemas/Author"})
+        );
+        assert_eq!(
+            schemas["BoxString"]["properties"]["value"],
+            json!({"type": "string"})
+        );
+        assert!(!schemas.contains_key("Page"));
+        assert!(
+            !serde_json::to_string(&schemas)
+                .unwrap()
+                .contains("x-unresolved")
+        );
+    }
+
+    #[test]
+    fn a_class_extending_a_generic_base_binds_its_arguments() {
+        let (_, schemas) = lower_component(
+            GENERICS,
+            "import { Book } from './dto';\n\
+             export class Envelope<T> { data: T; }\n\
+             export class BookEnvelope extends Envelope<Book> { etag: string; }",
+            "BookEnvelope",
+        );
+        assert_eq!(
+            schemas["BookEnvelope"]["allOf"][0],
+            json!({"$ref": "#/components/schemas/EnvelopeBook"})
+        );
+        assert_eq!(
+            schemas["EnvelopeBook"]["properties"]["data"],
+            json!({"$ref": "#/components/schemas/Book"})
+        );
+    }
+
+    #[test]
+    fn missing_type_arguments_take_their_defaults() {
+        let (_, schemas) = lower_component(
+            "",
+            "export interface Tagged<T = string, U = T[]> { one: T; many: U; }\n\
+             export interface Holder { bare: Tagged; some: Tagged<number>; }",
+            "Holder",
+        );
+        assert_eq!(
+            ref_name(&schemas["Holder"], "bare"),
+            "TaggedStringStringArray"
+        );
+        assert_eq!(
+            ref_name(&schemas["Holder"], "some"),
+            "TaggedNumberNumberArray"
+        );
+        assert_eq!(
+            schemas["TaggedNumberNumberArray"]["properties"],
+            json!({
+                "one": {"type": "number"},
+                "many": {"type": "array", "items": {"type": "number"}},
+            })
+        );
+    }
+
+    #[test]
+    fn generics_nested_in_an_instantiation_are_instantiated() {
+        let (_, schemas) = lower_component(
+            GENERICS,
+            "import * as dto from './dto';\n\
+             export interface Tree<T> { value: dto.Box<T>; children: Tree<T>[]; }\n\
+             import { Page as Listing } from './dto';\n\
+             export interface Root { tree: Tree<dto.Book>; page: dto.Page<dto.Author>; listing: Listing<dto.Author>; }",
+            "Root",
+        );
+        assert_eq!(ref_name(&schemas["Root"], "tree"), "TreeBook");
+        assert_eq!(ref_name(&schemas["Root"], "page"), "PageAuthor");
+        assert_eq!(ref_name(&schemas["Root"], "listing"), "PageAuthor");
+        assert_eq!(ref_name(&schemas["TreeBook"], "value"), "BoxBook");
+        assert_eq!(
+            schemas["TreeBook"]["properties"]["children"]["items"],
+            json!({"$ref": "#/components/schemas/TreeBook"})
+        );
+        assert_eq!(
+            schemas["BoxBook"]["properties"]["value"],
+            json!({"$ref": "#/components/schemas/Book"})
+        );
+    }
+
+    #[test]
+    fn a_generic_referenced_without_arguments_stays_one_component() {
+        let (_, schemas) = lower_component(
+            GENERICS,
+            "import { Page } from './dto';\n\
+             export interface Holder { page: Page; }",
+            "Holder",
+        );
+        assert_eq!(ref_name(&schemas["Holder"], "page"), "Page");
+        assert_eq!(
+            schemas["Page"]["properties"]["items"]["items"],
+            json!({"x-unresolved": "T"})
+        );
     }
 }
