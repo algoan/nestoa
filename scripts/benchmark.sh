@@ -5,7 +5,7 @@
 #   1 (regression, may be intended) when the candidate has more differences with the expected
 #     document than the baseline in any category, or fails `--strict` where the baseline passes;
 #   2 (error, never intended) when the candidate is not deterministic (two runs give different
-#     bytes), a binary writes no document, or the benchmark cannot run.
+#     bytes or exit statuses), a binary writes no document, or the benchmark cannot run.
 #
 #   scripts/benchmark.sh [candidate] [baseline]
 #     candidate: binary to check (default: target/release/nestoa)
@@ -53,9 +53,9 @@ require_document() {
 
 candidate_strict=$(generate "$CANDIDATE" "$OUT/candidate.yaml")
 require_document candidate
-generate "$CANDIDATE" "$OUT/candidate-2.yaml" >/dev/null
-if ! cmp -s "$OUT/candidate.yaml" "$OUT/candidate-2.yaml"; then
-  summary "❌ Two runs of the candidate gave different documents."
+candidate_strict_2=$(generate "$CANDIDATE" "$OUT/candidate-2.yaml")
+if [ "$candidate_strict" != "$candidate_strict_2" ] || ! cmp -s "$OUT/candidate.yaml" "$OUT/candidate-2.yaml"; then
+  summary "❌ Two runs of the candidate gave different documents or exit statuses."
   exit 2
 fi
 

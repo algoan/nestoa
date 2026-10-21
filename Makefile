@@ -50,7 +50,7 @@ BENCHMARK_DIR ?= ../nestjs-openapi-generation-benchmark
 export BENCHMARK_DIR
 
 bench: build ## Check against the benchmark; BASELINE=<binary> to fail on a regression
-	scripts/benchmark.sh target/release/nestoa $(BASELINE)
+	scripts/benchmark.sh target/release/nestoa "$(BASELINE)"
 
 ## --- housekeeping ---
 
