@@ -245,7 +245,7 @@ fn type_param_names(class: &Class) -> HashSet<String> {
 /// way the schema lowerer treats `X | undefined` as just `X`, and is what lets
 /// an interceptor whose handler returns `Promise<DataToPaginate<T> | undefined>`
 /// still bind `T` and produce the transformed `PaginatedData<T>` response.
-fn unwrap_async(ty: &TsType) -> &TsType {
+pub(crate) fn unwrap_async(ty: &TsType) -> &TsType {
     if let TsType::TsTypeRef(r) = ty
         && let Some(name) = ref_ident(&r.type_name)
         && (name == "Promise" || name == "Observable")

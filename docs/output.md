@@ -6,8 +6,8 @@ For every `@Controller` class in the [included](options/include.md) files,
 including handlers inherited through `extends`:
 
 - **Operations** from `@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`, `@Head`,
-  `@Options` and `@All` (expanded to every method). When several verb
-  decorators are stacked, the topmost one wins, as in NestJS.
+  `@Options`, `@All` (expanded to every method) and `@Sse` (a `GET`). When
+  several verb decorators are stacked, the topmost one wins, as in NestJS.
 - **Paths** built from the [base path](options/base-path.md), the version, the
   controller path and the route path. A path can be a literal or a constant
   (`ROUTES.LIST`, `` `redirect/${Species.CAT}` ``, `BASE + '/x'`, a string enum
@@ -23,13 +23,32 @@ including handlers inherited through `extends`:
   `ParseUUIDPipe` set its type.
 - **Request body** from `@Body`.
 - **Success response** from the return type, after unwrapping `Promise` and
-  `Observable`. The status is `201` for `POST` and `200` otherwise, unless
-  `@HttpCode(...)` says otherwise. Its argument can be a number, a named
-  constant or an enum member such as `HttpStatus.NO_CONTENT`.
+  `Observable`, and after the route's [interceptors](options/interceptors.md).
+  See [Success responses](#success-responses).
 - **Error responses**, see [`errorResponses`](options/error-responses.md).
 - **Tags**: each operation is tagged with its controller's class name, without
   the `Controller` suffix (`BooksController` → `Books`).
 - **Summaries and descriptions** from [JSDoc](jsdoc.md).
+
+### Success responses
+
+The status is `201` for `POST` and `200` otherwise, unless `@HttpCode(...)`
+says otherwise. Its argument can be a number, a constant (`MULTI_STATUS`,
+`STATUS.ACCEPTED`) or an enum member such as `HttpStatus.NO_CONTENT`.
+
+| Handler | Response |
+| --- | --- |
+| returns a type | that type, as `application/json` |
+| `@Header('Content-Type', 'text/csv')` | the same schema under that media type |
+| returns `StreamableFile` | `type: string`, `format: binary`, as `application/octet-stream` or the `@Header('Content-Type', …)` type |
+| `@Sse()` | `type: string` as `text/event-stream` |
+| `@Redirect(url, status)` | the redirect status (`302` by default, whatever `@HttpCode` says), with a `Location` header and no body |
+| status `204`, `205` or `304` | no body, whatever the return type |
+| no return type | no body, unless an interceptor's output doesn't depend on its input |
+
+A `StreamableFile` class of your own is lowered like any other type. A handler
+returning `{ url, statusCode }` from a `@Redirect` route changes the status at
+runtime, which nestoa doesn't follow.
 
 ## How types are lowered
 
