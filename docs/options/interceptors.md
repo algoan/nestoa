@@ -57,7 +57,8 @@ list(): Promise<Page<Book>> { … } // response: PaginatedData<T> with T = Book,
 
 Generic types reached from `Out` are **inlined per route**, so two
 controllers using the same interceptor with different element types never share
-one component. Utility types work on bound parameters: `Out` can be
+one component. Elsewhere, each instantiation is a component of its own, such as
+`PageBook` (see [output](../output.md#how-types-are-lowered)). Utility types work on bound parameters: `Out` can be
 `BatchResponse<Omit<T, 'createdAt'>>`, for example. A self-referencing generic
 (`TreeNode<T>` holding `TreeNode<T>[]`) becomes a named component such as
 `TreeNodeBook`, so it is never inlined forever.

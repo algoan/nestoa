@@ -104,6 +104,7 @@ applies to a route with a `@Body`.
 | `Exclude`, `Extract` | the filtered union |
 | `X['key']` | the property's schema |
 | a named class, interface, type alias or enum | a `$ref` to a component |
+| a generic one with type arguments, `Page<Book>` | a `$ref` to one component per distinct set of arguments, `PageBook`; missing arguments take their defaults |
 
 ### Properties
 
