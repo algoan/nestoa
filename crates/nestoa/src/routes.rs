@@ -574,11 +574,6 @@ impl<'a> Extractor<'a> {
                 Some(json!({ "type": "string" })),
                 "text/event-stream".to_string(),
             )
-        } else if declared_return.is_some_and(|t| self.is_streamable_file(file, t)) {
-            (
-                Some(json!({ "type": "string", "format": "binary" })),
-                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
         } else {
             let rewritten = if interceptor_names.is_empty() {
                 None
@@ -592,19 +587,29 @@ impl<'a> Extractor<'a> {
                     self.components,
                 )
             };
-            let response = rewritten.or_else(|| {
-                let mut ctx = SchemaCtx {
-                    project: self.project,
-                    components: self.components,
-                    type_env: None,
-                    current_owner: None,
-                    instantiating: Vec::new(),
-                    passthrough_types: &self.config.passthrough_types,
-                };
-                let schema = ctx.ts_type_to_schema(file, declared_return?);
-                (!schema.is_null() && schema != json!({})).then_some(schema)
-            });
-            (response, content_type.unwrap_or_else(|| JSON.to_string()))
+            // An interceptor may wrap the file in a JSON payload.
+            if rewritten.is_none()
+                && declared_return.is_some_and(|t| self.is_streamable_file(file, t))
+            {
+                (
+                    Some(json!({ "type": "string", "format": "binary" })),
+                    content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                )
+            } else {
+                let response = rewritten.or_else(|| {
+                    let mut ctx = SchemaCtx {
+                        project: self.project,
+                        components: self.components,
+                        type_env: None,
+                        current_owner: None,
+                        instantiating: Vec::new(),
+                        passthrough_types: &self.config.passthrough_types,
+                    };
+                    let schema = ctx.ts_type_to_schema(file, declared_return?);
+                    (!schema.is_null() && schema != json!({})).then_some(schema)
+                });
+                (response, content_type.unwrap_or_else(|| JSON.to_string()))
+            }
         };
 
         // `@route-mapping` lets one method serving several paths return a
@@ -4316,5 +4321,27 @@ mod tests {
         let doc = document_with("security-off", SECURED_CONTROLLER, off);
         assert!(doc["components"].get("securitySchemes").is_none(), "{doc}");
         assert!(doc["paths"]["/pets"]["get"].get("security").is_none());
+    }
+
+    #[test]
+    fn an_interceptor_wrapping_a_file_gives_a_json_response() {
+        let doc = document(
+            "streamable-wrapped",
+            r#"
+            interface Envelope<D> { data: D; }
+            class StampInterceptor implements NestInterceptor<unknown, Envelope<string>> {}
+            @Controller('books')
+            export class BooksController {
+                @Get('export') @UseInterceptors(StampInterceptor)
+                export(): StreamableFile { return null as any; }
+            }
+            "#,
+        );
+        let content = &doc["paths"]["/books/export"]["get"]["responses"]["200"]["content"];
+        assert_eq!(
+            content["application/json"]["schema"]["properties"]["data"],
+            json!({"type": "string"}),
+            "{content}"
+        );
     }
 }
