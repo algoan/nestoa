@@ -41,10 +41,10 @@ pub struct ComponentSchemas {
     /// were lowered. Interceptor output reuses only these: any other
     /// instantiation is inlined there.
     recursive: HashSet<String>,
-    /// Declarations whose missing type arguments are being defaulted. A
-    /// default reaching its own declaration (`A<T = B>`, `B<U = A>`) has no
-    /// finite expansion, so that reference stays a plain component.
-    defaulting: HashSet<(std::path::PathBuf, String)>,
+    /// The type parameters (declaration + index) whose defaults are being
+    /// lowered. A reference needing one of them again (`A<T = B>`,
+    /// `B<U = A>`) has no finite expansion, so it stays a plain component.
+    defaulting: HashSet<(std::path::PathBuf, String, usize)>,
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
@@ -818,8 +818,9 @@ impl<'a> SchemaCtx<'a> {
         args: &[&TsType],
     ) -> Option<Value> {
         let declared = generic_params(sym);
-        let decl_key = (decl_file.to_path_buf(), sym.name());
-        if args.len() < declared.len() && self.components.defaulting.contains(&decl_key) {
+        let param_key = |i: usize| (decl_file.to_path_buf(), sym.name(), i);
+        if (args.len()..declared.len()).any(|i| self.components.defaulting.contains(&param_key(i)))
+        {
             return None;
         }
         // Arguments are lowered in the *caller's* scope, before this
@@ -836,12 +837,12 @@ impl<'a> SchemaCtx<'a> {
             };
             let defaulted = args.get(i).is_none();
             let caller_env = defaulted.then(|| self.type_env.replace(new_env.clone()));
-            let guarded = defaulted && self.components.defaulting.insert(decl_key.clone());
+            let guarded = defaulted && self.components.defaulting.insert(param_key(i));
             let resolved = self.ts_type_to_schema(origin, arg);
             let admits_undefined = self.admits_undefined(origin, arg, 0);
             let awaited = self.awaited_admits_undefined(self.type_env.as_ref(), origin, arg, 0);
             if guarded {
-                self.components.defaulting.remove(&decl_key);
+                self.components.defaulting.remove(&param_key(i));
             }
             if let Some(env) = caller_env {
                 self.type_env = env;
@@ -5382,5 +5383,23 @@ mod tests {
             second["properties"]["back"].get("$ref").is_some(),
             "got {schemas:?}"
         );
+    }
+
+    #[test]
+    fn a_default_instantiating_its_own_declaration_is_expanded() {
+        let (_, schemas) = lower_component(
+            "",
+            "export interface Pair<T = Pair<string>, U = number> { first: T; second: U; }\n\
+             export interface Holder { pair: Pair; }",
+            "Holder",
+        );
+        let outer = &schemas[&ref_name(&schemas["Holder"], "pair")];
+        let inner = &schemas[&ref_name(outer, "first")];
+        assert_eq!(
+            inner["properties"]["first"],
+            json!({"type": "string"}),
+            "got {schemas:?}"
+        );
+        assert_eq!(inner["properties"]["second"], json!({"type": "number"}));
     }
 }
