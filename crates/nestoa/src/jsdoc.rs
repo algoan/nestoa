@@ -181,7 +181,7 @@ fn tag_start(line: &str) -> Option<(&str, &str)> {
     // `@deprecated: use v2`, `@deprecated.`: punctuation that ends the line or
     // a word, unlike `@example.com`.
     if let Some(after) = body.strip_prefix([':', '.', ','])
-        && (after.is_empty() || after.starts_with(char::is_whitespace))
+        && (after.is_empty() || after.starts_with(char::is_whitespace) || after.starts_with('{'))
     {
         body = after;
     }
@@ -691,6 +691,13 @@ mod tests {
         let doc = JsDoc::parse("\n * @deprecated: use v2\n ");
         assert_eq!(doc.deprecated_reason.as_deref(), Some("use v2"));
         assert!(JsDoc::parse(" @deprecated. ").deprecated);
+        let doc = JsDoc::parse("\n * @example:{\"shelf\": \"B2\"}\n ");
+        assert_eq!(doc.example.as_deref(), Some("{\"shelf\": \"B2\"}"));
+        let doc = JsDoc::parse("\n * @route-mapping:{ 'cats': Cat }\n ");
+        assert_eq!(
+            doc.route_mapping,
+            vec![("cats".to_string(), "Cat".to_string())]
+        );
         let doc = JsDoc::parse("\n * Mail\n * @example.com domain\n ");
         assert_eq!(doc.summary.as_deref(), Some("Mail\n@example.com domain"));
     }
