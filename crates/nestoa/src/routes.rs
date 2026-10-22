@@ -4749,8 +4749,9 @@ mod tests {
                 json!({"properties": {
                     "meta": {"type": "object", "example": {"$ref": "#/components/schemas/Orphan"}},
                     "example": {"$ref": "#/components/schemas/Shelf"}
-                }}),
+                }, "dependentSchemas": {"example": {"$ref": "#/components/schemas/Author"}}}),
             ),
+            ("Author", json!({"type": "object"})),
             ("Orphan", json!({"type": "object"})),
             ("Shelf", json!({"type": "object"})),
         ]
@@ -4761,6 +4762,6 @@ mod tests {
             .into_iter()
             .collect();
         reachable.sort();
-        assert_eq!(reachable, ["Book", "Shelf"]);
+        assert_eq!(reachable, ["Author", "Book", "Shelf"]);
     }
 }
