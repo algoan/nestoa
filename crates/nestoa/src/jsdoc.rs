@@ -340,7 +340,7 @@ pub fn example_value(raw: &str, schema_types: &[&str]) -> Value {
     });
     match parsed {
         Some(v) if v.is_string() => v,
-        Some(v) if has_rounded_integer(&v) => Value::String(raw.to_string()),
+        Some(v) if has_rounded_number(&v) => Value::String(raw.to_string()),
         // A `$ref` or a union: its type is unknown here, and a scalar would
         // contradict a string enum or alias.
         Some(v) if schema_types.is_empty() && (v.is_object() || v.is_array()) => v,
@@ -359,15 +359,14 @@ pub fn example_value(raw: &str, schema_types: &[&str]) -> Value {
     }
 }
 
-/// Whether `v` holds an integer too large for 64 bits, which serde_json rounds
-/// to the nearest `f64`.
-fn has_rounded_integer(v: &Value) -> bool {
+/// Whether `v` holds a float of 2^53 or more, where an `f64` no longer has
+/// every integer: `12345678901234567890123` or `9007199254740993.0` would come
+/// back rounded. Integers serde_json reads as `i64`/`u64` stay exact.
+fn has_rounded_number(v: &Value) -> bool {
     match v {
-        Value::Number(n) => n
-            .as_f64()
-            .is_some_and(|f| n.is_f64() && f.fract() == 0.0 && f.abs() >= 2f64.powi(63)),
-        Value::Array(items) => items.iter().any(has_rounded_integer),
-        Value::Object(m) => m.values().any(has_rounded_integer),
+        Value::Number(n) => n.is_f64() && n.as_f64().is_some_and(|f| f.abs() >= 2f64.powi(53)),
+        Value::Array(items) => items.iter().any(has_rounded_number),
+        Value::Object(m) => m.values().any(has_rounded_number),
         _ => false,
     }
 }
@@ -843,6 +842,18 @@ mod tests {
         assert_eq!(example_value("4.5", &["string", "integer"]), json!("4.5"));
         assert_eq!(example_value("1e3", &["integer"]), json!(1000));
         assert_eq!(example_value("2.0", &["integer", "null"]), json!(2));
+        assert_eq!(
+            example_value("9007199254740993.0", &["integer"]),
+            json!("9007199254740993.0")
+        );
+        assert_eq!(
+            example_value("[9.007199254740993e15]", &["array"]),
+            json!("[9.007199254740993e15]")
+        );
+        assert_eq!(
+            example_value("9007199254740993", &["integer"]),
+            json!(9007199254740993u64)
+        );
         assert_eq!(example_value("4.5", &["integer", "number"]), json!(4.5));
         assert_eq!(example_value("null", &["string", "null"]), json!(null));
         assert_eq!(example_value("123", &[]), json!("123"));
