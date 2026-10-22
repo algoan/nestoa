@@ -36,12 +36,13 @@ impl JsDoc {
         let mut description_lines: Vec<&str> = Vec::new();
         // A tag's name, the indentation of its line, and its lines.
         let mut current_tag: Option<(&str, usize, Vec<&str>)> = None;
-        let mut in_fence = false;
+        // The length of the open fence's backtick run.
+        let mut fence: Option<usize> = None;
         for (i, line) in raw.lines().enumerate() {
             let line = strip_leading_star(line).trim_end();
             // The first line follows `/**`: its leading space separates it.
             let line = if i == 0 { line.trim_start() } else { line };
-            let tag = if in_fence {
+            let tag = if fence.is_some() {
                 None
             } else {
                 tag_start(line.trim_start())
@@ -51,13 +52,7 @@ impl JsDoc {
                 Some(_) => "",
                 None => line.trim_start(),
             };
-            // An opening fence has no other backticks (`` ```npm``` is `` is
-            // inline code); a closing one is any line starting with them.
-            if let Some(after) = text.strip_prefix("```")
-                && (in_fence || !after.contains("```"))
-            {
-                in_fence = !in_fence;
-            }
+            fence = next_fence(text, fence);
             if let Some((name, body)) = tag {
                 if let Some((name, indent, lines)) = current_tag.take() {
                     doc.consume_tag(name, &tag_body(name, indent, &lines));
@@ -134,6 +129,20 @@ impl JsDoc {
         for text in texts {
             *text = render_links(text);
         }
+    }
+}
+
+/// The fence open after a line reading `text`, given the one open before.
+/// An opening fence is a run of three or more backticks with no other backtick
+/// on the line (`` ```npm``` is `` is inline code); only a run at least as long,
+/// alone on its line, closes it.
+fn next_fence(text: &str, open: Option<usize>) -> Option<usize> {
+    let run = text.chars().take_while(|&c| c == '`').count();
+    match open {
+        Some(len) if run >= len && text[run..].trim().is_empty() => None,
+        Some(len) => Some(len),
+        None if run >= 3 && !text[run..].contains('`') => Some(run),
+        None => None,
     }
 }
 
@@ -670,6 +679,19 @@ mod tests {
         assert!(JsDoc::parse(" @deprecated. ").deprecated);
         let doc = JsDoc::parse("\n * Mail\n * @example.com domain\n ");
         assert_eq!(doc.summary.as_deref(), Some("Mail\n@example.com domain"));
+    }
+
+    #[test]
+    fn a_longer_fence_holds_a_shorter_one() {
+        let raw =
+            "\n * @example\n * ````md\n * ```ts\n * @internal\n * ```\n * ````\n * @deprecated\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(
+            doc.example.as_deref(),
+            Some("````md\n```ts\n@internal\n```\n````")
+        );
+        assert!(!doc.internal);
+        assert!(doc.deprecated);
     }
 
     #[test]
