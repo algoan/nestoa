@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
 use swc_common::BytePos;
 use swc_common::comments::{Comment, CommentKind, SingleThreadedComments};
 
@@ -282,6 +283,54 @@ fn render_links(text: &str) -> String {
     out
 }
 
+/// The value of an `@example`: JSON when it parses (`42`, `true`, `{"a":1}`),
+/// the text between single quotes, or else the text itself. A parsed value
+/// the schema's `type` doesn't admit stays text, so `@example 12345` on a
+/// postcode is a string; so does a scalar when the schema has no `type`
+/// (`schema_types` is empty).
+pub fn example_value(raw: &str, schema_types: &[&str]) -> Value {
+    let parsed = serde_json::from_str::<Value>(raw).ok().or_else(|| {
+        raw.strip_prefix('\'')
+            .and_then(|r| r.strip_suffix('\''))
+            .map(|s| Value::String(s.to_string()))
+    });
+    match parsed {
+        Some(v) if v.is_string() => v,
+        Some(v) if has_rounded_integer(&v) => Value::String(raw.to_string()),
+        // A `$ref` or a union: its type is unknown here, and a scalar would
+        // contradict a string enum or alias.
+        Some(v) if schema_types.is_empty() && (v.is_object() || v.is_array()) => v,
+        Some(v) if schema_types.iter().any(|t| has_type(&v, t)) => v,
+        _ => Value::String(raw.to_string()),
+    }
+}
+
+/// Whether `v` holds an integer too large for 64 bits, which serde_json rounds
+/// to the nearest `f64`.
+fn has_rounded_integer(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => n
+            .as_f64()
+            .is_some_and(|f| n.is_f64() && f.fract() == 0.0 && f.abs() >= 2f64.powi(63)),
+        Value::Array(items) => items.iter().any(has_rounded_integer),
+        Value::Object(m) => m.values().any(has_rounded_integer),
+        _ => false,
+    }
+}
+
+fn has_type(v: &Value, ty: &str) -> bool {
+    match ty {
+        "null" => v.is_null(),
+        "boolean" => v.is_boolean(),
+        "integer" => v.is_i64() || v.is_u64(),
+        "number" => v.is_number(),
+        "string" => v.is_string(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        _ => false,
+    }
+}
+
 /// Parse a `@route-mapping` body of the form
 /// `{ 'suffix': TypeName, 'other/suffix': OtherType }` into ordered
 /// (suffix, type name) pairs. Entries are separated by newlines and/or commas;
@@ -382,6 +431,7 @@ impl DocComments {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use swc_common::{FileName, SourceMap, sync::Lrc};
     use swc_ecma_ast::EsVersion;
     use swc_ecma_parser::{StringInput, Syntax, TsSyntax, lexer::Lexer};
@@ -660,6 +710,39 @@ mod tests {
             Some("the Book id")
         );
         assert_eq!(doc.throws, vec![(404, Some("no Book".to_string()))]);
+    }
+
+    #[test]
+    fn example_values() {
+        assert_eq!(example_value("42", &["number"]), json!(42));
+        assert_eq!(example_value("{\"a\": 1}", &[]), json!({"a": 1}));
+        assert_eq!(example_value("'hello'", &[]), json!("hello"));
+        assert_eq!(example_value("\"hello\"", &["string"]), json!("hello"));
+        assert_eq!(
+            example_value("hello world", &["number"]),
+            json!("hello world")
+        );
+        assert_eq!(example_value("42", &["string"]), json!("42"));
+        assert_eq!(example_value("42", &["string", "number"]), json!(42));
+        assert_eq!(example_value("4.5", &["string", "integer"]), json!("4.5"));
+        assert_eq!(example_value("null", &["string", "null"]), json!(null));
+        assert_eq!(example_value("123", &[]), json!("123"));
+        assert_eq!(example_value("true", &[]), json!("true"));
+        assert_eq!(example_value("[1]", &[]), json!([1]));
+        assert_eq!(example_value("42", &["object"]), json!("42"));
+        assert_eq!(example_value("1e3", &["number"]), json!(1000.0));
+        assert_eq!(
+            example_value("12345678901234567890123", &["number"]),
+            json!("12345678901234567890123")
+        );
+        assert_eq!(
+            example_value("[12345678901234567890123]", &["array"]),
+            json!("[12345678901234567890123]")
+        );
+        assert_eq!(
+            example_value("{\"a\": 12345678901234567890123}", &[]),
+            json!("{\"a\": 12345678901234567890123}")
+        );
     }
 
     #[test]

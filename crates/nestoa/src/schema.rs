@@ -2860,6 +2860,14 @@ fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
     if description.is_none() && !doc.deprecated && doc.example.is_none() {
         return;
     }
+    let example = doc.example.as_deref().map(|raw| {
+        let types: Vec<&str> = match m.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        crate::jsdoc::example_value(raw, &types)
+    });
     // Only worth restructuring once there is actually a sibling to carry.
     ref_to_allof(m);
     if let Some(c) = description {
@@ -2868,8 +2876,8 @@ fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
     if doc.deprecated {
         m.insert("deprecated".into(), Value::Bool(true));
     }
-    if let Some(ex) = &doc.example {
-        m.insert("example".into(), Value::String(ex.clone()));
+    if let Some(ex) = example {
+        m.insert("example".into(), ex);
     }
 }
 
@@ -5105,6 +5113,44 @@ mod tests {
         assert_eq!(pick["description"], json!("Book metadata."), "got {pick}");
         assert_eq!(pick["deprecated"], json!(true));
         assert_eq!(prop_names(&pick["allOf"][1]), ["title"]);
+    }
+
+    #[test]
+    fn jsdoc_examples_take_the_property_type() {
+        let [book] = lower_all(
+            "",
+            "export enum Code { A = '123' }\n\
+             export type Shelf = string;\n\
+             export class Book {\n\
+             /** @example 42 */ pages: number;\n\
+             /** @example true */ draft: boolean;\n\
+             /** @example [\"poetry\", \"drama\"] */ tags: string[];\n\
+             /** @example 9780306406157 */ isbn: string;\n\
+             /** @example 12 */ edition: string | null;\n\
+             /** @example 'Dune' */ title: string;\n\
+             /** @example \"Herbert\" */ author: string;\n\
+             /** @example 2024-01-31 */ publishedOn: string;\n\
+             /** @example 123 */ code: Code;\n\
+             /** @example 7 */ shelf: Shelf | null;\n\
+             /**\n * @example\n * {\n *   \"city\": \"Paris\"\n * }\n */\n\
+             address: { city: string };\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        let example = |p: &str| book["properties"][p]["example"].clone();
+        assert_eq!(example("pages"), json!(42), "got {book}");
+        assert_eq!(example("draft"), json!(true));
+        assert_eq!(example("tags"), json!(["poetry", "drama"]));
+        assert_eq!(example("isbn"), json!("9780306406157"));
+        assert_eq!(example("edition"), json!("12"));
+        assert_eq!(example("title"), json!("Dune"));
+        assert_eq!(example("author"), json!("Herbert"));
+        assert_eq!(example("publishedOn"), json!("2024-01-31"));
+        assert_eq!(example("address"), json!({"city": "Paris"}));
+        assert_eq!(example("code"), json!("123"));
+        assert_eq!(example("shelf"), json!("7"));
     }
 
     #[test]

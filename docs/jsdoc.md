@@ -71,8 +71,20 @@ export class Book {
 | --- | --- |
 | Text (summary and description) | the schema's `description` |
 | `@deprecated [reason]` | `deprecated: true`, and `Deprecated: <reason>` ends the `description` |
-| `@example <value>` | `example` (as a string) |
+| `@example <value>` | `example`, see below |
 | `@internal` / `@private` | the property is left out of the schema |
+
+`@example` is read as JSON when it parses (`42`, `true`, `["a", "b"]`,
+`{"city": "Paris"}`, `"quoted"`), and a `'single-quoted'` value loses its
+quotes. Anything else is a string. The property's type decides between the two:
+
+- a value the property's `type` doesn't admit stays text, so
+  `@example 9780306406157` on an `isbn: string` stays `"9780306406157"`;
+- an example holding an integer too large for 64 bits stays text, rather than
+  being rounded;
+- a property without a `type` of its own (a `$ref` to an enum, alias or class,
+  or a union) keeps a number, boolean or `null` as text, and takes an array or
+  object as JSON.
 
 A multi-line `@example` keeps its lines and their relative indentation.
 
