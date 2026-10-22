@@ -300,7 +300,12 @@ fn render_links(text: &str) -> String {
         out.push_str(&rest[..start]);
         let label = if label.is_empty() { target } else { label };
         if target.contains("://") && label != target {
-            out.push_str(&format!("[{label}]({target})"));
+            // A parenthesis would end a bare destination early.
+            if target.contains(['(', ')']) {
+                out.push_str(&format!("[{label}](<{target}>)"));
+            } else {
+                out.push_str(&format!("[{label}]({target})"));
+            }
         } else if tag == "@linkcode" {
             out.push_str(&format!("`{label}`"));
         } else {
@@ -766,6 +771,10 @@ mod tests {
             "{@link |label} {@link |}"
         );
         assert_eq!(render_links("{@link A {@link B} end"), "{@link A B end");
+        assert_eq!(
+            render_links("{@link https://example.com/a_(b) Docs}"),
+            "[Docs](<https://example.com/a_(b)>)"
+        );
         let doc =
             JsDoc::parse("\n * @param id the {@link Book} id\n * @throws 404 no {@link Book}\n ");
         assert_eq!(
