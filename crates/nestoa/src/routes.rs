@@ -10,7 +10,9 @@ use swc_ecma_ast::{
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
+use crate::config::{
+    AuthScope, Config, DecoratorAlias, DecoratorAliasKind, DecoratorReads, OpenApiVersion,
+};
 use crate::constval::object_value;
 use crate::dialect::{self, is_instance_data, is_name_keyed_map};
 use crate::errors;
@@ -504,6 +506,7 @@ impl<'a> Extractor<'a> {
 
         // Parameters
         let mut params: Vec<RouteParam> = Vec::new();
+        let mut declared: Vec<RouteParam> = Vec::new();
         let mut request_body: Option<RequestBody> = None;
         let mut body_fields: Vec<BodyField> = Vec::new();
         // `@Headers('Authorization')`: `Some(required)`.
@@ -523,6 +526,7 @@ impl<'a> Extractor<'a> {
                             add_param(&mut params, rp, self.components);
                         }
                     }
+                    ParsedParam::Declared(rps) => declared.extend(rps),
                     ParsedParam::Body(b) => request_body = Some(b),
                     ParsedParam::BodyField(f) => body_fields.push(f),
                     ParsedParam::Authorization { required } => {
@@ -531,6 +535,9 @@ impl<'a> Extractor<'a> {
                     ParsedParam::Ignored => {}
                 }
             }
+        }
+        for rp in declared {
+            add_param(&mut params, rp, self.components);
         }
         // `@Body('field')` reads one property of the body; a whole-body
         // `@Body()` alongside already describes all of them.
@@ -1017,6 +1024,55 @@ impl<'a> Extractor<'a> {
         }
     }
 
+    /// The query parameters a custom decorator is declared to read, each
+    /// renamed by its `nameFrom` option when the decorator sets it.
+    fn declared_params(
+        &self,
+        file: &Path,
+        d: &Decorator,
+        decorator: &str,
+        reads: &DecoratorReads,
+    ) -> Vec<RouteParam> {
+        let option = |key: &str| -> Result<Option<String>, ()> {
+            let Some(arg) = first_arg(d) else {
+                return Ok(None);
+            };
+            let mut holder = None;
+            let (decl_file, o) =
+                crate::globalprefix::options_object(self.project, file, arg, &mut holder)
+                    .ok_or(())?;
+            match object_value(o, key) {
+                None => Ok(None),
+                Some(v) => crate::constval::string(self.project, &decl_file, &v)
+                    .map(Some)
+                    .ok_or(()),
+            }
+        };
+        reads
+            .query
+            .iter()
+            .map(|(key, p)| {
+                let name = match p.name_from.as_deref().map(|o| (o, option(o))) {
+                    None | Some((_, Ok(None))) => key.clone(),
+                    Some((_, Ok(Some(name)))) => name,
+                    Some((o, Err(()))) => {
+                        crate::diag::warn(format!(
+                            "cannot evaluate the {o} option of @{decorator}(…); the query parameter {key} keeps its name"
+                        ));
+                        key.clone()
+                    }
+                };
+                RouteParam {
+                    name,
+                    location: ParamLocation::Query,
+                    required: p.required,
+                    schema: p.schema.clone(),
+                    description: p.description.clone(),
+                }
+            })
+            .collect()
+    }
+
     fn classify_param(
         &mut self,
         file: &Path,
@@ -1035,12 +1091,19 @@ impl<'a> Extractor<'a> {
                 "Body" => DecoratorKind::Body,
                 "Headers" => DecoratorKind::Header,
                 other => match self.config.decorator_aliases.get(other) {
-                    Some(DecoratorAlias::Param) => DecoratorKind::Param,
-                    Some(DecoratorAlias::Query) => DecoratorKind::Query,
-                    Some(DecoratorAlias::Body) => DecoratorKind::Body,
-                    Some(DecoratorAlias::Header) => DecoratorKind::Header,
-                    Some(DecoratorAlias::User) | Some(DecoratorAlias::Ignore) => {
-                        return Some(ParsedParam::Ignored);
+                    Some(DecoratorAlias::Kind(kind)) => match kind {
+                        DecoratorAliasKind::Param => DecoratorKind::Param,
+                        DecoratorAliasKind::Query => DecoratorKind::Query,
+                        DecoratorAliasKind::Body => DecoratorKind::Body,
+                        DecoratorAliasKind::Header => DecoratorKind::Header,
+                        DecoratorAliasKind::User | DecoratorAliasKind::Ignore => {
+                            return Some(ParsedParam::Ignored);
+                        }
+                    },
+                    Some(DecoratorAlias::Reads(reads)) => {
+                        return Some(ParsedParam::Declared(
+                            self.declared_params(file, d, other, reads),
+                        ));
                     }
                     None => continue,
                 },
@@ -1531,6 +1594,9 @@ fn object_members(schema: &Value, components: &ComponentSchemas) -> Option<Objec
 enum ParsedParam {
     /// One parameter, or one per property of a `@Query()`/`@Param()` object.
     Routed(Vec<RouteParam>),
+    /// The query parameters read by a decorator of `decoratorAliases`,
+    /// documented after the handler's own.
+    Declared(Vec<RouteParam>),
     Body(RequestBody),
     BodyField(BodyField),
     /// `@Headers('Authorization')`, which documents credentials rather than
@@ -3192,6 +3258,96 @@ mod tests {
                 r#"Path org true {"type":"string"} -"#,
                 r#"Path id true {"type":"number"} -"#,
                 r#"Header x-request-id true {"type":"string"} -"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_decorator_alias_declares_the_query_parameters_it_reads() {
+        crate::diag::take_warnings();
+        let config: crate::config::Config = serde_json::from_str(
+            r#"{ "decoratorAliases": { "Paginate": { "query": {
+                "page": { "schema": { "type": "integer", "default": 1 } },
+                "per_page": {
+                    "nameFrom": "perPageName",
+                    "schema": { "type": "integer", "default": 10 }
+                },
+                "sort": { "schema": { "type": "string" }, "description": "Sort order" },
+                "tag": { "schema": { "type": "string" }, "required": true }
+            } } } }"#,
+        )
+        .unwrap();
+        let (routes, _) = extract_with(
+            "alias-query",
+            &[(
+                "ctrl.ts",
+                r#"
+                const LIMIT = { perPageName: 'limit' } as const;
+                @Controller('books')
+                export class BooksController {
+                    @Get() list(@Query('q') q: string, @Paginate(LIMIT) p: Page) {}
+                    @Get('all') all(@Paginate() p: Page, @Query('tag') tag?: 'a' | 'b') {}
+                    @Get('raw') raw(@Paginate({ perPageName: name }) p: Page) {}
+                }
+                "#,
+            )],
+            &["ctrl.ts"],
+            config,
+        );
+        let params = |path: &str| -> Vec<(String, bool, Value, Option<String>)> {
+            routes
+                .iter()
+                .find(|r| r.path == path)
+                .unwrap()
+                .parameters
+                .iter()
+                .map(|p| {
+                    assert_eq!(p.location, ParamLocation::Query);
+                    (
+                        p.name.clone(),
+                        p.required,
+                        p.schema.clone(),
+                        p.description.clone(),
+                    )
+                })
+                .collect()
+        };
+        let int = |d: i64| json!({ "type": "integer", "default": d });
+        let string = json!({ "type": "string" });
+        let sort = Some("Sort order".to_string());
+        assert_eq!(
+            params("/books"),
+            [
+                ("q".into(), true, string.clone(), None),
+                ("page".into(), false, int(1), None),
+                ("limit".into(), false, int(10), None),
+                ("sort".into(), false, string.clone(), sort.clone()),
+                ("tag".into(), true, string.clone(), None),
+            ]
+        );
+        // The handler's own `@Query('tag')` comes first and is merged with the
+        // declared one, which makes it required.
+        let tag = &params("/books/all")[0];
+        assert_eq!((tag.0.as_str(), tag.1), ("tag", true));
+        assert_eq!(
+            params("/books/all")[1..],
+            [
+                ("page".into(), false, int(1), None),
+                ("per_page".into(), false, int(10), None),
+                ("sort".into(), false, string.clone(), sort.clone()),
+            ]
+        );
+        assert_eq!(
+            params("/books/raw")
+                .iter()
+                .map(|p| p.0.as_str())
+                .collect::<Vec<_>>(),
+            ["page", "per_page", "sort", "tag"]
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            [
+                "cannot evaluate the perPageName option of @Paginate(…); the query parameter per_page keeps its name"
             ]
         );
     }

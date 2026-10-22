@@ -73,10 +73,11 @@ pub struct Config {
     #[serde(default)]
     pub passthrough_types: Vec<String>,
 
-    /// Extra decorator-name aliases mapped to known handlers. Lets users wire in
-    /// custom decorators without modifying the tool. For example, mapping a
-    /// project-specific `@MyAuthUser` to the `user` parameter kind tells the
-    /// tool to drop that parameter from the route signature.
+    /// Extra decorator-name aliases mapped to known handlers, or to the query
+    /// parameters the decorator reads. Lets users wire in custom decorators
+    /// without modifying the tool. For example, mapping a project-specific
+    /// `@MyAuthUser` to the `user` parameter kind tells the tool to drop that
+    /// parameter from the route signature.
     #[serde(default)]
     pub decorator_aliases: indexmap::IndexMap<String, DecoratorAlias>,
 
@@ -355,9 +356,54 @@ pub struct Info {
     pub description: Option<String>,
 }
 
+/// See `Config::decorator_aliases`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum DecoratorAlias {
+    Kind(DecoratorAliasKind),
+    Reads(DecoratorReads),
+}
+
+// By hand rather than `untagged`, whose error names no field.
+impl<'de> Deserialize<'de> for DecoratorAlias {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            v @ serde_json::Value::String(_) => serde_json::from_value(v).map(Self::Kind),
+            v => serde_json::from_value(v).map(Self::Reads),
+        }
+        .map_err(D::Error::custom)
+    }
+}
+
+/// What a custom parameter decorator reads from the request, for one that
+/// isn't a known kind (`@Paginate()` reading `?page` and `?limit`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DecoratorReads {
+    /// Query parameters keyed by name, emitted after the handler's own.
+    pub query: indexmap::IndexMap<String, DeclaredParam>,
+}
+
+/// A parameter declared by `DecoratorReads`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredParam {
+    pub schema: serde_json::Value,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A property of the decorator's options argument that renames the
+    /// parameter (`@Paginate({ perPageName: 'limit' })`). The key is the name
+    /// when the property is absent.
+    #[serde(default)]
+    pub name_from: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum DecoratorAlias {
+pub enum DecoratorAliasKind {
     /// Treat as @Body
     Body,
     /// Treat as @Query
@@ -580,6 +626,37 @@ mod tests {
             cfg.interceptors["MultiStatusInterceptor"].request_body,
             Some(RequestBodyTransform::SingleOrArray)
         );
+    }
+
+    #[test]
+    fn parses_decorator_aliases_of_both_forms() {
+        let cfg: Config = serde_json::from_str(
+            r#"{ "decoratorAliases": {
+                "CurrentUser": "user",
+                "Paginate": { "query": {
+                    "limit": { "schema": { "type": "integer" }, "nameFrom": "perPageName" }
+                } }
+            } }"#,
+        )
+        .expect("valid decoratorAliases parse");
+        assert_eq!(
+            cfg.decorator_aliases["CurrentUser"],
+            DecoratorAlias::Kind(DecoratorAliasKind::User)
+        );
+        let DecoratorAlias::Reads(reads) = &cfg.decorator_aliases["Paginate"] else {
+            panic!("expected the object form");
+        };
+        let limit = &reads.query["limit"];
+        assert_eq!(limit.name_from.as_deref(), Some("perPageName"));
+        assert!(!limit.required);
+        for bad in [
+            r#""cookie""#,
+            r#"{ "header": {} }"#,
+            r#"{ "query": { "page": { "type": "integer" } } }"#,
+        ] {
+            let json = format!(r#"{{ "decoratorAliases": {{ "Paginate": {bad} }} }}"#);
+            assert!(serde_json::from_str::<Config>(&json).is_err(), "{bad}");
+        }
     }
 
     #[test]
