@@ -34,10 +34,13 @@ impl JsDoc {
     pub fn parse(raw: &str) -> Self {
         let mut doc = JsDoc::default();
         let mut description_lines: Vec<&str> = Vec::new();
-        let mut current_tag: Option<(&str, Vec<&str>)> = None;
+        // A tag's name, the indentation of its line, and its lines.
+        let mut current_tag: Option<(&str, usize, Vec<&str>)> = None;
         let mut in_fence = false;
-        for line in raw.lines() {
+        for (i, line) in raw.lines().enumerate() {
             let line = strip_leading_star(line).trim_end();
+            // The first line follows `/**`: its leading space separates it.
+            let line = if i == 0 { line.trim_start() } else { line };
             let tag = if in_fence {
                 None
             } else {
@@ -56,18 +59,18 @@ impl JsDoc {
                 in_fence = !in_fence;
             }
             if let Some((name, body)) = tag {
-                if let Some((name, lines)) = current_tag.take() {
-                    doc.consume_tag(name, &tag_body(name, &lines));
+                if let Some((name, indent, lines)) = current_tag.take() {
+                    doc.consume_tag(name, &tag_body(name, indent, &lines));
                 }
-                current_tag = Some((name, vec![body]));
-            } else if let Some((_, lines)) = current_tag.as_mut() {
+                current_tag = Some((name, indent_of(line), vec![body]));
+            } else if let Some((_, _, lines)) = current_tag.as_mut() {
                 lines.push(line);
             } else {
                 description_lines.push(line.trim_start());
             }
         }
-        if let Some((name, lines)) = current_tag {
-            doc.consume_tag(name, &tag_body(name, &lines));
+        if let Some((name, indent, lines)) = current_tag {
+            doc.consume_tag(name, &tag_body(name, indent, &lines));
         }
         let joined = description_lines.join("\n").trim().to_string();
         if !joined.is_empty() {
@@ -135,13 +138,21 @@ impl JsDoc {
 }
 
 /// A comment line without its leading `*` and the space after it. A `*`
-/// followed by another one is markdown (`/** **Note** … */`), not a gutter.
+/// followed by another one is markdown (`/** **Note** … */`), not a gutter. A
+/// line without a gutter keeps its indentation, which an `@example` needs.
 fn strip_leading_star(line: &str) -> &str {
-    let line = line.trim_start();
-    match line.strip_prefix('*').filter(|rest| !rest.starts_with('*')) {
+    match line
+        .trim_start()
+        .strip_prefix('*')
+        .filter(|rest| !rest.starts_with('*'))
+    {
         Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
         None => line,
     }
+}
+
+fn indent_of(line: &str) -> usize {
+    line.chars().take_while(|c| c.is_whitespace()).count()
 }
 
 /// The name and body of a tag opening `line`. A tag name starts with a
@@ -171,14 +182,16 @@ fn tag_start(line: &str) -> Option<(&str, &str)> {
 }
 
 /// A tag's lines as one body. An `@example` keeps its lines' indentation,
-/// less the indentation they share; other tags' lines are trimmed.
-fn tag_body(name: &str, lines: &[&str]) -> String {
+/// less the indentation they share with the tag's line (`tag_indent`) when
+/// the body starts on it; other tags' lines are trimmed.
+fn tag_body(name: &str, tag_indent: usize, lines: &[&str]) -> String {
     let (first, rest) = lines.split_first().map_or(("", &[][..]), |(f, r)| (*f, r));
     let body = if name == "example" {
         let indent = rest
             .iter()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
+            .map(|l| indent_of(l))
+            .chain((!first.is_empty()).then_some(tag_indent))
             .min()
             .unwrap_or(0);
         std::iter::once(first)
@@ -661,6 +674,25 @@ mod tests {
         );
         assert!(doc.params.is_empty());
         assert!(doc.deprecated);
+    }
+
+    #[test]
+    fn example_on_the_tag_line_keeps_its_nesting() {
+        let doc = JsDoc::parse("\n * @example book:\n *   title: Dune\n ");
+        assert_eq!(doc.example.as_deref(), Some("book:\n  title: Dune"));
+        let doc = JsDoc::parse("@example book:\n  title: Dune\n");
+        assert_eq!(doc.example.as_deref(), Some("book:\n  title: Dune"));
+    }
+
+    #[test]
+    fn example_without_gutter_keeps_its_indentation() {
+        let raw = "\n    Find a book\n    @example\n    book:\n      title: Dune\n  ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.summary.as_deref(), Some("Find a book"));
+        assert_eq!(doc.example.as_deref(), Some("book:\n  title: Dune"));
+        let raw = "\n      @example book:\n        title: Dune\n  ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.example.as_deref(), Some("book:\n  title: Dune"));
     }
 
     #[test]
