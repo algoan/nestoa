@@ -273,6 +273,37 @@ pub fn object_value(o: &ObjectLit, key: &str) -> Option<Expr> {
     }
 }
 
+/// `object_value`, or `Err` when a spread or a computed key after the last
+/// `key` property may set it (`{ ...OPTIONS }`, `{ key: 'a', ...OPTIONS }`),
+/// or when that property is an accessor or a method.
+pub fn object_value_exact(o: &ObjectLit, key: &str) -> Result<Option<Expr>, ()> {
+    for p in o.props.iter().rev() {
+        let PropOrSpread::Prop(p) = p else {
+            return Err(());
+        };
+        let (name, value) = match p.as_ref() {
+            Prop::KeyValue(kv) => (&kv.key, true),
+            Prop::Method(m) => (&m.key, false),
+            Prop::Getter(g) => (&g.key, false),
+            Prop::Setter(s) => (&s.key, false),
+            Prop::Shorthand(i) if i.sym == key => break,
+            Prop::Shorthand(_) | Prop::Assign(_) => continue,
+        };
+        let found = match name {
+            PropName::Computed(_) => return Err(()),
+            PropName::Ident(i) => i.sym == key,
+            PropName::Str(s) => s.value.to_string_lossy() == key,
+            _ => false,
+        };
+        match (found, value) {
+            (true, true) => break,
+            (true, false) => return Err(()),
+            (false, _) => {}
+        }
+    }
+    Ok(object_value(o, key))
+}
+
 /// `a.b.c` for an identifier or a chain of property accesses.
 pub fn dotted_name(expr: &Expr) -> Option<String> {
     let (root, props) = member_chain(expr)?;

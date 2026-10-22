@@ -18,7 +18,8 @@ including handlers inherited through `extends`:
   produces both paths. A constraint (`:id(\\d+)`) becomes the parameter's
   `pattern`.
 - **Parameters** from `@Param`, `@Query`, `@Headers` and
-  [aliased decorators](options/decorator-aliases.md). An object `@Query()` or
+  [aliased decorators](options/decorator-aliases.md), including the query
+  parameters a custom decorator is declared to read. An object `@Query()` or
   `@Param()` produces one parameter per property. `@Headers()` without a name,
   and the `Accept`, `Content-Type` and `Authorization` headers, are left out;
   `Authorization` marks the operation as [secured](options/security.md).
