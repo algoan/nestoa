@@ -282,14 +282,6 @@ fn render_links(text: &str) -> String {
         let Some(end) = after.find('}') else { break };
         let inner = &after[..end];
         let (tag, target) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
-        if !matches!(tag, "@link" | "@linkcode" | "@linkplain")
-            || target.trim().is_empty()
-            || target.contains('{')
-        {
-            out.push_str(&rest[..start + 2]);
-            rest = &rest[start + 2..];
-            continue;
-        }
         let target = target.trim();
         let (target, label) = match target.split_once('|') {
             Some((t, l)) => (t.trim(), l.trim()),
@@ -297,6 +289,14 @@ fn render_links(text: &str) -> String {
                 .split_once(char::is_whitespace)
                 .map_or((target, ""), |(t, l)| (t, l.trim())),
         };
+        if !matches!(tag, "@link" | "@linkcode" | "@linkplain")
+            || target.is_empty()
+            || inner.contains('{')
+        {
+            out.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            continue;
+        }
         out.push_str(&rest[..start]);
         let label = if label.is_empty() { target } else { label };
         if target.contains("://") && label != target {
@@ -761,6 +761,10 @@ mod tests {
             "{@linkx Book} {@link Book"
         );
         assert_eq!(render_links("{@link} {@linkcode }"), "{@link} {@linkcode }");
+        assert_eq!(
+            render_links("{@link |label} {@link |}"),
+            "{@link |label} {@link |}"
+        );
         assert_eq!(render_links("{@link A {@link B} end"), "{@link A B end");
         let doc =
             JsDoc::parse("\n * @param id the {@link Book} id\n * @throws 404 no {@link Book}\n ");
