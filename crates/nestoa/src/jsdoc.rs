@@ -241,17 +241,33 @@ fn parse_param(body: &str) -> Option<(&str, &str)> {
     Some((name, desc))
 }
 
-/// The end (exclusive) of the `open … close` group `s` starts with.
+/// The end (exclusive) of the `open … close` group `s` starts with. Quoted
+/// text (`[prefix="["]`) is skipped.
 fn balanced_end(s: &str, open: char, close: char) -> Option<usize> {
     let mut depth = 0usize;
-    s.char_indices().find_map(|(i, c)| {
-        if c == open {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else if matches!(c, '"' | '\'' | '`') {
+            quote = Some(c);
+        } else if c == open {
             depth += 1;
         } else if c == close {
             depth -= 1;
+            if depth == 0 {
+                return Some(i + c.len_utf8());
+            }
         }
-        (depth == 0).then_some(i + c.len_utf8())
-    })
+    }
+    None
 }
 
 /// Replace each inline `{@link target}`, `{@link target text}` or
@@ -596,6 +612,17 @@ mod tests {
         assert_eq!(param("tags"), Some("the tags"));
         assert_eq!(param("draft"), Some(""));
         assert_eq!(doc.params.len(), 5);
+        let doc = JsDoc::parse(
+            "\n * @param [prefix=\"[\"] - opening\n * @param [suffix=\"]\"] - closing\n ",
+        );
+        assert_eq!(
+            doc.params.get("prefix").map(String::as_str),
+            Some("opening")
+        );
+        assert_eq!(
+            doc.params.get("suffix").map(String::as_str),
+            Some("closing")
+        );
         let doc = JsDoc::parse(" @param id: the id ");
         assert_eq!(doc.params.get("id").map(String::as_str), Some("the id"));
     }
