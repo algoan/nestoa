@@ -2870,8 +2870,18 @@ fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
     });
     // Only worth restructuring once there is actually a sibling to carry.
     ref_to_allof(m);
-    if let Some(c) = description {
-        m.insert("description".into(), Value::String(c));
+    match description {
+        Some(c) => {
+            m.insert("description".into(), Value::String(c));
+        }
+        // An inherited description (`id: Book['id']`) still gets the reason.
+        None => {
+            if let Some(reason) = &doc.deprecated_reason
+                && let Some(Value::String(d)) = m.get_mut("description")
+            {
+                d.push_str(&format!("\n\nDeprecated: {reason}"));
+            }
+        }
     }
     if doc.deprecated {
         m.insert("deprecated".into(), Value::Bool(true));
@@ -5151,6 +5161,29 @@ mod tests {
         assert_eq!(example("location"), json!({"shelf": "B2"}));
         assert_eq!(example("code"), json!("123"));
         assert_eq!(example("shelf"), json!("7"));
+    }
+
+    #[test]
+    fn jsdoc_deprecation_reason_extends_an_inherited_description() {
+        let [copy] = lower_all(
+            "",
+            "export class Book {\n\
+             /** The book id */ id: string;\n\
+             }\n\
+             export class BookCopy {\n\
+             /** @deprecated Use {@link BookCopy.key} */ id: Book['id'];\n\
+             }",
+            &["BookCopy"],
+        )
+        .try_into()
+        .unwrap();
+        let id = &copy["properties"]["id"];
+        assert_eq!(
+            id["description"],
+            json!("The book id\n\nDeprecated: Use BookCopy.key"),
+            "got {copy}"
+        );
+        assert_eq!(id["deprecated"], json!(true));
     }
 
     #[test]

@@ -120,11 +120,15 @@ impl JsDoc {
     }
 
     fn render_links(&mut self) {
-        let texts = [&mut self.summary, &mut self.description]
-            .into_iter()
-            .flatten()
-            .chain(self.params.values_mut())
-            .chain(self.throws.iter_mut().filter_map(|(_, d)| d.as_mut()));
+        let texts = [
+            &mut self.summary,
+            &mut self.description,
+            &mut self.deprecated_reason,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.params.values_mut())
+        .chain(self.throws.iter_mut().filter_map(|(_, d)| d.as_mut()));
         for text in texts {
             *text = render_links(text);
         }
