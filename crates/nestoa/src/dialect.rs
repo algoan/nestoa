@@ -234,6 +234,7 @@ pub(crate) fn is_name_keyed_map(key: &str) -> bool {
         key,
         "properties"
             | "patternProperties"
+            | "dependentSchemas"
             | "$defs"
             | "definitions"
             | "schemas"
