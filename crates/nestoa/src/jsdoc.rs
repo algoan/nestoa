@@ -415,7 +415,7 @@ fn is_integral_literal(raw: &str) -> bool {
     if exp >= 0 {
         frac <= exp
     } else {
-        frac == 0 && int_zeros >= -exp
+        frac == 0 && exp.checked_neg().is_some_and(|shift| int_zeros >= shift)
     }
 }
 
@@ -925,6 +925,10 @@ mod tests {
         assert_eq!(example_value("1.5e-1", &["integer"]), json!("1.5e-1"));
         assert_eq!(example_value("0.0e-2", &["integer"]), json!(0));
         assert_eq!(example_value("-0e-2", &["integer"]), json!(0));
+        assert_eq!(
+            example_value("1e-9223372036854775808", &["integer"]),
+            json!("1e-9223372036854775808")
+        );
         assert_eq!(
             example_value("9007199254740993.0", &["integer"]),
             json!("9007199254740993.0")
