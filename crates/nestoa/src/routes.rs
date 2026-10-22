@@ -12,7 +12,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::config::{AuthScope, Config, DecoratorAlias, OpenApiVersion};
 use crate::constval::object_value;
-use crate::dialect;
+use crate::dialect::{self, is_instance_data, is_name_keyed_map};
 use crate::errors;
 use crate::globalprefix::{Bootstrap, Version, versions};
 use crate::interceptors::{
@@ -2432,7 +2432,8 @@ fn ref_target(value: &Value) -> Option<&str> {
 }
 
 /// Collect every component-schema name referenced by a `$ref` anywhere within
-/// `value` (recursing through objects and arrays).
+/// `value` (recursing through objects and arrays). An `example` and other
+/// instance data are skipped, as in `dialect`: a `$ref` there is data.
 fn collect_refs(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -2441,7 +2442,11 @@ fn collect_refs(value: &Value, out: &mut Vec<String>) {
                     if let Some(name) = ref_target(v) {
                         out.push(name.to_string());
                     }
-                } else {
+                } else if is_name_keyed_map(key)
+                    && let Value::Object(entries) = v
+                {
+                    entries.values().for_each(|entry| collect_refs(entry, out));
+                } else if !is_instance_data(key) {
                     collect_refs(v, out);
                 }
             }
@@ -4731,5 +4736,31 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn a_ref_inside_an_example_keeps_no_component() {
+        let paths = json!({"/books": {"get": {"responses": {"200": {"content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Book"}}
+        }}}}}});
+        let schemas: IndexMap<String, Value> = [
+            (
+                "Book",
+                json!({"properties": {
+                    "meta": {"type": "object", "example": {"$ref": "#/components/schemas/Orphan"}},
+                    "example": {"$ref": "#/components/schemas/Shelf"}
+                }}),
+            ),
+            ("Orphan", json!({"type": "object"})),
+            ("Shelf", json!({"type": "object"})),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let mut reachable: Vec<_> = reachable_schemas(paths.as_object().unwrap(), &schemas)
+            .into_iter()
+            .collect();
+        reachable.sort();
+        assert_eq!(reachable, ["Book", "Shelf"]);
     }
 }
