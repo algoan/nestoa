@@ -81,6 +81,15 @@ impl JsDoc {
                 doc.description = Some(rest);
             }
         }
+        // OpenAPI has no field for the reason, so it ends the description.
+        if let Some(reason) = &doc.deprecated_reason {
+            let note = format!("Deprecated: {reason}");
+            doc.description = Some(match doc.description.take() {
+                Some(d) => format!("{d}\n\n{note}"),
+                None => note,
+            });
+        }
+        doc.render_links();
         doc
     }
 
@@ -110,6 +119,17 @@ impl JsDoc {
             _ => {}
         }
         self.tags.push((name.to_string(), body.to_string()));
+    }
+
+    fn render_links(&mut self) {
+        let texts = [&mut self.summary, &mut self.description]
+            .into_iter()
+            .flatten()
+            .chain(self.params.values_mut())
+            .chain(self.throws.iter_mut().filter_map(|(_, d)| d.as_mut()));
+        for text in texts {
+            *text = render_links(text);
+        }
     }
 }
 
@@ -218,6 +238,48 @@ fn balanced_end(s: &str, open: char, close: char) -> Option<usize> {
         }
         (depth == 0).then_some(i + c.len_utf8())
     })
+}
+
+/// Replace each inline `{@link target}`, `{@link target text}` or
+/// `{@link target|text}` (also `@linkcode`, `@linkplain`) by its text, or by a
+/// markdown link when a URL target has a text. An unclosed, empty or nested
+/// tag stays as written.
+fn render_links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{@link") {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else { break };
+        let inner = &after[..end];
+        let (tag, target) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
+        if !matches!(tag, "@link" | "@linkcode" | "@linkplain")
+            || target.trim().is_empty()
+            || target.contains('{')
+        {
+            out.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            continue;
+        }
+        let target = target.trim();
+        let (target, label) = match target.split_once('|') {
+            Some((t, l)) => (t.trim(), l.trim()),
+            None => target
+                .split_once(char::is_whitespace)
+                .map_or((target, ""), |(t, l)| (t, l.trim())),
+        };
+        out.push_str(&rest[..start]);
+        let label = if label.is_empty() { target } else { label };
+        if target.contains("://") && label != target {
+            out.push_str(&format!("[{label}]({target})"));
+        } else if tag == "@linkcode" {
+            out.push_str(&format!("`{label}`"));
+        } else {
+            out.push_str(label);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse a `@route-mapping` body of the form
@@ -559,6 +621,45 @@ mod tests {
         let raw = "\n * @example\n *   {\n *     \"a\": 1\n *   }\n ";
         let doc = JsDoc::parse(raw);
         assert_eq!(doc.example.as_deref(), Some("{\n  \"a\": 1\n}"));
+    }
+
+    #[test]
+    fn deprecation_reason_ends_the_description() {
+        let doc = JsDoc::parse("\n * Find a book\n * @deprecated Use v2\n ");
+        assert_eq!(doc.summary.as_deref(), Some("Find a book"));
+        assert_eq!(doc.description.as_deref(), Some("Deprecated: Use v2"));
+        let doc = JsDoc::parse("\n * Find\n *\n * Slow.\n * @deprecated Use v2\n ");
+        assert_eq!(
+            doc.description.as_deref(),
+            Some("Slow.\n\nDeprecated: Use v2")
+        );
+        let doc = JsDoc::parse("\n * Find\n * @deprecated\n ");
+        assert_eq!(doc.description, None);
+    }
+
+    #[test]
+    fn renders_inline_links() {
+        assert_eq!(render_links("see {@link Book}"), "see Book");
+        assert_eq!(render_links("see {@link Book|the book}"), "see the book");
+        assert_eq!(render_links("see {@link Book the book}"), "see the book");
+        assert_eq!(render_links("{@linkcode Book.find}"), "`Book.find`");
+        assert_eq!(
+            render_links("{@link https://example.com/docs Docs} and {@link https://example.com}"),
+            "[Docs](https://example.com/docs) and https://example.com"
+        );
+        assert_eq!(
+            render_links("{@linkx Book} {@link Book"),
+            "{@linkx Book} {@link Book"
+        );
+        assert_eq!(render_links("{@link} {@linkcode }"), "{@link} {@linkcode }");
+        assert_eq!(render_links("{@link A {@link B} end"), "{@link A B end");
+        let doc =
+            JsDoc::parse("\n * @param id the {@link Book} id\n * @throws 404 no {@link Book}\n ");
+        assert_eq!(
+            doc.params.get("id").map(String::as_str),
+            Some("the Book id")
+        );
+        assert_eq!(doc.throws, vec![(404, Some("no Book".to_string()))]);
     }
 
     #[test]

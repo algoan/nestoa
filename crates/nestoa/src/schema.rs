@@ -5108,6 +5108,27 @@ mod tests {
     }
 
     #[test]
+    fn jsdoc_deprecation_reason_and_links_reach_the_description() {
+        let [book] = lower_all(
+            "",
+            "export class Book {\n\
+             /**\n * The shelf, see {@link Shelf}.\n * @deprecated Use {@link Book.location} instead\n */\n\
+             shelf: string;\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        let shelf = &book["properties"]["shelf"];
+        assert_eq!(
+            shelf["description"],
+            json!("The shelf, see Shelf.\n\nDeprecated: Use Book.location instead"),
+            "got {book}"
+        );
+        assert_eq!(shelf["deprecated"], json!(true));
+    }
+
+    #[test]
     fn exponentiation_by_nan_follows_javascript() {
         let [e] = lower_all("", "export enum E { A = 1 ** (0 / 0) }", &["E"])
             .try_into()

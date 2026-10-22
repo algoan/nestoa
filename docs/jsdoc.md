@@ -15,6 +15,12 @@ never closed runs to the end of the comment.
 `@param` accepts the JSDoc forms `@param {Type} name`, `@param [name]`,
 `@param [name=default]`, `@param name - text` and `@param name: text`.
 
+Inline `{@link Target}`, `{@link Target text}` and `{@link Target|text}` (and
+`@linkplain`) become their text, or `Target` when there is none; `@linkcode`
+puts it in backticks. A URL target with a text becomes a markdown link
+`[text](url)`. An empty or unclosed tag stays as written, and so does the outer
+one of two nested tags.
+
 Description lines are trimmed, even inside a code fence. Only an `@example`
 keeps its indentation.
 
@@ -39,7 +45,7 @@ findOne(@Param('id') id: string): Promise<Book> { … }
 | Following paragraphs | operation `description` |
 | `@summary` / `@description` | set either one explicitly |
 | `@param <name> <text>` | the parameter's `description` |
-| `@deprecated` | `deprecated: true` |
+| `@deprecated [reason]` | `deprecated: true`, and `Deprecated: <reason>` ends the `description` |
 | `@throws`, `@route-mapping` | see below |
 
 ## On a DTO, interface, enum or property
@@ -64,7 +70,7 @@ export class Book {
 | Source | Output |
 | --- | --- |
 | Text (summary and description) | the schema's `description` |
-| `@deprecated` | `deprecated: true` |
+| `@deprecated [reason]` | `deprecated: true`, and `Deprecated: <reason>` ends the `description` |
 | `@example <value>` | `example` (as a string) |
 | `@internal` / `@private` | the property is left out of the schema |
 
