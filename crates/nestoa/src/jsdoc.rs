@@ -47,8 +47,10 @@ impl JsDoc {
             } else {
                 tag_start(line.trim_start())
             };
+            // On a tag line a fence may follow a name or status
+            // (`@param id ```ts`), so it is looked for from the first backtick.
             let text = match tag {
-                Some((_, body)) => body.trim_start(),
+                Some((_, body)) => body.find('`').map_or("", |i| &body[i..]),
                 None => line.trim_start(),
             };
             fence = next_fence(text, fence);
@@ -709,6 +711,16 @@ mod tests {
         assert_eq!(doc.description.as_deref(), Some("```ts\n@internal\n```"));
         assert!(!doc.internal);
         assert!(doc.deprecated);
+    }
+
+    #[test]
+    fn a_fence_after_a_param_name_or_status_hides_tags() {
+        for tag in ["@param id", "@throws 404"] {
+            let raw = format!("\n * {tag} ```ts\n * @deprecated\n * ```\n * @internal\n ");
+            let doc = JsDoc::parse(&raw);
+            assert!(!doc.deprecated, "{tag}");
+            assert!(doc.internal, "{tag}");
+        }
     }
 
     #[test]
