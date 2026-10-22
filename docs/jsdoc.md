@@ -5,6 +5,16 @@ nearest `/** … */` block before the declaration: above its `export` keyword an
 its decorators. A plain `/* */` or `//` comment in between is skipped, as in
 TypeScript.
 
+A line opens a tag when it starts with `@` and a lowercase name followed by a
+space, `{` or the end of the line, optionally after a `:`, `.` or `,`
+(`@deprecated: use v2`). So `@nestjs/common`, `@Get()` or a bare
+`@Injectable` at the start of a line are text, and so is anything inside a
+```` ``` ```` code fence, up to its closing fence: an `@example` whose fence is
+never closed runs to the end of the comment.
+
+Description lines are trimmed, even inside a code fence. Only an `@example`
+keeps its indentation.
+
 ## On a handler
 
 ```ts
@@ -54,6 +64,8 @@ export class Book {
 | `@deprecated` | `deprecated: true` |
 | `@example <value>` | `example` (as a string) |
 | `@internal` / `@private` | the property is left out of the schema |
+
+A multi-line `@example` keeps its lines and their relative indentation.
 
 When a property's schema is a `$ref`, the annotation is put on an `allOf`
 wrapper, because OpenAPI 3.0 ignores siblings of `$ref` (see

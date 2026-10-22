@@ -32,46 +32,45 @@ pub struct JsDoc {
 impl JsDoc {
     pub fn parse(raw: &str) -> Self {
         let mut doc = JsDoc::default();
-        let lines: Vec<&str> = raw
-            .lines()
-            .map(|l| l.trim_start().trim_start_matches('*').trim_start())
-            .collect();
-        let mut description_lines: Vec<String> = Vec::new();
-        let mut current_tag: Option<(String, Vec<String>)> = None;
-        for line in lines {
-            let line = line.trim_end();
-            if let Some(rest) = line.strip_prefix('@') {
-                if let Some((tag_name, tag_body)) = current_tag.take() {
-                    doc.consume_tag(&tag_name, tag_body.join("\n").trim());
-                }
-                // The tag name runs up to the first whitespace or `{`. Allowing
-                // `{` as a boundary lets `@route-mapping{ ... }` attach its
-                // brace-body with no separating space; a whitespace separator is
-                // consumed, while a `{` is kept as the start of the body.
-                let name_end = rest
-                    .find(|c: char| c.is_whitespace() || c == '{')
-                    .unwrap_or(rest.len());
-                let name = rest[..name_end].to_string();
-                let mut body = &rest[name_end..];
-                if let Some(stripped) = body.strip_prefix(char::is_whitespace) {
-                    body = stripped;
-                }
-                current_tag = Some((name, vec![body.to_string()]));
-            } else if let Some((_, body)) = current_tag.as_mut() {
-                if !line.is_empty() || !body.is_empty() {
-                    body.push(line.to_string());
-                }
+        let mut description_lines: Vec<&str> = Vec::new();
+        let mut current_tag: Option<(&str, Vec<&str>)> = None;
+        let mut in_fence = false;
+        for line in raw.lines() {
+            let line = strip_leading_star(line).trim_end();
+            let tag = if in_fence {
+                None
             } else {
-                description_lines.push(line.to_string());
+                tag_start(line.trim_start())
+            };
+            let text = match tag {
+                Some(("example", body)) => body.trim_start(),
+                Some(_) => "",
+                None => line.trim_start(),
+            };
+            // An opening fence has no other backticks (`` ```npm``` is `` is
+            // inline code); a closing one is any line starting with them.
+            if let Some(after) = text.strip_prefix("```")
+                && (in_fence || !after.contains("```"))
+            {
+                in_fence = !in_fence;
+            }
+            if let Some((name, body)) = tag {
+                if let Some((name, lines)) = current_tag.take() {
+                    doc.consume_tag(name, &tag_body(name, &lines));
+                }
+                current_tag = Some((name, vec![body]));
+            } else if let Some((_, lines)) = current_tag.as_mut() {
+                lines.push(line);
+            } else {
+                description_lines.push(line.trim_start());
             }
         }
-        if let Some((tag_name, body)) = current_tag {
-            doc.consume_tag(&tag_name, body.join("\n").trim());
+        if let Some((name, lines)) = current_tag {
+            doc.consume_tag(name, &tag_body(name, &lines));
         }
         let joined = description_lines.join("\n").trim().to_string();
         if !joined.is_empty() {
-            // First non-empty line becomes the summary; the rest becomes the
-            // longer description if it differs.
+            // The first paragraph is the summary, the rest the description.
             let mut iter = joined.split("\n\n");
             doc.summary = iter
                 .next()
@@ -114,6 +113,73 @@ impl JsDoc {
         }
         self.tags.push((name.to_string(), body.to_string()));
     }
+}
+
+/// A comment line without its leading `*` and the space after it. A `*`
+/// followed by another one is markdown (`/** **Note** … */`), not a gutter.
+fn strip_leading_star(line: &str) -> &str {
+    let line = line.trim_start();
+    match line.strip_prefix('*').filter(|rest| !rest.starts_with('*')) {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+        None => line,
+    }
+}
+
+/// The name and body of a tag opening `line`. A tag name starts with a
+/// lowercase letter and ends at whitespace, the end of the line or a `{`
+/// (`@route-mapping{`), optionally after a `:`, `.` or `,`. So
+/// `@nestjs/common`, `@Get()` or a bare `@Injectable` stay text.
+fn tag_start(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('@')?;
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    let mut body = &rest[name_end..];
+    // `@deprecated: use v2`, `@deprecated.`: punctuation that ends the line or
+    // a word, unlike `@example.com`.
+    if let Some(after) = body.strip_prefix([':', '.', ','])
+        && (after.is_empty() || after.starts_with(char::is_whitespace))
+    {
+        body = after;
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase())
+        || !(body.is_empty() || body.starts_with(char::is_whitespace) || body.starts_with('{'))
+    {
+        return None;
+    }
+    Some((name, body.strip_prefix(char::is_whitespace).unwrap_or(body)))
+}
+
+/// A tag's lines as one body. An `@example` keeps its lines' indentation,
+/// less the indentation they share; other tags' lines are trimmed.
+fn tag_body(name: &str, lines: &[&str]) -> String {
+    let (first, rest) = lines.split_first().map_or(("", &[][..]), |(f, r)| (*f, r));
+    let body = if name == "example" {
+        let indent = rest
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
+            .min()
+            .unwrap_or(0);
+        std::iter::once(first)
+            .chain(rest.iter().map(|l| dedent(l, indent)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        std::iter::once(first)
+            .chain(rest.iter().map(|l| l.trim_start()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    body.trim().to_string()
+}
+
+/// `line` without its first `indent` characters, all whitespace.
+fn dedent(line: &str, indent: usize) -> &str {
+    line.char_indices()
+        .nth(indent)
+        .map_or("", |(i, _)| &line[i..])
 }
 
 /// Parse a `@route-mapping` body of the form
@@ -354,6 +420,92 @@ mod tests {
     #[test]
     fn no_throws_leaves_field_empty() {
         assert!(JsDoc::parse("\n * Just a summary\n ").throws.is_empty());
+    }
+
+    #[test]
+    fn only_a_tag_shaped_word_opens_a_tag() {
+        let raw = "\n * Wraps the client of\n * @nestjs/common and\n * @Injectable services.\n * @deprecated\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(
+            doc.summary.as_deref(),
+            Some("Wraps the client of\n@nestjs/common and\n@Injectable services.")
+        );
+        assert!(doc.deprecated);
+    }
+
+    #[test]
+    fn example_body_is_kept_verbatim() {
+        let raw = "\n * Find a book\n * @example\n * @Get(':id')\n * find() {\n *   return 1;\n * }\n * @param id the id\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(
+            doc.example.as_deref(),
+            Some("@Get(':id')\nfind() {\n  return 1;\n}")
+        );
+        assert_eq!(doc.params.get("id").map(String::as_str), Some("the id"));
+    }
+
+    #[test]
+    fn a_code_fence_hides_tags() {
+        let raw = "\n * @example\n * ```ts\n * @param x\n * ```\n * @deprecated\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.example.as_deref(), Some("```ts\n@param x\n```"));
+        assert!(doc.params.is_empty());
+        assert!(doc.deprecated);
+    }
+
+    #[test]
+    fn a_tag_name_may_end_with_punctuation() {
+        let doc = JsDoc::parse("\n * @deprecated: use v2\n ");
+        assert_eq!(doc.deprecated_reason.as_deref(), Some("use v2"));
+        assert!(JsDoc::parse(" @deprecated. ").deprecated);
+        let doc = JsDoc::parse("\n * Mail\n * @example.com domain\n ");
+        assert_eq!(doc.summary.as_deref(), Some("Mail\n@example.com domain"));
+    }
+
+    #[test]
+    fn inline_code_opens_no_fence() {
+        let doc = JsDoc::parse("\n * ```npm``` is the tool\n * @deprecated\n ");
+        assert_eq!(doc.summary.as_deref(), Some("```npm``` is the tool"));
+        assert!(doc.deprecated);
+        let doc = JsDoc::parse("\n * @example ```{\"a\": 1}```\n * @deprecated\n ");
+        assert_eq!(doc.example.as_deref(), Some("```{\"a\": 1}```"));
+        assert!(doc.deprecated);
+    }
+
+    #[test]
+    fn only_an_example_opens_a_fence_on_its_tag_line() {
+        let doc = JsDoc::parse("\n * @deprecated ```old``` is gone\n * @param id the id\n ");
+        assert_eq!(doc.params.get("id").map(String::as_str), Some("the id"));
+    }
+
+    #[test]
+    fn a_leading_bold_keeps_its_stars() {
+        let doc = JsDoc::parse("\n * **Note**: read only\n ");
+        assert_eq!(doc.summary.as_deref(), Some("**Note**: read only"));
+        let doc = JsDoc::parse(" **Note**: read only ");
+        assert_eq!(doc.summary.as_deref(), Some("**Note**: read only"));
+    }
+
+    #[test]
+    fn a_fence_opened_on_the_tag_line_hides_tags() {
+        let raw = "\n * @example ```json\n * {\"a\": 1}\n * @param x\n * ```\n * @deprecated\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(
+            doc.example.as_deref(),
+            Some("```json\n{\"a\": 1}\n@param x\n```")
+        );
+        assert!(doc.params.is_empty());
+        assert!(doc.deprecated);
+    }
+
+    #[test]
+    fn example_indentation_is_counted_in_characters() {
+        let raw = "\n * @example\n *  \u{a0}first\n *   second\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.example.as_deref(), Some("first\nsecond"));
+        let raw = "\n * @example\n *   {\n *     \"a\": 1\n *   }\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.example.as_deref(), Some("{\n  \"a\": 1\n}"));
     }
 
     #[test]
