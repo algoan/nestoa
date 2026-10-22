@@ -97,10 +97,8 @@ impl JsDoc {
             "summary" => self.summary = Some(body.to_string()),
             "description" => self.description = Some(body.to_string()),
             "param" => {
-                let mut parts = body.splitn(2, char::is_whitespace);
-                if let Some(name) = parts.next() {
-                    let desc = parts.next().unwrap_or("").trim().to_string();
-                    self.params.insert(name.to_string(), desc);
+                if let Some((name, desc)) = parse_param(body) {
+                    self.params.insert(name.to_string(), desc.to_string());
                 }
             }
             "route-mapping" => self.route_mapping = parse_route_mapping(body),
@@ -180,6 +178,46 @@ fn dedent(line: &str, indent: usize) -> &str {
     line.char_indices()
         .nth(indent)
         .map_or("", |(i, _)| &line[i..])
+}
+
+/// Parse a `@param` body: `[{type}] name [desc]`, where the name may be
+/// `[name]` or `[name=default]` and the description may open with `-`.
+fn parse_param(body: &str) -> Option<(&str, &str)> {
+    let mut rest = body.trim_start();
+    if rest.starts_with('{') {
+        rest = rest[balanced_end(rest, '{', '}')?..].trim_start();
+    }
+    let (name, desc) = if rest.starts_with('[') {
+        let end = balanced_end(rest, '[', ']')?;
+        let inner = &rest[1..end - 1];
+        (inner.split('=').next().unwrap_or("").trim(), &rest[end..])
+    } else {
+        let (name, desc) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        // `@param id: the id`
+        (name.strip_suffix(':').unwrap_or(name), desc)
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let desc = desc.trim();
+    let desc = match desc.strip_prefix('-') {
+        Some(after) if after.is_empty() || after.starts_with(char::is_whitespace) => after.trim(),
+        _ => desc,
+    };
+    Some((name, desc))
+}
+
+/// The end (exclusive) of the `open … close` group `s` starts with.
+fn balanced_end(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    s.char_indices().find_map(|(i, c)| {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+        }
+        (depth == 0).then_some(i + c.len_utf8())
+    })
 }
 
 /// Parse a `@route-mapping` body of the form
@@ -420,6 +458,21 @@ mod tests {
     #[test]
     fn no_throws_leaves_field_empty() {
         assert!(JsDoc::parse("\n * Just a summary\n ").throws.is_empty());
+    }
+
+    #[test]
+    fn parses_param_forms() {
+        let raw = "\n * @param {string} title the title\n * @param pages - the page count\n * @param [isbn] optional ISBN\n * @param {Array<{a: string}>} [tags=[]] - the tags\n * @param draft\n ";
+        let doc = JsDoc::parse(raw);
+        let param = |n: &str| doc.params.get(n).map(String::as_str);
+        assert_eq!(param("title"), Some("the title"));
+        assert_eq!(param("pages"), Some("the page count"));
+        assert_eq!(param("isbn"), Some("optional ISBN"));
+        assert_eq!(param("tags"), Some("the tags"));
+        assert_eq!(param("draft"), Some(""));
+        assert_eq!(doc.params.len(), 5);
+        let doc = JsDoc::parse(" @param id: the id ");
+        assert_eq!(doc.params.get("id").map(String::as_str), Some("the id"));
     }
 
     #[test]

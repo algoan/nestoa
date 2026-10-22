@@ -12,6 +12,9 @@ space, `{` or the end of the line, optionally after a `:`, `.` or `,`
 ```` ``` ```` code fence, up to its closing fence: an `@example` whose fence is
 never closed runs to the end of the comment.
 
+`@param` accepts the JSDoc forms `@param {Type} name`, `@param [name]`,
+`@param [name=default]`, `@param name - text` and `@param name: text`.
+
 Description lines are trimmed, even inside a code fence. Only an `@example`
 keeps its indentation.
 
