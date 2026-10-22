@@ -389,7 +389,8 @@ pub struct DecoratorReads {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeclaredParam {
-    pub schema: serde_json::Value,
+    #[serde(deserialize_with = "schema_object")]
+    pub schema: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub required: bool,
     #[serde(default)]
@@ -399,6 +400,17 @@ pub struct DeclaredParam {
     /// when the property is absent.
     #[serde(default)]
     pub name_from: Option<String>,
+}
+
+fn schema_object<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Object(schema) => Ok(schema),
+        other => Err(serde::de::Error::custom(format!(
+            "`schema` must be an OpenAPI schema object, not {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -653,6 +665,8 @@ mod tests {
             r#""cookie""#,
             r#"{ "header": {} }"#,
             r#"{ "query": { "page": { "type": "integer" } } }"#,
+            r#"{ "query": { "page": { "schema": "integer" } } }"#,
+            r#"{ "query": { "page": { "schema": null } } }"#,
         ] {
             let json = format!(r#"{{ "decoratorAliases": {{ "Paginate": {bad} }} }}"#);
             assert!(serde_json::from_str::<Config>(&json).is_err(), "{bad}");

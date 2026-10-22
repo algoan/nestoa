@@ -1066,7 +1066,7 @@ impl<'a> Extractor<'a> {
                     name,
                     location: ParamLocation::Query,
                     required: p.required,
-                    schema: p.schema.clone(),
+                    schema: Value::Object(p.schema.clone()),
                     description: p.description.clone(),
                 }
             })
