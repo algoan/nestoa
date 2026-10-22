@@ -292,11 +292,13 @@ fn render_links(text: &str) -> String {
         let inner = &after[..end];
         let (tag, target) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
         let target = target.trim();
-        let (target, label) = match target.split_once('|') {
-            Some((t, l)) => (t.trim(), l.trim()),
-            None => target
-                .split_once(char::is_whitespace)
-                .map_or((target, ""), |(t, l)| (t, l.trim())),
+        let (target, label) = match target.find(|c: char| c == '|' || c.is_whitespace()) {
+            Some(i) => {
+                let label = target[i..].trim_start();
+                let label = label.strip_prefix('|').unwrap_or(label);
+                (&target[..i], label.trim())
+            }
+            None => (target, ""),
         };
         if !matches!(tag, "@link" | "@linkcode" | "@linkplain")
             || target.is_empty()
@@ -793,6 +795,8 @@ mod tests {
             "{@link |label} {@link |}"
         );
         assert_eq!(render_links("{@link A {@link B} end"), "{@link A B end");
+        assert_eq!(render_links("{@link Book read | write}"), "read | write");
+        assert_eq!(render_links("{@link Book | the book}"), "the book");
         assert_eq!(
             render_links("{@link https://example.com/a_(b) Docs}"),
             "[Docs](<https://example.com/a_(b)>)"
