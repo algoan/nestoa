@@ -404,6 +404,9 @@ fn is_integral_literal(raw: &str) -> bool {
         },
         None => (digits, 0),
     };
+    if mantissa.chars().all(|c| c == '0' || c == '.') {
+        return true;
+    }
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let frac = frac.trim_end_matches('0').len() as i64;
     let int_zeros = int.len() as i64 - int.trim_end_matches('0').len() as i64;
@@ -920,6 +923,8 @@ mod tests {
             json!("1.0000000000000001")
         );
         assert_eq!(example_value("1.5e-1", &["integer"]), json!("1.5e-1"));
+        assert_eq!(example_value("0.0e-2", &["integer"]), json!(0));
+        assert_eq!(example_value("-0e-2", &["integer"]), json!(0));
         assert_eq!(
             example_value("9007199254740993.0", &["integer"]),
             json!("9007199254740993.0")
