@@ -370,7 +370,7 @@ pub fn example_value(raw: &str, schema_types: &[&str]) -> Value {
         Some(Value::Number(n))
             if schema_types.contains(&"integer") && !n.is_i64() && !n.is_u64() =>
         {
-            match n.as_f64().filter(|f| f.fract() == 0.0) {
+            match n.as_f64().filter(|_| is_integral_literal(raw)) {
                 Some(f) => Value::from(f as i64),
                 None if schema_types.contains(&"number") => Value::Number(n),
                 None => Value::String(raw.to_string()),
@@ -390,6 +390,29 @@ fn has_rounded_number(v: &Value) -> bool {
         Value::Array(items) => items.iter().any(has_rounded_number),
         Value::Object(m) => m.values().any(has_rounded_number),
         _ => false,
+    }
+}
+
+/// Whether a JSON number literal is an integer, judged on its digits rather
+/// than its `f64`, which rounds `1.0000000000000001` to `1.0`.
+fn is_integral_literal(raw: &str) -> bool {
+    let digits = raw.trim().trim_start_matches('-');
+    let (mantissa, exp) = match digits.split_once(['e', 'E']) {
+        Some((m, e)) => match e.trim_start_matches('+').parse::<i64>() {
+            Ok(e) => (m, e),
+            Err(_) => return false,
+        },
+        None => (digits, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let frac = frac.trim_end_matches('0').len() as i64;
+    let int_zeros = int.len() as i64 - int.trim_end_matches('0').len() as i64;
+    // `exp` shifts the point right: the fraction must fit before it, or the
+    // integer part's trailing zeros must absorb a shift left.
+    if exp >= 0 {
+        frac <= exp
+    } else {
+        frac == 0 && int_zeros >= -exp
     }
 }
 
@@ -890,6 +913,13 @@ mod tests {
         assert_eq!(example_value("4.5", &["string", "integer"]), json!("4.5"));
         assert_eq!(example_value("1e3", &["integer"]), json!(1000));
         assert_eq!(example_value("2.0", &["integer", "null"]), json!(2));
+        assert_eq!(example_value("1000e-3", &["integer"]), json!(1));
+        assert_eq!(example_value("1.5e1", &["integer"]), json!(15));
+        assert_eq!(
+            example_value("1.0000000000000001", &["integer"]),
+            json!("1.0000000000000001")
+        );
+        assert_eq!(example_value("1.5e-1", &["integer"]), json!("1.5e-1"));
         assert_eq!(
             example_value("9007199254740993.0", &["integer"]),
             json!("9007199254740993.0")
