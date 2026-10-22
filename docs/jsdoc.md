@@ -5,6 +5,27 @@ nearest `/** … */` block before the declaration: above its `export` keyword an
 its decorators. A plain `/* */` or `//` comment in between is skipped, as in
 TypeScript.
 
+A line opens a tag when it starts with `@` and a lowercase name followed by a
+space, `{` or the end of the line, optionally after a `:`, `.` or `,`
+(`@deprecated: use v2`). So `@nestjs/common`, `@Get()` or a bare
+`@Injectable` at the start of a line are text, and so is anything inside a
+```` ``` ```` code fence, up to its closing fence: an `@example` whose fence is
+never closed runs to the end of the comment. A fence opens at the start of a
+line, or at the start of a tag's text: after `@example`, after a `@param`
+name or after a `@throws` status.
+
+`@param` accepts the JSDoc forms `@param {Type} name`, `@param [name]`,
+`@param [name=default]`, `@param name - text` and `@param name: text`.
+
+Inline `{@link Target}`, `{@link Target text}` and `{@link Target|text}` (and
+`@linkplain`) become their text, or `Target` when there is none; `@linkcode`
+puts it in backticks. A URL target with a text becomes a markdown link
+`[text](url)`. An empty or unclosed tag stays as written, and so does the outer
+one of two nested tags.
+
+Description lines are trimmed, even inside a code fence. Only an `@example`
+keeps its indentation.
+
 ## On a handler
 
 ```ts
@@ -26,7 +47,7 @@ findOne(@Param('id') id: string): Promise<Book> { … }
 | Following paragraphs | operation `description` |
 | `@summary` / `@description` | set either one explicitly |
 | `@param <name> <text>` | the parameter's `description` |
-| `@deprecated` | `deprecated: true` |
+| `@deprecated [reason]` | `deprecated: true`, and `Deprecated: <reason>` ends the `description` |
 | `@throws`, `@route-mapping` | see below |
 
 ## On a DTO, interface, enum or property
@@ -51,9 +72,23 @@ export class Book {
 | Source | Output |
 | --- | --- |
 | Text (summary and description) | the schema's `description` |
-| `@deprecated` | `deprecated: true` |
-| `@example <value>` | `example` (as a string) |
+| `@deprecated [reason]` | `deprecated: true`, and `Deprecated: <reason>` ends the `description` |
+| `@example <value>` | `example`, see below |
 | `@internal` / `@private` | the property is left out of the schema |
+
+`@example` is read as JSON when it parses (`42`, `true`, `["a", "b"]`,
+`{"shelf": "B2"}`, `"quoted"`), and a `'single-quoted'` value loses its
+quotes. Anything else is a string. The property's type decides between the two:
+
+- a value the property's `type` doesn't admit stays text, so
+  `@example 9780306406157` on an `isbn: string` stays `"9780306406157"`;
+- an example holding a number that a 64-bit float would round (an integer
+  beyond 64 bits, or a decimal or exponent form of 2^53 or more) stays text;
+- a property without a `type` of its own (a `$ref` to an enum, alias or class,
+  or a union) keeps a number, boolean or `null` as text, and takes an array or
+  object as JSON.
+
+A multi-line `@example` keeps its lines and their relative indentation.
 
 When a property's schema is a `$ref`, the annotation is put on an `allOf`
 wrapper, because OpenAPI 3.0 ignores siblings of `$ref` (see

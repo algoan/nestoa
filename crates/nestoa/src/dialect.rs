@@ -216,7 +216,7 @@ fn unwrap_null_union(map: &mut Map<String, Value>) -> bool {
 ///
 /// Only meaningful in keyword position: inside a `properties` map the same
 /// word is a field name, which is what `is_name_keyed_map` exists to catch.
-fn is_instance_data(key: &str) -> bool {
+pub(crate) fn is_instance_data(key: &str) -> bool {
     matches!(
         key,
         "example" | "examples" | "default" | "enum" | "const" | "security" | "securitySchemes"
@@ -229,11 +229,12 @@ fn is_instance_data(key: &str) -> bool {
 ///
 /// A DTO with a field named `example` or `default` is ordinary TypeScript, and
 /// without this its schema would be skipped and keep its 3.1 constructs.
-fn is_name_keyed_map(key: &str) -> bool {
+pub(crate) fn is_name_keyed_map(key: &str) -> bool {
     matches!(
         key,
         "properties"
             | "patternProperties"
+            | "dependentSchemas"
             | "$defs"
             | "definitions"
             | "schemas"

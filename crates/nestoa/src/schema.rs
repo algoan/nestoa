@@ -2860,16 +2860,34 @@ fn attach_doc_to_map(m: &mut Map<String, Value>, doc: &JsDoc) {
     if description.is_none() && !doc.deprecated && doc.example.is_none() {
         return;
     }
+    let example = doc.example.as_deref().map(|raw| {
+        let types: Vec<&str> = match m.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        crate::jsdoc::example_value(raw, &types)
+    });
     // Only worth restructuring once there is actually a sibling to carry.
     ref_to_allof(m);
-    if let Some(c) = description {
-        m.insert("description".into(), Value::String(c));
+    match description {
+        Some(c) => {
+            m.insert("description".into(), Value::String(c));
+        }
+        // An inherited description (`id: Book['id']`) still gets the reason.
+        None => {
+            if let Some(reason) = &doc.deprecated_reason
+                && let Some(Value::String(d)) = m.get_mut("description")
+            {
+                d.push_str(&format!("\n\nDeprecated: {reason}"));
+            }
+        }
     }
     if doc.deprecated {
         m.insert("deprecated".into(), Value::Bool(true));
     }
-    if let Some(ex) = &doc.example {
-        m.insert("example".into(), Value::String(ex.clone()));
+    if let Some(ex) = example {
+        m.insert("example".into(), ex);
     }
 }
 
@@ -5105,6 +5123,88 @@ mod tests {
         assert_eq!(pick["description"], json!("Book metadata."), "got {pick}");
         assert_eq!(pick["deprecated"], json!(true));
         assert_eq!(prop_names(&pick["allOf"][1]), ["title"]);
+    }
+
+    #[test]
+    fn jsdoc_examples_take_the_property_type() {
+        let [book] = lower_all(
+            "",
+            "export enum Code { A = '123' }\n\
+             export type Shelf = string;\n\
+             export class Book {\n\
+             /** @example 42 */ pages: number;\n\
+             /** @example true */ draft: boolean;\n\
+             /** @example [\"poetry\", \"drama\"] */ tags: string[];\n\
+             /** @example 9780306406157 */ isbn: string;\n\
+             /** @example 12 */ edition: string | null;\n\
+             /** @example 'Dune' */ title: string;\n\
+             /** @example \"Herbert\" */ author: string;\n\
+             /** @example 2024-01-31 */ publishedOn: string;\n\
+             /** @example 123 */ code: Code;\n\
+             /** @example 7 */ shelf: Shelf | null;\n\
+             /**\n * @example\n * {\n *   \"shelf\": \"B2\"\n * }\n */\n\
+             location: { shelf: string };\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        let example = |p: &str| book["properties"][p]["example"].clone();
+        assert_eq!(example("pages"), json!(42), "got {book}");
+        assert_eq!(example("draft"), json!(true));
+        assert_eq!(example("tags"), json!(["poetry", "drama"]));
+        assert_eq!(example("isbn"), json!("9780306406157"));
+        assert_eq!(example("edition"), json!("12"));
+        assert_eq!(example("title"), json!("Dune"));
+        assert_eq!(example("author"), json!("Herbert"));
+        assert_eq!(example("publishedOn"), json!("2024-01-31"));
+        assert_eq!(example("location"), json!({"shelf": "B2"}));
+        assert_eq!(example("code"), json!("123"));
+        assert_eq!(example("shelf"), json!("7"));
+    }
+
+    #[test]
+    fn jsdoc_deprecation_reason_extends_an_inherited_description() {
+        let [copy] = lower_all(
+            "",
+            "export class Book {\n\
+             /** The book id */ id: string;\n\
+             }\n\
+             export class BookCopy {\n\
+             /** @deprecated Use {@link BookCopy.key} */ id: Book['id'];\n\
+             }",
+            &["BookCopy"],
+        )
+        .try_into()
+        .unwrap();
+        let id = &copy["properties"]["id"];
+        assert_eq!(
+            id["description"],
+            json!("The book id\n\nDeprecated: Use BookCopy.key"),
+            "got {copy}"
+        );
+        assert_eq!(id["deprecated"], json!(true));
+    }
+
+    #[test]
+    fn jsdoc_deprecation_reason_and_links_reach_the_description() {
+        let [book] = lower_all(
+            "",
+            "export class Book {\n\
+             /**\n * The shelf, see {@link Shelf}.\n * @deprecated Use {@link Book.location} instead\n */\n\
+             shelf: string;\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        let shelf = &book["properties"]["shelf"];
+        assert_eq!(
+            shelf["description"],
+            json!("The shelf, see Shelf.\n\nDeprecated: Use Book.location instead"),
+            "got {book}"
+        );
+        assert_eq!(shelf["deprecated"], json!(true));
     }
 
     #[test]
