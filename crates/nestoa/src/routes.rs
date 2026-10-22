@@ -3292,6 +3292,9 @@ mod tests {
                     @Get('over') over(@Paginate({ perPageName: 'size', ...LIMIT }) p: Page) {}
                     @Get('computed') computed(@Paginate({ [key]: 'size' }) p: Page) {}
                     @Get('last') last(@Paginate({ ...LIMIT, perPageName: 'size' }) p: Page) {}
+                    @Get('getter') getter(
+                        @Paginate({ perPageName: 'size', get perPageName() { return 'limit'; } }) p: Page,
+                    ) {}
                 }
                 "#,
             )],
@@ -3342,12 +3345,13 @@ mod tests {
             ]
         );
         let names = |path: &str| params(path).into_iter().map(|p| p.0).collect::<Vec<_>>();
-        // A spread or computed key may set the option: the name is unknown.
+        // A spread, computed key or accessor may set the option: the name is unknown.
         for path in [
             "/books/raw",
             "/books/spread",
             "/books/over",
             "/books/computed",
+            "/books/getter",
         ] {
             assert_eq!(names(path), ["page", "per_page", "sort", "tag"], "{path}");
         }
@@ -3355,7 +3359,7 @@ mod tests {
         assert_eq!(
             crate::diag::take_warnings(),
             ["cannot evaluate the perPageName option of @Paginate(…); the query parameter per_page keeps its name";
-                4]
+                5]
         );
     }
 

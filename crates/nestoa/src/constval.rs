@@ -274,17 +274,18 @@ pub fn object_value(o: &ObjectLit, key: &str) -> Option<Expr> {
 }
 
 /// `object_value`, or `Err` when a spread or a computed key after the last
-/// `key` property may set it: `{ ...OPTIONS }`, `{ key: 'a', ...OPTIONS }`.
+/// `key` property may set it (`{ ...OPTIONS }`, `{ key: 'a', ...OPTIONS }`),
+/// or when that property is an accessor or a method.
 pub fn object_value_exact(o: &ObjectLit, key: &str) -> Result<Option<Expr>, ()> {
     for p in o.props.iter().rev() {
         let PropOrSpread::Prop(p) = p else {
             return Err(());
         };
-        let name = match p.as_ref() {
-            Prop::KeyValue(kv) => &kv.key,
-            Prop::Method(m) => &m.key,
-            Prop::Getter(g) => &g.key,
-            Prop::Setter(s) => &s.key,
+        let (name, value) = match p.as_ref() {
+            Prop::KeyValue(kv) => (&kv.key, true),
+            Prop::Method(m) => (&m.key, false),
+            Prop::Getter(g) => (&g.key, false),
+            Prop::Setter(s) => (&s.key, false),
             Prop::Shorthand(i) if i.sym == key => break,
             Prop::Shorthand(_) | Prop::Assign(_) => continue,
         };
@@ -294,8 +295,10 @@ pub fn object_value_exact(o: &ObjectLit, key: &str) -> Result<Option<Expr>, ()> 
             PropName::Str(s) => s.value.to_string_lossy() == key,
             _ => false,
         };
-        if found {
-            break;
+        match (found, value) {
+            (true, true) => break,
+            (true, false) => return Err(()),
+            (false, _) => {}
         }
     }
     Ok(object_value(o, key))

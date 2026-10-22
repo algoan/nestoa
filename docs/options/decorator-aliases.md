@@ -73,8 +73,8 @@ Each entry of `query` is one `in: query` parameter, keyed by its name:
 
 The options argument can be an object literal or a constant holding one. When
 the name can't be read, the parameter keeps its key as name, with a warning:
-the property's value can't be evaluated, or a spread (`{ ...OPTIONS }`) or a
-computed key comes after it and may override it.
+the property's value can't be evaluated, it is a getter or a method, or a
+spread (`{ ...OPTIONS }`) or a computed key comes after it and may override it.
 
 The declared parameters come after the handler's own `@Query()` parameters. A
 handler parameter of the same name is merged with the declared one, as two
