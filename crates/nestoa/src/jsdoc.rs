@@ -48,8 +48,7 @@ impl JsDoc {
                 tag_start(line.trim_start())
             };
             let text = match tag {
-                Some(("example", body)) => body.trim_start(),
-                Some(_) => "",
+                Some((_, body)) => body.trim_start(),
                 None => line.trim_start(),
             };
             fence = next_fence(text, fence);
@@ -684,6 +683,15 @@ mod tests {
     }
 
     #[test]
+    fn any_tag_line_can_open_a_fence() {
+        let raw = "\n * @description ```ts\n * @internal\n * ```\n * @deprecated\n ";
+        let doc = JsDoc::parse(raw);
+        assert_eq!(doc.description.as_deref(), Some("```ts\n@internal\n```"));
+        assert!(!doc.internal);
+        assert!(doc.deprecated);
+    }
+
+    #[test]
     fn a_longer_fence_holds_a_shorter_one() {
         let raw =
             "\n * @example\n * ````md\n * ```ts\n * @internal\n * ```\n * ````\n * @deprecated\n ";
@@ -707,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_example_opens_a_fence_on_its_tag_line() {
+    fn inline_code_on_a_tag_line_opens_no_fence() {
         let doc = JsDoc::parse("\n * @deprecated ```old``` is gone\n * @param id the id\n ");
         assert_eq!(doc.params.get("id").map(String::as_str), Some("the id"));
     }
