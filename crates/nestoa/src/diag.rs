@@ -5,6 +5,8 @@ use std::fmt::Display;
 
 use serde_json::Value;
 
+use crate::dialect::{is_instance_data, is_name_keyed_map};
+
 thread_local! {
     static WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -37,10 +39,24 @@ pub fn unresolved(doc: &Value) -> Vec<(String, String)> {
                         .map_or_else(|| name.to_string(), str::to_string);
                     out.push((format!("#{pointer}"), name));
                 }
+                // An `example` is data, which may hold an `x-unresolved` key of
+                // its own; walk the schemas only, as `dialect` does.
                 for (key, child) in map {
-                    pointer.push('/');
-                    pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                    walk(child, pointer, out);
+                    if is_instance_data(key) {
+                        continue;
+                    }
+                    push_key(pointer, key);
+                    match child {
+                        Value::Object(entries) if is_name_keyed_map(key) => {
+                            let len = pointer.len();
+                            for (name, entry) in entries {
+                                push_key(pointer, name);
+                                walk(entry, pointer, out);
+                                pointer.truncate(len);
+                            }
+                        }
+                        _ => walk(child, pointer, out),
+                    }
                     pointer.truncate(len);
                 }
             }
@@ -54,6 +70,10 @@ pub fn unresolved(doc: &Value) -> Vec<(String, String)> {
             _ => {}
         }
     }
+    fn push_key(pointer: &mut String, key: &str) {
+        pointer.push('/');
+        pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+    }
     let mut out = Vec::new();
     walk(doc, &mut String::new(), &mut out);
     out
@@ -63,6 +83,21 @@ pub fn unresolved(doc: &Value) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_example_holding_the_marker_is_data() {
+        let doc = json!({"components": {"schemas": {"Book": {"properties": {
+            "meta": {"type": "object", "example": {"x-unresolved": "literal data"}},
+            "example": {"x-unresolved": "T"}
+        }}}}});
+        assert_eq!(
+            unresolved(&doc),
+            [(
+                "#/components/schemas/Book/properties/example".to_string(),
+                "T".to_string()
+            )]
+        );
+    }
 
     #[test]
     fn unresolved_markers_are_located_by_json_pointer() {
