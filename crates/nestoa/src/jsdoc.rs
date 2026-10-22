@@ -48,9 +48,13 @@ impl JsDoc {
                 tag_start(line.trim_start())
             };
             // On a tag line a fence may follow a name or status
-            // (`@param id ```ts`), so it is looked for from the first backtick.
+            // (`@param id ```ts`): it starts the body or follows a space, so
+            // backticks inside a word or a string (`"```"`) are not one.
             let text = match tag {
-                Some((_, body)) => body.find('`').map_or("", |i| &body[i..]),
+                Some((_, body)) => body
+                    .match_indices("```")
+                    .find(|(i, _)| *i == 0 || body[..*i].ends_with(char::is_whitespace))
+                    .map_or("", |(i, _)| &body[i..]),
                 None => line.trim_start(),
             };
             fence = next_fence(text, fence);
@@ -721,6 +725,13 @@ mod tests {
             assert!(!doc.deprecated, "{tag}");
             assert!(doc.internal, "{tag}");
         }
+    }
+
+    #[test]
+    fn backticks_in_a_string_open_no_fence() {
+        let doc = JsDoc::parse("\n * @example {\"content\":\"```\"}\n * @internal\n ");
+        assert_eq!(doc.example.as_deref(), Some("{\"content\":\"```\"}"));
+        assert!(doc.internal);
     }
 
     #[test]
