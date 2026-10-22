@@ -1,0 +1,119 @@
+name: Benchmark
+
+# Checks nestoa against the NestJS OpenAPI generation benchmark
+# (algoan/nestjs-openapi-generation-benchmark), see docs/development.md#benchmark.
+#
+# - Pull request: builds the pull request and its base, and fails if the pull request has more
+#   differences with the benchmark's expected document in any category, is not deterministic, or fails
+#   --strict where the base passes. Label the pull request `benchmark-regression` to accept more
+#   differences or a --strict failure on purpose (explain it in the description); non-determinism and
+#   errors are never accepted.
+# - Push to main: asks the benchmark to refresh its `nestoa-main` results (it opens a pull request).
+#
+# Needs the BENCHMARK_TOKEN secret: a token with read and write access to the contents of the benchmark
+# repository. Without it, the job is skipped with a warning.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  HAS_TOKEN: ${{ secrets.BENCHMARK_TOKEN != '' }}
+
+jobs:
+  check:
+    name: Check against the benchmark
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Missing token
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::warning::BENCHMARK_TOKEN is not set (or not available to this pull request), benchmark skipped"
+
+      # Neither checkout keeps its token in .git/config: the build and the binaries run the pull
+      # request's code, which must not reuse BENCHMARK_TOKEN
+      - uses: actions/checkout@v7
+        if: env.HAS_TOKEN == 'true'
+        with:
+          fetch-depth: 0 # the base commit is built too
+          persist-credentials: false
+
+      - name: Check out the benchmark
+        if: env.HAS_TOKEN == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: algoan/nestjs-openapi-generation-benchmark
+          token: ${{ secrets.BENCHMARK_TOKEN }}
+          path: .benchmark
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: env.HAS_TOKEN == 'true'
+        with:
+          node-version: 24
+
+      - name: Install the benchmark harness
+        if: env.HAS_TOKEN == 'true'
+        run: npm --prefix .benchmark/bench ci --no-audit --no-fund
+
+      - name: Install Rust toolchain
+        if: env.HAS_TOKEN == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        if: env.HAS_TOKEN == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the pull request and its base
+        if: env.HAS_TOKEN == 'true'
+        run: |
+          cargo build --release --locked --package nestoa
+          git worktree add "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
+          # Inside target/ so that rust-cache keeps the base build too
+          cargo build --release --locked --package nestoa \
+            --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir target/base
+
+      - name: Compare with the base
+        if: env.HAS_TOKEN == 'true'
+        env:
+          BENCHMARK_DIR: .benchmark
+          ACCEPTED: ${{ contains(github.event.pull_request.labels.*.name, 'benchmark-regression') }}
+        run: |
+          export BENCHMARK_SUMMARY="$GITHUB_STEP_SUMMARY"
+          status=0
+          scripts/benchmark.sh target/release/nestoa target/base/release/nestoa || status=$?
+          # The label only accepts a regression (exit 1), never an error (exit 2)
+          if [ "$status" = 1 ] && [ "$ACCEPTED" = true ]; then
+            echo "::warning::Benchmark regression accepted by the benchmark-regression label"
+          elif [ "$status" = 1 ]; then
+            echo "::error::Benchmark regression, see the job summary (label the pull request benchmark-regression to accept it)"
+            exit 1
+          elif [ "$status" != 0 ]; then
+            echo "::error::The benchmark could not run, see the job summary"
+            exit "$status"
+          fi
+
+  refresh:
+    name: Refresh the benchmark results
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch nestoa-main to the benchmark
+        if: env.HAS_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BENCHMARK_TOKEN }}
+        run: |
+          gh api repos/algoan/nestjs-openapi-generation-benchmark/dispatches \
+            -f event_type=nestoa-main -f "client_payload[sha]=$GITHUB_SHA" \
+            || echo "::warning::The benchmark refresh dispatch failed"
+
+      - name: Missing token
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::warning::BENCHMARK_TOKEN is not set, the benchmark results are not refreshed"
