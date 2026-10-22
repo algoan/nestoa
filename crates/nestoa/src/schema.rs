@@ -5132,8 +5132,8 @@ mod tests {
              /** @example 2024-01-31 */ publishedOn: string;\n\
              /** @example 123 */ code: Code;\n\
              /** @example 7 */ shelf: Shelf | null;\n\
-             /**\n * @example\n * {\n *   \"city\": \"Paris\"\n * }\n */\n\
-             address: { city: string };\n\
+             /**\n * @example\n * {\n *   \"shelf\": \"B2\"\n * }\n */\n\
+             location: { shelf: string };\n\
              }",
             &["Book"],
         )
@@ -5148,7 +5148,7 @@ mod tests {
         assert_eq!(example("title"), json!("Dune"));
         assert_eq!(example("author"), json!("Herbert"));
         assert_eq!(example("publishedOn"), json!("2024-01-31"));
-        assert_eq!(example("address"), json!({"city": "Paris"}));
+        assert_eq!(example("location"), json!({"shelf": "B2"}));
         assert_eq!(example("code"), json!("123"));
         assert_eq!(example("shelf"), json!("7"));
     }

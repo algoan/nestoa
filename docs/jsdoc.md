@@ -75,7 +75,7 @@ export class Book {
 | `@internal` / `@private` | the property is left out of the schema |
 
 `@example` is read as JSON when it parses (`42`, `true`, `["a", "b"]`,
-`{"city": "Paris"}`, `"quoted"`), and a `'single-quoted'` value loses its
+`{"shelf": "B2"}`, `"quoted"`), and a `'single-quoted'` value loses its
 quotes. Anything else is a string. The property's type decides between the two:
 
 - a value the property's `type` doesn't admit stays text, so
