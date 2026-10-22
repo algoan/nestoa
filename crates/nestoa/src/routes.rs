@@ -1041,7 +1041,7 @@ impl<'a> Extractor<'a> {
             let (decl_file, o) =
                 crate::globalprefix::options_object(self.project, file, arg, &mut holder)
                     .ok_or(())?;
-            match object_value(o, key) {
+            match crate::constval::object_value_exact(o, key)? {
                 None => Ok(None),
                 Some(v) => crate::constval::string(self.project, &decl_file, &v)
                     .map(Some)
@@ -3288,6 +3288,10 @@ mod tests {
                     @Get() list(@Query('q') q: string, @Paginate(LIMIT) p: Page) {}
                     @Get('all') all(@Paginate() p: Page, @Query('tag') tag?: 'a' | 'b') {}
                     @Get('raw') raw(@Paginate({ perPageName: name }) p: Page) {}
+                    @Get('spread') spread(@Paginate({ ...LIMIT }) p: Page) {}
+                    @Get('over') over(@Paginate({ perPageName: 'size', ...LIMIT }) p: Page) {}
+                    @Get('computed') computed(@Paginate({ [key]: 'size' }) p: Page) {}
+                    @Get('last') last(@Paginate({ ...LIMIT, perPageName: 'size' }) p: Page) {}
                 }
                 "#,
             )],
@@ -3337,18 +3341,21 @@ mod tests {
                 ("sort".into(), false, string.clone(), sort.clone()),
             ]
         );
-        assert_eq!(
-            params("/books/raw")
-                .iter()
-                .map(|p| p.0.as_str())
-                .collect::<Vec<_>>(),
-            ["page", "per_page", "sort", "tag"]
-        );
+        let names = |path: &str| params(path).into_iter().map(|p| p.0).collect::<Vec<_>>();
+        // A spread or computed key may set the option: the name is unknown.
+        for path in [
+            "/books/raw",
+            "/books/spread",
+            "/books/over",
+            "/books/computed",
+        ] {
+            assert_eq!(names(path), ["page", "per_page", "sort", "tag"], "{path}");
+        }
+        assert_eq!(names("/books/last"), ["page", "size", "sort", "tag"]);
         assert_eq!(
             crate::diag::take_warnings(),
-            [
-                "cannot evaluate the perPageName option of @Paginate(…); the query parameter per_page keeps its name"
-            ]
+            ["cannot evaluate the perPageName option of @Paginate(…); the query parameter per_page keeps its name";
+                4]
         );
     }
 
