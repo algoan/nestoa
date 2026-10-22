@@ -344,6 +344,16 @@ pub fn example_value(raw: &str, schema_types: &[&str]) -> Value {
         // A `$ref` or a union: its type is unknown here, and a scalar would
         // contradict a string enum or alias.
         Some(v) if schema_types.is_empty() && (v.is_object() || v.is_array()) => v,
+        // `1.0` or `1e3` on an `integer`: emitted as `1`, `1000`.
+        Some(Value::Number(n))
+            if schema_types.contains(&"integer") && !n.is_i64() && !n.is_u64() =>
+        {
+            match n.as_f64().filter(|f| f.fract() == 0.0) {
+                Some(f) => Value::from(f as i64),
+                None if schema_types.contains(&"number") => Value::Number(n),
+                None => Value::String(raw.to_string()),
+            }
+        }
         Some(v) if schema_types.iter().any(|t| has_type(&v, t)) => v,
         _ => Value::String(raw.to_string()),
     }
@@ -831,6 +841,9 @@ mod tests {
         assert_eq!(example_value("42", &["string"]), json!("42"));
         assert_eq!(example_value("42", &["string", "number"]), json!(42));
         assert_eq!(example_value("4.5", &["string", "integer"]), json!("4.5"));
+        assert_eq!(example_value("1e3", &["integer"]), json!(1000));
+        assert_eq!(example_value("2.0", &["integer", "null"]), json!(2));
+        assert_eq!(example_value("4.5", &["integer", "number"]), json!(4.5));
         assert_eq!(example_value("null", &["string", "null"]), json!(null));
         assert_eq!(example_value("123", &[]), json!("123"));
         assert_eq!(example_value("true", &[]), json!("true"));
