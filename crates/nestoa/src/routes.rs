@@ -519,24 +519,8 @@ impl<'a> Extractor<'a> {
             if let Some(parsed) = self.classify_param(file, p, &method_doc) {
                 match parsed {
                     ParsedParam::Routed(rps) => {
-                        // `@Query('a')` twice reads one parameter, which OpenAPI
-                        // allows once per location: it must satisfy both.
                         for rp in rps {
-                            match params
-                                .iter_mut()
-                                .find(|p| p.location == rp.location && same_name(p, &rp))
-                            {
-                                Some(p) => {
-                                    p.required |= rp.required;
-                                    p.schema = merged_param_schema(
-                                        p.schema.take(),
-                                        rp.schema,
-                                        self.components,
-                                    );
-                                    p.description = p.description.take().or(rp.description);
-                                }
-                                None => params.push(rp),
-                            }
+                            add_param(&mut params, rp, self.components);
                         }
                     }
                     ParsedParam::Body(b) => request_body = Some(b),
@@ -1432,6 +1416,22 @@ fn schema_type<'a>(schema: &'a Value, components: &'a ComponentSchemas) -> Optio
 
 /// Whether two parameters of one location have the same name; header names
 /// are case-insensitive.
+/// Adds a parameter to a route's. `@Query('a')` twice reads one parameter,
+/// which OpenAPI allows once per location: it must satisfy both.
+fn add_param(params: &mut Vec<RouteParam>, rp: RouteParam, components: &ComponentSchemas) {
+    match params
+        .iter_mut()
+        .find(|p| p.location == rp.location && same_name(p, &rp))
+    {
+        Some(p) => {
+            p.required |= rp.required;
+            p.schema = merged_param_schema(p.schema.take(), rp.schema, components);
+            p.description = p.description.take().or(rp.description);
+        }
+        None => params.push(rp),
+    }
+}
+
 fn same_name(a: &RouteParam, b: &RouteParam) -> bool {
     match a.location {
         ParamLocation::Header => a.name.eq_ignore_ascii_case(&b.name),
