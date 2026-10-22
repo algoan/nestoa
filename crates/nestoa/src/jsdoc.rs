@@ -47,14 +47,8 @@ impl JsDoc {
             } else {
                 tag_start(line.trim_start())
             };
-            // On a tag line a fence may follow a name or status
-            // (`@param id ```ts`): it starts the body or follows a space, so
-            // backticks inside a word or a string (`"```"`) are not one.
             let text = match tag {
-                Some((_, body)) => body
-                    .match_indices("```")
-                    .find(|(i, _)| *i == 0 || body[..*i].ends_with(char::is_whitespace))
-                    .map_or("", |(i, _)| &body[i..]),
+                Some((name, body)) => tag_text(name, body),
                 None => line.trim_start(),
             };
             fence = next_fence(text, fence);
@@ -138,6 +132,24 @@ impl JsDoc {
         for text in texts {
             *text = render_links(text);
         }
+    }
+}
+
+/// Where a tag's text starts, which is where a fence may open: after the name
+/// of a `@param` (`@param id ```ts`) or the status of a `@throws`, else at the
+/// start of the body. Backticks further in (`{"a": " ```"}`) are text.
+fn tag_text<'a>(name: &str, body: &'a str) -> &'a str {
+    let body = body.trim_start();
+    match name {
+        "param" => parse_param(body).map_or("", |(_, desc)| desc),
+        "throws" | "httpError" | "exception" => {
+            let rest = match body.strip_prefix('{') {
+                Some(after) => after.split_once('}').map_or("", |(_, r)| r),
+                None => body.split_once(char::is_whitespace).map_or("", |(_, r)| r),
+            };
+            rest.trim_start()
+        }
+        _ => body,
     }
 }
 
@@ -729,9 +741,11 @@ mod tests {
 
     #[test]
     fn backticks_in_a_string_open_no_fence() {
-        let doc = JsDoc::parse("\n * @example {\"content\":\"```\"}\n * @internal\n ");
-        assert_eq!(doc.example.as_deref(), Some("{\"content\":\"```\"}"));
-        assert!(doc.internal);
+        for example in ["{\"content\":\"```\"}", "{\"content\":\" ```\"}"] {
+            let doc = JsDoc::parse(&format!("\n * @example {example}\n * @internal\n "));
+            assert_eq!(doc.example.as_deref(), Some(example));
+            assert!(doc.internal, "{example}");
+        }
     }
 
     #[test]

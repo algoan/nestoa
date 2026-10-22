@@ -10,7 +10,9 @@ space, `{` or the end of the line, optionally after a `:`, `.` or `,`
 (`@deprecated: use v2`). So `@nestjs/common`, `@Get()` or a bare
 `@Injectable` at the start of a line are text, and so is anything inside a
 ```` ``` ```` code fence, up to its closing fence: an `@example` whose fence is
-never closed runs to the end of the comment.
+never closed runs to the end of the comment. A fence opens at the start of a
+line, or at the start of a tag's text: after `@example`, after a `@param`
+name or after a `@throws` status.
 
 `@param` accepts the JSDoc forms `@param {Type} name`, `@param [name]`,
 `@param [name=default]`, `@param name - text` and `@param name: text`.
