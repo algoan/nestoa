@@ -52,7 +52,7 @@ says otherwise. Its argument can be a number, a constant (`MULTI_STATUS`,
 | `@Sse()`, even under another verb decorator | `200`, whatever `@HttpCode` says, with `type: string` as `text/event-stream` |
 | `@Redirect(url, status)` | the redirect status (`302` by default, whatever `@HttpCode` says), with a `Location` header and no body |
 | status `204`, `205` or `304` | no body, whatever the return type |
-| no return type | no body, unless an interceptor's output doesn't depend on its input |
+| no return type | no body, unless an interceptor's output doesn't depend on its input; a warning when the handler returns a value |
 
 A `StreamableFile` class of your own is lowered like any other type. A handler
 returning `{ url, statusCode }` from a `@Redirect` route changes the status at

@@ -573,6 +573,8 @@ impl<'a> Extractor<'a> {
             .iter()
             .any(|d| decorator_name(d) == "Sse");
         let declared_return = m.function.return_type.as_ref().map(|r| &*r.type_ann);
+        // A handler returning a value its signature doesn't type.
+        let mut untyped_return = false;
         let (response_value, response_media_type) = if redirect_code.is_some() {
             (None, JSON.to_string())
         } else if sse {
@@ -625,6 +627,7 @@ impl<'a> Extractor<'a> {
                         let schema = ctx.ts_type_to_schema(file, t);
                         (!schema.is_null() && schema != json!({})).then_some(schema)
                     });
+                    untyped_return = declared_return.is_none() && returns_a_value(&m.function);
                     (response, json_type())
                 }
             }
@@ -717,6 +720,7 @@ impl<'a> Extractor<'a> {
             handler,
             file: file.to_path_buf(),
         };
+        let mut undocumented_body = false;
         for (method, concrete) in &full_paths {
             let method = *method;
             let full_path = concrete.path.clone();
@@ -735,6 +739,7 @@ impl<'a> Extractor<'a> {
             let response = overridden
                 .or_else(|| response_value.clone())
                 .filter(|_| !template.redirect);
+            undocumented_body |= untyped_return && response.is_none() && !bodiless(status_code);
             let signals = errors::RouteSignals {
                 auth_active,
                 auth_opted_out: opted_out,
@@ -759,6 +764,12 @@ impl<'a> Extractor<'a> {
                 errors: route_errors,
                 ..template.clone()
             });
+        }
+        if undocumented_body {
+            crate::diag::warn(format!(
+                "{}: no return type; its response body is left undocumented",
+                template.handler
+            ));
         }
     }
 
@@ -1870,6 +1881,31 @@ fn scanned_throw_statuses(func: &Function) -> Vec<u16> {
     finder.codes.sort_unstable();
     finder.codes.dedup();
     finder.codes
+}
+
+/// Whether a handler's own body has a `return` with a value; returns in
+/// nested functions and classes are theirs.
+fn returns_a_value(func: &Function) -> bool {
+    let mut finder = ValueReturnFinder { found: false };
+    func.body.visit_with(&mut finder);
+    finder.found
+}
+
+struct ValueReturnFinder {
+    found: bool,
+}
+
+impl Visit for ValueReturnFinder {
+    fn visit_return_stmt(&mut self, n: &swc_ecma_ast::ReturnStmt) {
+        self.found |= n.arg.as_deref().is_some_and(|arg| {
+            !matches!(arg, Expr::Ident(i) if i.sym == "undefined")
+                && !matches!(arg, Expr::Unary(u) if u.op == swc_ecma_ast::UnaryOp::Void)
+        });
+    }
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &swc_ecma_ast::ArrowExpr) {}
+    fn visit_class(&mut self, _: &swc_ecma_ast::Class) {}
+    fn visit_getter_prop(&mut self, _: &swc_ecma_ast::GetterProp) {}
 }
 
 struct ThrowFinder {
@@ -4930,5 +4966,73 @@ mod tests {
             .collect();
         reachable.sort();
         assert_eq!(reachable, ["Author", "Book", "Shelf"]);
+    }
+
+    #[test]
+    fn a_handler_returning_an_untyped_value_is_warned() {
+        crate::diag::take_warnings();
+        let doc = document(
+            "untyped-return",
+            r#"
+            @Controller('books')
+            export class BooksController {
+                constructor(private readonly books: BooksService) {}
+                @Get(':id') async findOne(@Param('id') id: string) {
+                    if (!id) { return; }
+                    return this.books.findOne(id);
+                }
+                @Get() list() { return []; }
+            }
+            "#,
+        );
+        assert_eq!(
+            doc["paths"]["/books/{id}"]["get"]["responses"]["200"],
+            json!({"description": "OK"})
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            [
+                "BooksController.findOne: no return type; its response body is left undocumented",
+                "BooksController.list: no return type; its response body is left undocumented",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_handler_without_a_documentable_body_is_not_warned() {
+        crate::diag::take_warnings();
+        document(
+            "untyped-no-body",
+            r#"
+            class MuteInterceptor implements NestInterceptor<unknown, void> {}
+            class StampInterceptor implements NestInterceptor<unknown, { stamp: string }> {}
+            @Controller('books')
+            export class BooksController {
+                @Get('muted') @UseInterceptors(MuteInterceptor) muted() { return this.books.one(); }
+                @Get('stamped') @UseInterceptors(StampInterceptor) stamped() { return this.books.one(); }
+                @Post() create() { this.books.create(); }
+                @Put() replace() { return; }
+                @Patch() update() { return undefined; }
+                @Delete() remove() { return void this.books.remove(); }
+                @Get('later') later() {
+                    const run = () => { return 1; };
+                    setTimeout(function () { return 2; });
+                    const box = { get size() { return 3; } };
+                    return void new (class { get x() { return 4; } })();
+                }
+                @Post('archive') @HttpCode(204) archive() { return this.books.archive(); }
+                @Get('docs') @Redirect('/') docs() { return { url: '/x' }; }
+                @Sse('events') events() { return this.books.events(); }
+                @Get('typed') typed(): Book { return this.books.one(); }
+                /**
+                 * @route-mapping {
+                 *   'mapped': Book
+                 * }
+                 */
+                @Get('mapped') mapped() { return this.books.one(); }
+            }
+            "#,
+        );
+        assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
     }
 }

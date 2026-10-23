@@ -31,6 +31,8 @@ document correctly. For example:
 - an error-response rule that matches no route,
 - a parameter whose name it could not evaluate (the parameter is left out),
 - two handlers on the same method and path (the later one wins),
+- a handler without a return type that returns a value (its response body is
+  left undocumented; declare the return type),
 - paths that differ only in parameter names, which OpenAPI forbids.
 
 A type nestoa cannot lower is emitted as `x-unresolved` with its name or source
