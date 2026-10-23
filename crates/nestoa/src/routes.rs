@@ -1898,6 +1898,7 @@ struct ValueReturnFinder {
 impl Visit for ValueReturnFinder {
     fn visit_return_stmt(&mut self, n: &swc_ecma_ast::ReturnStmt) {
         self.found |= n.arg.as_deref().is_some_and(|arg| {
+            let arg = crate::constval::unwrap(arg);
             !matches!(arg, Expr::Ident(i) if i.sym == "undefined")
                 && !matches!(arg, Expr::Unary(u) if u.op == swc_ecma_ast::UnaryOp::Void)
         });
@@ -5013,6 +5014,7 @@ mod tests {
                 @Post() create() { this.books.create(); }
                 @Put() replace() { return; }
                 @Patch() update() { return undefined; }
+                @Patch('quiet') quiet() { return (undefined); }
                 @Delete() remove() { return void this.books.remove(); }
                 @Get('later') later() {
                     const run = () => { return 1; };
