@@ -1,11 +1,14 @@
-//! Static evaluation of the string expressions decorators take as paths and
-//! versions: literals, template literals and `+` concatenations of them,
-//! variables (`BASE`), properties of object constants (`ROUTES.LIST`) and
-//! string enum members (`Species.CAT`), followed across modules.
+//! Static evaluation of the string and number expressions decorators take as
+//! paths, versions and bounds: literals, negative numbers, template literals
+//! and `+` concatenations of them, variables (`BASE`), properties of object
+//! constants (`ROUTES.LIST`) and string enum members (`Species.CAT`), followed
+//! across modules.
 
 use std::path::Path;
 
-use swc_ecma_ast::{BinaryOp, Expr, Lit, MemberProp, ObjectLit, Prop, PropName, PropOrSpread};
+use swc_ecma_ast::{
+    BinaryOp, Expr, Lit, MemberProp, ObjectLit, Prop, PropName, PropOrSpread, UnaryOp,
+};
 
 use crate::symbols::{EnumValue, Project, Symbol, enum_member_values};
 
@@ -131,6 +134,10 @@ fn eval(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<Enu
     match unwrap(expr) {
         Expr::Lit(Lit::Str(s)) => Some(EnumValue::Str(s.value.to_string_lossy().into_owned())),
         Expr::Lit(Lit::Num(n)) => Some(EnumValue::Num(n.value)),
+        Expr::Unary(u) if u.op == UnaryOp::Minus => match eval(project, file, &u.arg, depth)? {
+            EnumValue::Num(n) => Some(EnumValue::Num(-n)),
+            EnumValue::Str(_) => None,
+        },
         Expr::Tpl(t) => {
             let mut out = String::new();
             for (i, quasi) in t.quasis.iter().enumerate() {

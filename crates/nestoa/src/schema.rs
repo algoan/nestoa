@@ -1350,6 +1350,13 @@ impl<'a> SchemaCtx<'a> {
             (None, Some(init)) => self.initializer_schema(file, init),
             (None, None) => json!({}),
         };
+        for d in member.decorators {
+            if let Some((constraints, each)) = self.class_validator_constraints(file, d) {
+                for c in &constraints {
+                    constrain(&mut schema, c, each);
+                }
+            }
+        }
         if let Some(doc) = &doc {
             attach_doc(&mut schema, doc);
         }
@@ -1361,6 +1368,118 @@ impl<'a> SchemaCtx<'a> {
             }
             || member.decorators.iter().any(marks_optional);
         Some((name, schema, optional))
+    }
+
+    /// The schema keywords a class-validator decorator (`@MaxLength(100)`,
+    /// `@IsInt()`, …) sets, and whether its `{ each: true }` option moves them
+    /// onto the elements of an array. `None` for a decorator not imported from
+    /// `class-validator`, one without a JSON Schema equivalent, or one whose
+    /// arguments cannot be evaluated.
+    fn class_validator_constraints(
+        &self,
+        file: &Path,
+        d: &swc_ecma_ast::Decorator,
+    ) -> Option<(Vec<Constraint>, bool)> {
+        let Expr::Call(call) = &*d.expr else {
+            return None;
+        };
+        let swc_ecma_ast::Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        let (package, name) = match &**callee {
+            Expr::Ident(id) => self.project.import_origin(file, id.sym.as_ref())?,
+            Expr::Member(m) => {
+                let (Expr::Ident(ns), swc_ecma_ast::MemberProp::Ident(prop)) =
+                    (m.obj.as_ref(), &m.prop)
+                else {
+                    return None;
+                };
+                self.project
+                    .namespace_member_origin(file, ns.sym.as_ref(), prop.sym.as_ref())?
+            }
+            _ => return None,
+        };
+        if package != "class-validator" {
+            return None;
+        }
+        let args: Vec<&Expr> = call
+            .args
+            .iter()
+            .map(|a| a.spread.is_none().then_some(&*a.expr))
+            .collect::<Option<_>>()?;
+        let number = |i: usize| match crate::constval::value(self.project, file, args.get(i)?)? {
+            EnumValue::Num(n) if n.is_finite() => Some(n),
+            _ => None,
+        };
+        // A length or a count: a non-negative integer.
+        let count = |i: usize| {
+            number(i)
+                .filter(|n| *n >= 0.0 && n.fract() == 0.0)
+                .map(number_json)
+        };
+        let bound = |i: usize| number(i).map(number_json);
+        let constraints = match name.as_str() {
+            "IsInt" => vec![Constraint::new(NUMERIC, "type", json!("integer"))],
+            "Min" => vec![Constraint::new(NUMERIC, "minimum", bound(0)?)],
+            "Max" => vec![Constraint::new(NUMERIC, "maximum", bound(0)?)],
+            "IsPositive" => vec![Constraint::new(NUMERIC, "exclusiveMinimum", json!(0))],
+            "IsNegative" => vec![Constraint::new(NUMERIC, "exclusiveMaximum", json!(0))],
+            "MinLength" => vec![Constraint::new(STRING, "minLength", count(0)?)],
+            "MaxLength" => vec![Constraint::new(STRING, "maxLength", count(0)?)],
+            "Length" => {
+                let mut out = vec![Constraint::new(STRING, "minLength", count(0)?)];
+                // `Length(min, max?)`: the second argument may be the options.
+                if let Some(max) = count(1) {
+                    out.push(Constraint::new(STRING, "maxLength", max));
+                }
+                out
+            }
+            "ArrayMinSize" => vec![Constraint::new(ARRAY, "minItems", count(0)?)],
+            "ArrayMaxSize" => vec![Constraint::new(ARRAY, "maxItems", count(0)?)],
+            "ArrayNotEmpty" => vec![Constraint::new(ARRAY, "minItems", json!(1))],
+            "IsEmail" => vec![Constraint::new(STRING, "format", json!("email"))],
+            "IsUrl" => vec![Constraint::new(STRING, "format", json!("uri"))],
+            "IsUUID" => vec![Constraint::new(STRING, "format", json!("uuid"))],
+            "IsDateString" => vec![Constraint::new(STRING, "format", json!("date-time"))],
+            "Matches" => vec![Constraint::new(
+                STRING,
+                "pattern",
+                Value::String(self.matches_pattern(file, &args)?),
+            )],
+            _ => return None,
+        };
+        let each = args.last().is_some_and(|last| {
+            let mut holder = None;
+            crate::globalprefix::options_object(self.project, file, last, &mut holder).is_some_and(
+                |(decl_file, o)| {
+                    crate::constval::object_value(o, "each")
+                        .and_then(|v| crate::constval::boolean(self.project, &decl_file, &v))
+                        == Some(true)
+                },
+            )
+        });
+        Some((constraints, each))
+    }
+
+    /// The JSON Schema `pattern` of `@Matches(/re/)` or `@Matches('re', 'flags')`.
+    /// A flag that changes what the expression matches (`i`, `m`, `s`) has no
+    /// `pattern` spelling, so such a pattern is not lowered.
+    fn matches_pattern(&self, file: &Path, args: &[&Expr]) -> Option<String> {
+        let (source, flags) = match crate::constval::unwrap(args.first()?) {
+            Expr::Lit(Lit::Regex(r)) => (r.exp.to_string(), r.flags.to_string()),
+            first => {
+                let source = crate::constval::string(self.project, file, first)?;
+                let flags = args
+                    .get(1)
+                    .and_then(|e| crate::constval::string(self.project, file, e))
+                    .unwrap_or_default();
+                (source, flags)
+            }
+        };
+        flags
+            .chars()
+            .all(|f| matches!(f, 'g' | 'u' | 'd' | 'y'))
+            .then_some(source)
     }
 
     /// Whether a property's declared type admits `undefined`, directly or
@@ -1966,6 +2085,74 @@ fn marks_optional(d: &swc_ecma_ast::Decorator) -> bool {
         "IsOptional" | "ApiPropertyOptional" => true,
         "ApiProperty" => decorator_option_bool(d, "required") == Some(false),
         _ => false,
+    }
+}
+
+const NUMERIC: &[&str] = &["number", "integer"];
+const STRING: &[&str] = &["string"];
+const ARRAY: &[&str] = &["array"];
+
+/// A schema keyword a validation decorator sets, on a schema whose `type` is
+/// one of `types`: `@MaxLength(5)` says nothing about a number.
+struct Constraint {
+    types: &'static [&'static str],
+    keyword: &'static str,
+    value: Value,
+}
+
+impl Constraint {
+    fn new(types: &'static [&'static str], keyword: &'static str, value: Value) -> Self {
+        Self {
+            types,
+            keyword,
+            value,
+        }
+    }
+}
+
+/// Set `c` on `schema`, on each branch of a union (`T | null`) when it is
+/// one, and on the elements of an array when `each` is set. A `$ref` is left
+/// alone: the component it names is shared by every other use.
+fn constrain(schema: &mut Value, c: &Constraint, each: bool) {
+    let Value::Object(m) = schema else {
+        return;
+    };
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = m.get_mut(key) {
+            for branch in branches {
+                constrain(branch, c, each);
+            }
+        }
+    }
+    let types: Vec<&str> = match m.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => return,
+    };
+    if each && types.contains(&"array") {
+        if let Some(items) = m.get_mut("items") {
+            constrain(items, c, false);
+        }
+        return;
+    }
+    if !types.iter().any(|t| c.types.contains(t)) {
+        return;
+    }
+    match c.keyword {
+        // `IsInt` narrows `number` to `integer`, keeping any other type.
+        "type" => match m.get_mut("type") {
+            Some(Value::Array(ts)) => ts
+                .iter_mut()
+                .filter(|t| *t == "number")
+                .for_each(|t| *t = c.value.clone()),
+            Some(t) => *t = c.value.clone(),
+            None => {}
+        },
+        // The type's own format (`date-time` for a `Date`) stays.
+        "format" if m.contains_key("format") => {}
+        keyword => {
+            m.insert(keyword.into(), c.value.clone());
+        }
     }
 }
 
@@ -4211,6 +4398,178 @@ mod tests {
         .unwrap();
         assert_eq!(prop_names(&user), ["computed", "nickname", "bio", "email"]);
         assert_eq!(required_names(&user), ["computed", "email"]);
+    }
+
+    #[test]
+    fn class_validator_decorators_constrain_properties() {
+        let [shelter] = lower_all(
+            "",
+            "import {\n\
+               IsInt, Min, Max, MinLength, MaxLength, Length, ArrayMinSize, ArrayMaxSize,\n\
+               ArrayNotEmpty, IsEmail, IsUrl, IsUUID, IsDateString, Matches, IsPositive,\n\
+               IsNegative,\n\
+             } from 'class-validator';\n\
+             const MAX_NAME = 100;\n\
+             const LIMITS = { capacity: 1000 };\n\
+             export class Shelter {\n\
+               @MaxLength(MAX_NAME) name: string;\n\
+               @MinLength(10) @MaxLength(500) notes: string;\n\
+               @Length(2, 2) country: string;\n\
+               @Length(3) code: string;\n\
+               @IsInt() @Min(0) @Max(LIMITS.capacity) capacity: number;\n\
+               @Min(-90) @Max(90.5) latitude: number;\n\
+               @IsPositive() fee: number;\n\
+               @IsNegative() offset: number;\n\
+               @ArrayMinSize(1) @ArrayMaxSize(10) tags: string[];\n\
+               @ArrayNotEmpty() ids: number[];\n\
+               @IsEmail() email: string;\n\
+               @IsUrl() website: string;\n\
+               @IsUUID('4') id: string;\n\
+               @IsDateString() openedAt: string;\n\
+               @Matches(/^[A-Z]{2}\\d+$/) ref: string;\n\
+               @Matches('^[a-z]+$', 'i') slug: string;\n\
+             }",
+            &["Shelter"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            shelter["properties"],
+            json!({
+                "name": {"type": "string", "maxLength": 100},
+                "notes": {"type": "string", "minLength": 10, "maxLength": 500},
+                "country": {"type": "string", "minLength": 2, "maxLength": 2},
+                "code": {"type": "string", "minLength": 3},
+                "capacity": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "latitude": {"type": "number", "minimum": -90, "maximum": 90.5},
+                "fee": {"type": "number", "exclusiveMinimum": 0},
+                "offset": {"type": "number", "exclusiveMaximum": 0},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 10
+                },
+                "ids": {"type": "array", "items": {"type": "number"}, "minItems": 1},
+                "email": {"type": "string", "format": "email"},
+                "website": {"type": "string", "format": "uri"},
+                "id": {"type": "string", "format": "uuid"},
+                "openedAt": {"type": "string", "format": "date-time"},
+                "ref": {"type": "string", "pattern": "^[A-Z]{2}\\d+$"},
+                "slug": {"type": "string"},
+            })
+        );
+    }
+
+    #[test]
+    fn each_moves_a_class_validator_constraint_onto_the_elements() {
+        let [shelter] = lower_all(
+            "",
+            "import { IsInt, MaxLength, ArrayMaxSize, Min } from 'class-validator';\n\
+             const EACH = { each: true };\n\
+             export class Shelter {\n\
+               @MaxLength(20, { each: true }) @ArrayMaxSize(10) tags: string[];\n\
+               @IsInt({ each: true }) @Min(1, EACH) counts: Set<number>;\n\
+               @MaxLength(5, { each: true }) code: string;\n\
+               @MaxLength(5, { each: false }) labels: string[];\n\
+             }",
+            &["Shelter"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            shelter["properties"],
+            json!({
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 20},
+                    "maxItems": 10
+                },
+                "counts": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "uniqueItems": true
+                },
+                "code": {"type": "string", "maxLength": 5},
+                "labels": {"type": "array", "items": {"type": "string"}},
+            })
+        );
+    }
+
+    #[test]
+    fn a_class_validator_constraint_skips_a_schema_of_another_type() {
+        let [book] = lower_all(
+            "export enum Genre { Novel = 'novel' }\n\
+             export class Author { name: string; }",
+            "import { IsInt, MaxLength, IsEmail, IsDateString, Min } from 'class-validator';\n\
+             import { Genre, Author } from './dto';\n\
+             export class Book {\n\
+               @MaxLength(10) @IsInt() title: string | null;\n\
+               @IsInt() @Min(0) pages: number | null;\n\
+               @IsDateString() @IsEmail() publishedOn: Date;\n\
+               @MaxLength(10) genre: Genre;\n\
+               @Min(1) @MaxLength(3) author: Author | null;\n\
+               @Min(1) unknown: any;\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            book["properties"],
+            json!({
+                "title": {"type": ["string", "null"], "maxLength": 10},
+                "pages": {"type": ["integer", "null"], "minimum": 0},
+                "publishedOn": {"type": "string", "format": "date-time"},
+                "genre": {"$ref": "#/components/schemas/Genre"},
+                "author": {"anyOf": [{"$ref": "#/components/schemas/Author"}, {"type": "null"}]},
+                "unknown": {},
+            })
+        );
+    }
+
+    #[test]
+    fn only_decorators_imported_from_class_validator_constrain_properties() {
+        let [book] = lower_with(
+            &[
+                (
+                    "validators.ts",
+                    "export function MaxLength(n: number) { return () => {}; }",
+                ),
+                (
+                    "barrel.ts",
+                    "export { MaxLength as Max } from 'class-validator';",
+                ),
+            ],
+            "import { MaxLength } from './validators';\n\
+             import { MinLength as AtLeast } from '@acme/validators';\n\
+             import { Max } from './barrel';\n\
+             import * as validator from 'class-validator';\n\
+             import { IsEmail as Email } from 'class-validator';\n\
+             function IsInt() { return () => {}; }\n\
+             export class Book {\n\
+               @MaxLength(10) a: string;\n\
+               @AtLeast(2) b: string;\n\
+               @IsInt() c: number;\n\
+               @Max(5) d: string;\n\
+               @validator.MaxLength(6) e: string;\n\
+               @Email() f: string;\n\
+             }",
+            &["Book"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            book["properties"],
+            json!({
+                "a": {"type": "string"},
+                "b": {"type": "string"},
+                "c": {"type": "number"},
+                "d": {"type": "string", "maxLength": 5},
+                "e": {"type": "string", "maxLength": 6},
+                "f": {"type": "string", "format": "email"},
+            })
+        );
     }
 
     #[test]

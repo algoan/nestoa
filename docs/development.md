@@ -82,6 +82,7 @@ The code is organised so that most changes touch one file. See
 | --- | --- |
 | A config option | `config.rs`, plus its page in [`options/`](options/README.md) |
 | A utility type or TypeScript type form | `schema.rs` |
+| A class-property decorator (class-validator, class-transformer, `@nestjs/swagger`) | `schema.rs` |
 | A JSDoc tag | `jsdoc.rs` |
 | An HTTP decorator, parameter kind or pipe | `routes.rs` |
 | An expression form in paths or decorator arguments | `constval.rs` |
