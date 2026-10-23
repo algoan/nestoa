@@ -739,7 +739,10 @@ impl<'a> Extractor<'a> {
             let response = overridden
                 .or_else(|| response_value.clone())
                 .filter(|_| !template.redirect);
-            undocumented_body |= untyped_return && response.is_none() && !bodiless(status_code);
+            undocumented_body |= untyped_return
+                && response.is_none()
+                && method != HttpMethod::Head
+                && !bodiless(status_code);
             let signals = errors::RouteSignals {
                 auth_active,
                 auth_opted_out: opted_out,
@@ -5015,6 +5018,7 @@ mod tests {
                 @Put() replace() { return; }
                 @Patch() update() { return undefined; }
                 @Patch('quiet') quiet() { return (undefined); }
+                @Head() exists() { return this.books.exists(); }
                 @Delete() remove() { return void this.books.remove(); }
                 @Get('later') later() {
                     const run = () => { return 1; };
