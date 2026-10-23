@@ -627,7 +627,9 @@ impl<'a> Extractor<'a> {
                         let schema = ctx.ts_type_to_schema(file, t);
                         (!schema.is_null() && schema != json!({})).then_some(schema)
                     });
-                    untyped_return = declared_return.is_none() && returns_a_value(&m.function);
+                    untyped_return = declared_return.is_none()
+                        && !sends_its_own_response(&m.function)
+                        && returns_a_value(&m.function);
                     (response, json_type())
                 }
             }
@@ -1884,6 +1886,19 @@ fn scanned_throw_statuses(func: &Function) -> Vec<u16> {
     finder.codes.sort_unstable();
     finder.codes.dedup();
     finder.codes
+}
+
+/// Whether a handler injects the library response without `passthrough`, so
+/// NestJS ignores the value it returns.
+fn sends_its_own_response(func: &Function) -> bool {
+    func.params.iter().flat_map(|p| &p.decorators).any(|d| {
+        matches!(decorator_name(d).as_str(), "Res" | "Response")
+            && !first_arg(d).is_some_and(|arg| {
+                matches!(crate::constval::unwrap(arg), Expr::Object(o)
+                    if matches!(object_value(o, "passthrough"),
+                        Some(Expr::Lit(swc_ecma_ast::Lit::Bool(b))) if b.value))
+            })
+    })
 }
 
 /// Whether a handler's own body has a `return` with a value; returns in
@@ -4986,6 +5001,7 @@ mod tests {
                     return this.books.findOne(id);
                 }
                 @Get() list() { return []; }
+                @Get('raw') raw(@Res({ passthrough: true }) res: Response) { return []; }
             }
             "#,
         );
@@ -4998,6 +5014,7 @@ mod tests {
             [
                 "BooksController.findOne: no return type; its response body is left undocumented",
                 "BooksController.list: no return type; its response body is left undocumented",
+                "BooksController.raw: no return type; its response body is left undocumented",
             ]
         );
     }
@@ -5019,6 +5036,10 @@ mod tests {
                 @Patch() update() { return undefined; }
                 @Patch('quiet') quiet() { return (undefined); }
                 @Head() exists() { return this.books.exists(); }
+                @Get('sent') sent(@Res() res: Response) { return res.json([]); }
+                @Get('streamed') streamed(@Response({ passthrough: false }) res: Response) {
+                    return res.json([]);
+                }
                 @Delete() remove() { return void this.books.remove(); }
                 @Get('later') later() {
                     const run = () => { return 1; };
