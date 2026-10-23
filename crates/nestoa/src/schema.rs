@@ -56,6 +56,9 @@ pub struct ComponentSchemas {
     /// Property-set edits whose operand was still being lowered: the
     /// component name reserved for the result, the operand, and the edit.
     deferred: Vec<(String, Value, ObjectEdit)>,
+    /// The reference to the project type `errorResponses.schema` names, which
+    /// every error response uses in place of the built-in body.
+    pub error_body: Option<Value>,
 }
 
 impl ComponentSchemas {

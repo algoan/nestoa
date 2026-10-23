@@ -33,8 +33,8 @@ Error:
 
 This is the body of a custom global exception filter, **not** NestJS's stock
 error body (`{ statusCode, message, error }`). nestoa does not read your
-application's filter. If your app keeps Nest's default filter, the documented
-error bodies will not match what it serves.
+application's filter: if it sends another shape, name it with
+[`schema`](#schema).
 
 `500` is never added by default: it is a failure, not a documented outcome.
 
@@ -52,6 +52,7 @@ error bodies will not match what it serves.
 | `pipes` | see below | Pipe class name → status it throws on bad input, for pipes on `@Param` / `@Query`. |
 | `global` | `[]` | Codes added to every route, optionally limited to a path suffix. |
 | `routes` | `[]` | Codes added to matching routes. |
+| `schema` | built-in | The error body: a type name, or an OpenAPI schema. See [`schema`](#schema). |
 
 Default `pipes`:
 
@@ -61,6 +62,49 @@ Default `pipes`:
 | `ParseEnumPipe`, `ParseBoolPipe`, `ParseIntPipe`, `ParseFloatPipe`, `ParseUUIDPipe`, `ParseArrayPipe`, `ValidationPipe` | `400` |
 
 Setting `pipes` replaces this whole list, so repeat the defaults you still need.
+
+## `schema`
+
+Names the body your exception filter sends, in place of the built-in one:
+
+```ts
+/** Body sent by the global exception filter */
+export interface HttpError {
+  code: string;
+  message: string;
+  status: number;
+}
+```
+
+```json
+{ "errorResponses": { "schema": "HttpError" } }
+```
+
+The type is lowered like a handler's return type, into `components/schemas`
+under its own name, and every error response references it. It is looked up
+among the files of [`include`](include.md) first, then among the other files
+nestoa reads (relative imports, `tsconfig` paths,
+[`resolvePackages`](resolve-packages.md)). If no file declares it, or several do,
+nestoa warns and keeps the built-in body.
+
+An object is an OpenAPI schema, used verbatim as the `Error` component, e.g.
+for Nest's stock body:
+
+```json
+{
+  "errorResponses": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "statusCode": { "type": "integer" },
+        "message": { "type": "string" },
+        "error": { "type": "string" }
+      },
+      "required": ["statusCode", "message"]
+    }
+  }
+}
+```
 
 ## Sources, in priority order
 
