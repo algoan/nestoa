@@ -34,6 +34,19 @@ jobs:
       - name: Build (release)
         run: cargo build --release --workspace --locked
 
+  npm:
+    name: npm packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Test
+        run: node --test 'npm/test/*.test.js'
+
   lint:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest

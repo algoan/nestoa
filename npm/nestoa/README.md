@@ -23,6 +23,10 @@ npm install --save-dev @algoan/nestoa
 
 The right prebuilt binary for your platform is picked automatically.
 
+With npm on macOS and Linux, `node_modules/.bin/nestoa` is that binary itself.
+On Windows, with pnpm or Yarn, or when install scripts are disabled, it goes
+through a small Node launcher instead, which adds about 30 ms to each run.
+
 ## Use
 
 ```sh
