@@ -125,6 +125,55 @@ type admits `undefined` (`string | undefined`, directly or through a type
 alias), or when it carries
 `@IsOptional()`, `@ApiPropertyOptional()` or `@ApiProperty({ required: false })`.
 
+### Validation constraints
+
+The class-validator decorators with a JSON Schema equivalent are lowered onto
+the schema of the property they decorate, and so onto the query parameters a
+DTO expands into. Only decorators imported from `class-validator` count,
+directly, under an alias, through a namespace import or an in-repo barrel; a
+same-named decorator of another package or of the project is ignored.
+
+| Decorator | Schema |
+| --- | --- |
+| `@IsInt()` | `type: integer` instead of `number` |
+| `@Min(n)`, `@Max(n)` | `minimum`, `maximum` |
+| `@IsPositive()`, `@IsNegative()` | `exclusiveMinimum: 0`, `exclusiveMaximum: 0` |
+| `@MinLength(n)`, `@MaxLength(n)`, `@Length(min, max?)` | `minLength`, `maxLength` |
+| `@ArrayMinSize(n)`, `@ArrayMaxSize(n)`, `@ArrayNotEmpty()` | `minItems`, `maxItems`, `minItems: 1` |
+| `@IsEmail()`, `@IsUrl()`, `@IsUUID()`, `@IsDateString()` | `format: email`, `uri`, `uuid`, `date-time` |
+| `@Matches(/re/)`, `@Matches('re')` | `pattern` |
+
+```ts
+export class CreateShelterDto {
+  @IsInt() @Min(0) @Max(MAX_CAPACITY) capacity: number;
+  @IsOptional() @MaxLength(20, { each: true }) @ArrayMaxSize(10) tags?: string[];
+}
+```
+
+```yaml
+capacity: { type: integer, minimum: 0, maximum: 1000 }
+tags: { type: array, items: { type: string, maxLength: 20 }, maxItems: 10 }
+```
+
+- Arguments are evaluated like other decorator arguments: literals, negative
+  numbers, constants and enum members, across modules. A decorator whose
+  argument cannot be evaluated (`@Max(Number.MAX_SAFE_INTEGER)`) is skipped.
+- `{ each: true }` applies the constraint to the elements of an array or
+  `Set`.
+- A constraint only lands on a schema of its type: `@MaxLength()` on a string,
+  `@Min()` on a number, `@ArrayMaxSize()` on an array. On a nullable property
+  (`string | null`) it constrains the non-null branch. A type's own `format`
+  wins: a `Date` stays `date-time`.
+- A property whose type is a component (`$ref`: a class, an enum, a named type
+  alias) is left unchanged, since the component is shared with every other use.
+- A class read from a package's declaration files (`.d.ts`, see
+  [`resolvePackages`](options/resolve-packages.md)) has no decorators left, so
+  it carries no constraint.
+- `@Matches()` with a flag that changes what the expression matches (`i`, `m`,
+  `s`) has no `pattern` spelling, and is skipped.
+- 3.0.3 output writes `exclusiveMinimum: 0` as `minimum: 0` +
+  `exclusiveMinimum: true` (see [below](#openapi-31-and-30)).
+
 `Partial`, `Pick`, `Omit` and the `@nestjs/*` helpers edit inherited
 properties too. When a parent cannot be resolved (a class from an unresolved
 package), it is kept as an `x-unresolved` `allOf` branch beside the edited
