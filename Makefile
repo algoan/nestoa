@@ -8,7 +8,7 @@ export RUST_BACKTRACE
 
 .DEFAULT_GOAL := help
 
-.PHONY: help ci check test build build-debug lint fmt fmt-fix clippy bench clean
+.PHONY: help ci check test npm-test build build-debug lint fmt fmt-fix clippy bench clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -16,14 +16,17 @@ help: ## Show this help
 
 ## --- Everything CI runs ---
 
-ci: check ## Run the full CI suite (lint + test + release build)
+ci: check ## Run the full CI suite (lint + test + npm-test + release build)
 
-check: lint test build ## Alias for the full CI suite
+check: lint test npm-test build ## Alias for the full CI suite
 
 ## --- test job (ci.yml) ---
 
 test: ## Run the test suite (cargo test --workspace --locked)
 	cargo test --workspace --locked
+
+npm-test: ## Test the npm packaging scripts (node --test)
+	node --test 'npm/test/*.test.js'
 
 build: ## Build the optimized release binary (cargo build --release --workspace --locked)
 	cargo build --release --workspace --locked

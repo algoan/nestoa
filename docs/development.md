@@ -31,13 +31,19 @@ cargo test --package nestoa jsdoc      # one module
 cargo test test_name                   # one test
 ```
 
+The npm packaging scripts are tested with Node's test runner, in `npm/test/`:
+
+```sh
+make npm-test                          # node --test 'npm/test/*.test.js'
+```
+
 ## Makefile
 
 The `Makefile` mirrors `.github/workflows/ci.yml`, so CI can be reproduced
 locally. `make help` lists every target.
 
 ```sh
-make ci          # what CI runs: fmt check + clippy -D warnings + tests + release build
+make ci          # what CI runs: fmt check + clippy -D warnings + tests + npm tests + release build
 make test        # cargo test --workspace --locked
 make build       # cargo build --release --workspace --locked
 make lint        # fmt check + clippy
