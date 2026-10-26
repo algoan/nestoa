@@ -45,7 +45,7 @@ Every key is optional, and an unknown key is an error.
 | `passthroughTypes` | `[]` | [passthroughTypes](passthrough-types.md) |
 | `decoratorAliases` | `{}` | [decoratorAliases](decorator-aliases.md) |
 | `interceptors` | `{}` | [interceptors](interceptors.md) |
-| `errorResponses` | enabled | [errorResponses](error-responses.md) |
+| `errorResponses` | enabled, built-in body | [errorResponses](error-responses.md) |
 | `security` | bearer token | [security](security.md) |
 
 ## Composition

@@ -11,7 +11,8 @@ use swc_ecma_ast::{
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::config::{
-    AuthScope, Config, DecoratorAlias, DecoratorAliasKind, DecoratorReads, OpenApiVersion,
+    AuthScope, Config, DecoratorAlias, DecoratorAliasKind, DecoratorReads, ErrorSchema,
+    OpenApiVersion,
 };
 use crate::constval::object_value;
 use crate::dialect::{self, is_instance_data, is_name_keyed_map};
@@ -266,7 +267,71 @@ impl<'a> Extractor<'a> {
                 }
             }
         }
+        let er = &self.config.error_responses;
+        if let (true, Some(ErrorSchema::Type(name))) = (er.enabled, &er.schema) {
+            self.components.error_body = self.error_body(name);
+        }
         routes
+    }
+
+    /// Lower the type `errorResponses.schema` names, looked up among the
+    /// entry files first, then the other files read. A name that is missing,
+    /// or declared in several files of the first tier that has it, warns and
+    /// leaves the built-in body.
+    fn error_body(&mut self, name: &str) -> Option<Value> {
+        let project = self.project;
+        let declaring = |files: &mut dyn Iterator<Item = &PathBuf>| {
+            let mut found: Vec<PathBuf> = files
+                .filter(|f| {
+                    project
+                        .symbols
+                        .get(*f)
+                        .is_some_and(|s| s.declared.contains_key(name))
+                })
+                .cloned()
+                .collect();
+            found.sort();
+            found.dedup();
+            found
+        };
+        let mut found = declaring(&mut self.entry_files.iter());
+        if found.is_empty() {
+            found = declaring(
+                &mut project
+                    .symbols
+                    .keys()
+                    .filter(|f| !self.entry_files.contains(f)),
+            );
+        }
+        let file = match found.as_slice() {
+            [file] => file.clone(),
+            [] => {
+                crate::diag::warn(format!(
+                    "errorResponses.schema: no type {name:?} is declared in the project; \
+                     using the built-in error body"
+                ));
+                return None;
+            }
+            files => {
+                let files: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
+                crate::diag::warn(format!(
+                    "errorResponses.schema: type {name:?} is declared in several files ({}); \
+                     using the built-in error body",
+                    files.join(", ")
+                ));
+                return None;
+            }
+        };
+        let mut ctx = SchemaCtx {
+            project,
+            components: self.components,
+            type_env: None,
+            inline_generics: false,
+            current_owner: None,
+            instantiating: Vec::new(),
+            passthrough_types: &self.config.passthrough_types,
+        };
+        Some(ctx.named_type_to_schema(&file, name))
     }
 
     fn extract_class(
@@ -2296,16 +2361,24 @@ fn normalize_segment(s: &str) -> String {
 /// `config.openapi_version` selects (3.1 natively; 3.0.3 via `dialect`).
 pub fn to_openapi(config: &Config, routes: &[Route], mut components: ComponentSchemas) -> Value {
     components.resolve_deferred();
-    // Register the shared error-body schema once, if any route emits an error
-    // response, under a name no project schema takes. Tree-shaking below
-    // drops it if nothing ends up referencing it.
-    let error_schema_name = errors::error_schema_name(|n| components.schemas.contains_key(n));
-    if routes.iter().any(|r| !r.errors.is_empty()) {
-        components
-            .schemas
-            .insert(error_schema_name.clone(), errors::error_schema());
-    }
-    let error_ref = json!({ "$ref": format!("#/components/schemas/{error_schema_name}") });
+    // Every error response references one body: the project type
+    // `errorResponses.schema` names, or a schema registered once, if any route
+    // emits an error response, under a name no project schema takes.
+    // Tree-shaking below drops it if nothing ends up referencing it.
+    let error_ref = match components.error_body.take() {
+        Some(body) => body,
+        None => {
+            let name = errors::error_schema_name(|n| components.schemas.contains_key(n));
+            if routes.iter().any(|r| !r.errors.is_empty()) {
+                let schema = match &config.error_responses.schema {
+                    Some(ErrorSchema::Inline(schema)) => Value::Object(schema.clone()),
+                    _ => errors::error_schema(),
+                };
+                components.schemas.insert(name.clone(), schema);
+            }
+            json!({ "$ref": format!("#/components/schemas/{name}") })
+        }
+    };
     let security = config.security.enabled.then_some(&config.security);
     let mut secured = false;
     let mut paths: IndexMap<String, Map<String, Value>> = IndexMap::new();
@@ -5061,5 +5134,103 @@ mod tests {
             "#,
         );
         assert_eq!(crate::diag::take_warnings(), Vec::<String>::new());
+    }
+
+    const ERROR_BODY_CONTROLLER: &str = r#"
+        @Controller('books')
+        export class BooksController {
+            @Get(':id') findOne(@Param('id') id: string): string { return id; }
+            @Get('public') @Unprotected() list(): string[] { return []; }
+        }
+    "#;
+
+    fn error_body_document(name: &str, files: &[(&str, &str)], schema: Value) -> Value {
+        crate::diag::take_warnings();
+        let config: Config =
+            serde_json::from_value(json!({ "errorResponses": { "schema": schema } })).unwrap();
+        let mut all = vec![("books.controller.ts", ERROR_BODY_CONTROLLER)];
+        all.extend_from_slice(files);
+        let entries: Vec<&str> = all
+            .iter()
+            .map(|(rel, _)| *rel)
+            .filter(|rel| !rel.starts_with("libs/"))
+            .collect();
+        let (routes, components) = extract_with(name, &all, &entries, config.clone());
+        to_openapi(&config, &routes, components)
+    }
+
+    fn error_ref(doc: &Value) -> &Value {
+        &doc["paths"]["/books/{id}"]["get"]["responses"]["401"]["content"]["application/json"]["schema"]
+    }
+
+    #[test]
+    fn error_responses_reference_the_named_project_type() {
+        let error = r#"
+            /** Body sent by the global exception filter */
+            export interface HttpError { code: string; message: string; status: number; }
+        "#;
+        for (name, rel) in [
+            ("error-body-entry", "http-error.ts"),
+            ("error-body-imported", "libs/http-error.ts"),
+        ] {
+            let doc = error_body_document(name, &[(rel, error)], json!("HttpError"));
+            assert!(crate::diag::take_warnings().is_empty(), "{rel}");
+            assert_eq!(
+                error_ref(&doc),
+                &json!({"$ref": "#/components/schemas/HttpError"}),
+                "{rel}"
+            );
+            let schemas = &doc["components"]["schemas"];
+            assert_eq!(
+                schemas["HttpError"]["properties"]["status"],
+                json!({"type": "number"}),
+                "{rel}"
+            );
+            assert!(schemas.get("Error").is_none(), "{rel}: {schemas}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_ambiguous_error_type_keeps_the_built_in_body() {
+        let error = "export interface HttpError { code: string; }";
+        for (name, files) in [
+            ("error-body-missing", vec![]),
+            (
+                "error-body-ambiguous",
+                vec![("a/http-error.ts", error), ("b/http-error.ts", error)],
+            ),
+        ] {
+            let doc = error_body_document(name, &files, json!("HttpError"));
+            let warnings = crate::diag::take_warnings();
+            assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
+            assert!(
+                warnings[0].contains("errorResponses.schema")
+                    && warnings[0].contains("\"HttpError\""),
+                "{warnings:?}"
+            );
+            assert_eq!(
+                error_ref(&doc),
+                &json!({"$ref": "#/components/schemas/Error"})
+            );
+            assert_eq!(
+                doc["components"]["schemas"]["Error"],
+                errors::error_schema()
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_error_schema_replaces_the_built_in_body() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "statusCode": { "type": "number" }, "message": { "type": "string" } }
+        });
+        let doc = error_body_document("error-body-inline", &[], schema.clone());
+        assert!(crate::diag::take_warnings().is_empty());
+        assert_eq!(
+            error_ref(&doc),
+            &json!({"$ref": "#/components/schemas/Error"})
+        );
+        assert_eq!(doc["components"]["schemas"]["Error"], schema);
     }
 }

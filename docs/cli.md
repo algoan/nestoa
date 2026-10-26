@@ -29,6 +29,7 @@ document correctly. For example:
 - a route path it could not evaluate (the route is left out),
 - an `include` entry that doesn't exist,
 - an error-response rule that matches no route,
+- an error body type (`errorResponses.schema`) that no file, or several, declare,
 - a parameter whose name it could not evaluate (the parameter is left out),
 - two handlers on the same method and path (the later one wins),
 - a handler without a return type that returns a value (its response body is

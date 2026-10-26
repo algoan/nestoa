@@ -203,6 +203,33 @@ pub struct ErrorResponses {
     /// Empty by default; the source-level counterpart is the `@throws` JSDoc tag.
     #[serde(default)]
     pub routes: Vec<RouteErrors>,
+
+    /// The body every error response references in place of the built-in
+    /// `{ code, message, status }` object: a project type name, or a schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<ErrorSchema>,
+}
+
+/// See `ErrorResponses::schema`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ErrorSchema {
+    /// A type declared in the project, lowered like a handler's return type.
+    Type(String),
+    /// An OpenAPI schema, used verbatim.
+    Inline(serde_json::Map<String, serde_json::Value>),
+}
+
+impl<'de> Deserialize<'de> for ErrorSchema {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(name) => Ok(Self::Type(name)),
+            serde_json::Value::Object(schema) => Ok(Self::Inline(schema)),
+            other => Err(serde::de::Error::custom(format!(
+                "`schema` must be a type name or an OpenAPI schema object, not {other}"
+            ))),
+        }
+    }
 }
 
 impl Default for ErrorResponses {
@@ -218,6 +245,7 @@ impl Default for ErrorResponses {
             pipes: default_pipes(),
             global: Vec::new(),
             routes: Vec::new(),
+            schema: None,
         }
     }
 }
@@ -835,6 +863,29 @@ mod tests {
             Some("/publish")
         );
         assert_eq!(er.global[0].status, 413);
+    }
+
+    #[test]
+    fn error_schema_is_a_type_name_or_a_schema_object() {
+        let schema = |json: &str| {
+            serde_json::from_str::<Config>(&format!(r#"{{ "errorResponses": {json} }}"#))
+                .map(|c| c.error_responses.schema)
+        };
+        assert_eq!(schema("{}").unwrap(), None);
+        assert_eq!(
+            schema(r#"{ "schema": "HttpError" }"#).unwrap(),
+            Some(ErrorSchema::Type("HttpError".into()))
+        );
+        let Some(ErrorSchema::Inline(inline)) =
+            schema(r#"{ "schema": { "type": "object" } }"#).unwrap()
+        else {
+            panic!("an object is an inline schema");
+        };
+        assert_eq!(inline["type"], "object");
+        for bad in ["42", "true", r#"["HttpError"]"#] {
+            let err = schema(&format!(r#"{{ "schema": {bad} }}"#)).expect_err(bad);
+            assert!(err.to_string().contains("`schema`"), "{err}");
+        }
     }
 
     #[test]
