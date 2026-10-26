@@ -37,6 +37,13 @@ test("replaces the shim with a binary that runs", posixOnly, () => {
   assert.deepEqual(fs.readdirSync(binDir), ["nestoa.js"]);
 });
 
+test("leaves nothing behind when the shim is already the binary", posixOnly, () => {
+  const { source, binDir } = fixture(WORKING);
+  install(source, binDir, { platform: "linux", env: npmEnv });
+  assert.equal(install(source, binDir, { platform: "linux", env: npmEnv }), "native");
+  assert.deepEqual(fs.readdirSync(binDir), ["nestoa.js"]);
+});
+
 test("keeps the shim when the binary does not run", posixOnly, () => {
   const { source, binDir, shim } = fixture("#!/bin/sh\nexit 1\n");
   assert.equal(install(source, binDir, { platform: "linux", env: npmEnv }), "shim");

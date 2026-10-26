@@ -82,9 +82,12 @@ function replaceShim(source, shim) {
     fs.renameSync(temp, shim);
     return true;
   } catch (err) {
-    fs.rmSync(temp, { force: true });
     console.warn("nestoa: keeping the Node launcher:", err.message);
     return false;
+  } finally {
+    // When the shim is already a hard link to the binary (a reinstall),
+    // renaming onto it is a no-op that leaves `temp` in place.
+    fs.rmSync(temp, { force: true });
   }
 }
 
