@@ -2,9 +2,13 @@
 // Thin shim that dispatches to the platform-specific prebuilt binary.
 //
 // At install time, npm installs exactly one of the `@nestoa/<platform>` optional
-// dependencies based on os/arch/libc, and `install.js` copies (or symlinks) the
-// binary into ./bin/nestoa(.exe). This shim execs that binary with the user's
-// argv. NESTOA_BINARY, when set, wins over both.
+// dependencies based on os/arch/libc, and `install.js` replaces this file with
+// its binary when npm installed it outside Windows. This shim only runs where
+// that was not possible: on Windows, under another package manager, with
+// NESTOA_BINARY set at install time, or when install scripts were skipped.
+// Then it execs the binary copied into ./bin/nestoa(.exe), or the optional
+// dependency's own one, with the user's argv. NESTOA_BINARY, when set, wins
+// over both.
 
 const { spawnSync } = require("child_process");
 const path = require("path");
