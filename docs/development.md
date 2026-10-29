@@ -96,7 +96,9 @@ The code is organised so that most changes touch one file. See
 | An error-response source or status mapping | `errors.rs` (signals gathered in `routes.rs`) |
 | A module-resolution scheme (alias, package, namespace) | `symbols.rs`, plus `tsconfig.rs` for path aliases |
 | Global prefix or versioning | `globalprefix.rs` |
-| A 3.0.3 downgrade rule | `dialect.rs` |
+| A 3.0.3 downgrade rule, or a draft-07 rewrite of AsyncAPI payloads | `dialect.rs` |
+| A message-event decorator, publisher match or payload inference | `events.rs` |
+| The AsyncAPI document's layout | `asyncapi.rs` |
 
 ## Release
 

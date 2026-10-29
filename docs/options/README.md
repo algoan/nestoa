@@ -30,6 +30,7 @@ Every key is optional, and an unknown key is an error.
 | `format` | from the `output` extension | [format](format.md) |
 | `openapiVersion` | `3.1.0` | [openapiVersion](openapi-version.md) |
 | `info` | `API` / `0.0.0` (see page) | [info](info.md) |
+| `asyncapi` | none | [asyncapi](asyncapi.md) |
 
 ## Paths
 

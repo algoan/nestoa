@@ -1,9 +1,11 @@
+mod asyncapi;
 mod config;
 mod constval;
 mod diag;
 mod dialect;
 mod discover;
 mod errors;
+mod events;
 mod globalprefix;
 mod interceptors;
 mod jsdoc;
@@ -19,7 +21,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
+use crate::asyncapi::to_asyncapi;
 use crate::config::{Config, OpenApiVersion, OutputFormat};
+use crate::events::EventExtractor;
 use crate::parse::ParsingContext;
 use crate::routes::{Extractor, to_openapi};
 use crate::schema::ComponentSchemas;
@@ -44,6 +48,11 @@ struct Cli {
     /// Override the output file path, relative to the current directory.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Write the AsyncAPI document of the message events to this path,
+    /// relative to the current directory.
+    #[arg(long)]
+    asyncapi_output: Option<PathBuf>,
 
     /// Override the OpenAPI version to emit.
     #[arg(long, value_enum)]
@@ -130,6 +139,10 @@ fn main() -> Result<()> {
         cfg.output = std::path::absolute(&o)
             .with_context(|| format!("resolving output path {}", o.display()))?;
     }
+    if let Some(o) = cli.asyncapi_output {
+        cfg.asyncapi.get_or_insert_with(Default::default).output = std::path::absolute(&o)
+            .with_context(|| format!("resolving output path {}", o.display()))?;
+    }
     if let Some(v) = cli.openapi_version {
         cfg.openapi_version = v;
     }
@@ -211,38 +224,30 @@ fn main() -> Result<()> {
             .iter()
             .map(|r| (r.method.as_lower(), r.path.as_str())),
     );
-    if routes.is_empty() {
-        diag::warn("no @Controller-decorated classes with HTTP routes were found");
+
+    let events = cfg.asyncapi.as_ref().map(|asyncapi| {
+        let mut components = ComponentSchemas::default();
+        let events = EventExtractor {
+            config: &cfg,
+            asyncapi,
+            project: &project,
+            entry_files: &files,
+            components: &mut components,
+        }
+        .extract_all();
+        (asyncapi, events, components)
+    });
+    if let Some(warning) = nothing_found(routes.len(), events.as_ref().map(|e| e.1.len())) {
+        diag::warn(warning);
     }
 
     let doc = to_openapi(&cfg, &routes, components);
     // Resolve a relative output path against the analysed project dir (where the
     // config was found), not the process CWD — so `nestoa services/foo` writes
     // `services/foo/openapi.yaml` regardless of where it is invoked from.
-    let output_path = if cfg.output.is_relative() {
-        project_root.join(&cfg.output)
-    } else {
-        cfg.output.clone()
-    };
-    if let Some(parent) = output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-
-    let body = match cfg.output_format() {
-        OutputFormat::Json => serde_json::to_string_pretty(&doc)?,
-        OutputFormat::Yaml => serde_yaml::to_string(&doc)?,
-    };
-    std::fs::write(&output_path, body)
-        .with_context(|| format!("writing {}", output_path.display()))?;
-    let schemas = doc
-        .get("components")
-        .and_then(|c| c.get("schemas"))
-        .and_then(|s| s.as_object().map(|o| o.len()))
-        .unwrap_or(0);
-    let unresolved = diag::unresolved(&doc);
+    let output_path = write_document(&project_root, &cfg.output, cfg.output_format(), &doc)?;
+    let schemas = schema_count(&doc);
+    let mut unresolved = diag::unresolved(&doc);
     eprintln!(
         "nestoa: wrote {} ({}, {}{})",
         output_path.display(),
@@ -254,6 +259,36 @@ fn main() -> Result<()> {
             format!(", {} unresolved", unresolved.len())
         },
     );
+
+    if let Some((asyncapi, events, components)) = events {
+        let doc = to_asyncapi(&cfg, asyncapi, &events, components);
+        let output_path = write_document(
+            &project_root,
+            &asyncapi.output,
+            asyncapi.output_format(),
+            &doc,
+        )?;
+        let channels = doc["channels"].as_object().map_or(0, |c| c.len());
+        let operations = doc["operations"].as_object().map_or(0, |o| o.len());
+        let async_unresolved = diag::unresolved(&doc);
+        eprintln!(
+            "nestoa: wrote {} ({}, {}, {}{})",
+            output_path.display(),
+            plural(channels, "channel"),
+            plural(operations, "operation"),
+            plural(schema_count(&doc), "schema"),
+            if async_unresolved.is_empty() {
+                String::new()
+            } else {
+                format!(", {} unresolved", async_unresolved.len())
+            },
+        );
+        unresolved.extend(
+            async_unresolved
+                .into_iter()
+                .map(|(pointer, name)| (format!("{}{pointer}", output_path.display()), name)),
+        );
+    }
 
     if cli.strict {
         for (pointer, name) in &unresolved {
@@ -271,6 +306,52 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The warning for a project with no route, nor any message event when they
+/// are looked for, so an event-only service is not reported empty.
+fn nothing_found(routes: usize, events: Option<usize>) -> Option<&'static str> {
+    match events {
+        _ if routes > 0 => None,
+        None => Some("no @Controller-decorated classes with HTTP routes were found"),
+        Some(0) => Some("no HTTP routes or message events were found"),
+        Some(_) => None,
+    }
+}
+
+/// Write `doc` to `output`, relative to the project when relative, and return
+/// the path written.
+fn write_document(
+    project_root: &std::path::Path,
+    output: &std::path::Path,
+    format: OutputFormat,
+    doc: &serde_json::Value,
+) -> Result<PathBuf> {
+    let output_path = if output.is_relative() {
+        project_root.join(output)
+    } else {
+        output.to_path_buf()
+    };
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let body = match format {
+        OutputFormat::Json => serde_json::to_string_pretty(doc)?,
+        OutputFormat::Yaml => serde_yaml::to_string(doc)?,
+    };
+    std::fs::write(&output_path, body)
+        .with_context(|| format!("writing {}", output_path.display()))?;
+    Ok(output_path)
+}
+
+fn schema_count(doc: &serde_json::Value) -> usize {
+    doc.get("components")
+        .and_then(|c| c.get("schemas"))
+        .and_then(|s| s.as_object().map(|o| o.len()))
+        .unwrap_or(0)
+}
+
 fn plural(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
@@ -278,6 +359,20 @@ fn plural(n: usize, noun: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_event_only_service_is_not_reported_empty() {
+        assert_eq!(nothing_found(1, None), None);
+        assert_eq!(
+            nothing_found(0, None),
+            Some("no @Controller-decorated classes with HTTP routes were found")
+        );
+        assert_eq!(nothing_found(0, Some(2)), None);
+        assert_eq!(
+            nothing_found(0, Some(0)),
+            Some("no HTTP routes or message events were found")
+        );
+    }
 
     #[test]
     fn relative_imports_outside_include_are_parsed_without_any_allowlist() {

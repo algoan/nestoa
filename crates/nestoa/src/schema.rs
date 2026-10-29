@@ -88,6 +88,14 @@ impl ComponentSchemas {
         }
     }
 
+    /// The schema of property `key` of an object-shaped `schema`.
+    pub fn property(&self, schema: &Value, key: &str) -> Option<Value> {
+        flatten_object(&self.schemas, schema, 0)?
+            .get("properties")?
+            .get(key)
+            .cloned()
+    }
+
     /// The name of a component `schema` references, directly or through an
     /// `allOf` branch, that is reserved but not yet lowered.
     fn pending_ref(&self, schema: &Value) -> Option<String> {
@@ -1756,7 +1764,7 @@ impl<'a> SchemaCtx<'a> {
 
     /// The type TypeScript infers for an unannotated field from its
     /// initialiser, widened as for a mutable field (`a = 1` is a `number`).
-    fn initializer_schema(&mut self, file: &Path, init: &Expr) -> Value {
+    pub(crate) fn initializer_schema(&mut self, file: &Path, init: &Expr) -> Value {
         match init {
             Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) => json!({ "type": "string" }),
             Expr::Lit(Lit::Num(_)) => json!({ "type": "number" }),

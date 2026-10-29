@@ -63,6 +63,10 @@ components:
 The shared `Error` component referenced by `401` and the `bearerAuth` security
 scheme are omitted here.
 
+With [`asyncapi`](docs/options/asyncapi.md), it also writes an AsyncAPI 3.0
+document of the service's message events: the `@EventPattern` and
+`@MessagePattern` handlers it receives, and the publish calls it sends.
+
 ## Install
 
 nestoa is published on the GitHub Packages npm registry, which requires a token

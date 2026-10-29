@@ -99,6 +99,113 @@ pub struct Config {
     /// `errorResponses`' `auth`, `authGuards` and `authOptOut` pick out.
     #[serde(default)]
     pub security: Security,
+
+    /// The AsyncAPI document of the service's message events, written beside
+    /// the OpenAPI one when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asyncapi: Option<AsyncApi>,
+}
+
+/// See `Config::asyncapi`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AsyncApi {
+    /// Output file of the AsyncAPI document, relative to the project.
+    #[serde(default = "default_asyncapi_output")]
+    pub output: PathBuf,
+    /// The document's `info`; the top-level `info` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<Info>,
+    #[serde(default = "default_content_type")]
+    pub default_content_type: String,
+    /// Generic envelope types a message payload is unwrapped from, to their
+    /// first type argument, at the root of the payload only.
+    #[serde(default)]
+    pub payload_wrappers: Vec<String>,
+    /// The calls that publish a message.
+    #[serde(default = "default_publishers")]
+    pub publishers: Vec<Publisher>,
+}
+
+impl Default for AsyncApi {
+    fn default() -> Self {
+        Self {
+            output: default_asyncapi_output(),
+            info: None,
+            default_content_type: default_content_type(),
+            payload_wrappers: Vec::new(),
+            publishers: default_publishers(),
+        }
+    }
+}
+
+impl AsyncApi {
+    pub fn output_format(&self) -> OutputFormat {
+        format_of(&self.output)
+    }
+}
+
+/// A method call that publishes a message: `<receiver>.<method>(channel,
+/// payload)`. See `AsyncApi::publishers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Publisher {
+    pub method: String,
+    /// Type names the receiver (`this.<field>`) must be declared with; any
+    /// receiver when empty.
+    #[serde(default)]
+    pub receiver_types: Vec<String>,
+    /// Index of the argument naming the channel.
+    #[serde(default)]
+    pub channel: usize,
+    /// Index of the argument holding the payload.
+    #[serde(default = "default_payload_arg")]
+    pub payload: usize,
+    /// The property of an object-literal payload argument that holds the
+    /// message payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_property: Option<String>,
+    /// Index of the call's type argument giving the payload type, which wins
+    /// over the argument's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_argument: Option<usize>,
+}
+
+fn default_asyncapi_output() -> PathBuf {
+    PathBuf::from("asyncapi.json")
+}
+
+fn default_content_type() -> String {
+    "application/json".into()
+}
+
+fn default_payload_arg() -> usize {
+    1
+}
+
+/// `ClientProxy.emit`/`send` and the transport clients extending it.
+fn default_publishers() -> Vec<Publisher> {
+    let receiver_types: Vec<String> = [
+        "ClientProxy",
+        "ClientKafka",
+        "ClientMqtt",
+        "ClientNats",
+        "ClientRedis",
+        "ClientRMQ",
+        "ClientTCP",
+    ]
+    .map(String::from)
+    .to_vec();
+    ["emit", "send"]
+        .map(|method| Publisher {
+            method: method.into(),
+            receiver_types: receiver_types.clone(),
+            channel: 0,
+            payload: default_payload_arg(),
+            payload_property: None,
+            type_argument: Some(1),
+        })
+        .to_vec()
 }
 
 /// See `Config::security`.
@@ -540,6 +647,7 @@ impl Default for Config {
             interceptors: indexmap::IndexMap::new(),
             error_responses: ErrorResponses::default(),
             security: Security::default(),
+            asyncapi: None,
         }
     }
 }
@@ -571,19 +679,19 @@ impl Config {
     }
 
     pub fn output_format(&self) -> OutputFormat {
-        if let Some(f) = self.format {
-            return f;
-        }
-        match self
-            .output
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("yaml") | Some("yml") => OutputFormat::Yaml,
-            _ => OutputFormat::Json,
-        }
+        self.format.unwrap_or_else(|| format_of(&self.output))
+    }
+}
+
+fn format_of(output: &Path) -> OutputFormat {
+    match output
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("yaml") | Some("yml") => OutputFormat::Yaml,
+        _ => OutputFormat::Json,
     }
 }
 
@@ -651,6 +759,47 @@ fn merge_value(base: &mut serde_json::Value, over: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asyncapi_is_off_by_default_and_defaults_its_publishers() {
+        assert!(Config::default().asyncapi.is_none());
+        let cfg: Config = serde_json::from_str(r#"{ "asyncapi": {} }"#).unwrap();
+        let asyncapi = cfg.asyncapi.expect("an empty section enables it");
+        assert_eq!(asyncapi.output, PathBuf::from("asyncapi.json"));
+        assert_eq!(asyncapi.output_format(), OutputFormat::Json);
+        let methods: Vec<&str> = asyncapi
+            .publishers
+            .iter()
+            .map(|p| p.method.as_str())
+            .collect();
+        assert_eq!(methods, ["emit", "send"]);
+        assert!(
+            asyncapi.publishers[0]
+                .receiver_types
+                .contains(&"ClientProxy".to_string())
+        );
+
+        let cfg: Config = serde_json::from_str(
+            r#"{ "asyncapi": { "output": "events.yaml", "publishers": [
+                { "method": "publish", "payloadProperty": "data", "typeArgument": 0 }
+            ] } }"#,
+        )
+        .unwrap();
+        let asyncapi = cfg.asyncapi.unwrap();
+        assert_eq!(asyncapi.output_format(), OutputFormat::Yaml);
+        assert_eq!(
+            asyncapi.publishers,
+            [Publisher {
+                method: "publish".into(),
+                receiver_types: Vec::new(),
+                channel: 0,
+                payload: 1,
+                payload_property: Some("data".into()),
+                type_argument: Some(0),
+            }]
+        );
+        assert!(serde_json::from_str::<Config>(r#"{ "asyncapi": { "channels": {} } }"#).is_err());
+    }
 
     #[test]
     fn parses_interceptors_config() {
