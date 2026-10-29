@@ -904,6 +904,25 @@ fn object_member(o: &swc_ecma_ast::ObjectLit, key: &str) -> Option<Expr> {
     })
 }
 
+/// The type of a binding declared `ty`, `T | undefined` when declared with
+/// `?`: it lowers to the same schema, and admits `undefined`.
+fn declared_type(ty: &TsType, optional: bool) -> TsType {
+    use swc_ecma_ast::{TsKeywordType, TsKeywordTypeKind, TsUnionOrIntersectionType, TsUnionType};
+    if !optional {
+        return ty.clone();
+    }
+    TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(TsUnionType {
+        span: ty.span(),
+        types: vec![
+            Box::new(ty.clone()),
+            Box::new(TsType::TsKeywordType(TsKeywordType {
+                span: ty.span(),
+                kind: TsKeywordTypeKind::TsUndefinedKeyword,
+            })),
+        ],
+    }))
+}
+
 /// A declared type, with the file it is written in.
 type Declared = Option<(PathBuf, TsType)>;
 
@@ -980,14 +999,15 @@ pub(crate) fn callable_return<'t>(
 fn class_fields(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
     let mut fields = HashMap::new();
     for (file, class) in chain {
-        let declared =
-            |t: Option<&swc_ecma_ast::TsTypeAnn>| t.map(|t| (file.clone(), (*t.type_ann).clone()));
+        let declared = |t: Option<&swc_ecma_ast::TsTypeAnn>, optional: bool| {
+            t.map(|t| (file.clone(), declared_type(&t.type_ann, optional)))
+        };
         for member in &class.body {
             match member {
                 ClassMember::ClassProp(p) => {
                     fields
                         .entry(prop_name_text(&p.key))
-                        .or_insert_with(|| declared(p.type_ann.as_deref()));
+                        .or_insert_with(|| declared(p.type_ann.as_deref(), p.is_optional));
                 }
                 ClassMember::Constructor(c) => {
                     for p in &c.params {
@@ -996,7 +1016,7 @@ fn class_fields(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
                         {
                             fields
                                 .entry(i.id.sym.to_string())
-                                .or_insert_with(|| declared(i.type_ann.as_deref()));
+                                .or_insert_with(|| declared(i.type_ann.as_deref(), i.id.optional));
                         }
                     }
                 }
@@ -1055,7 +1075,7 @@ impl MemberScan {
                 i.id.sym.to_string(),
                 i.type_ann
                     .as_ref()
-                    .map(|t| Binding::Type((*t.type_ann).clone())),
+                    .map(|t| Binding::Type(declared_type(&t.type_ann, i.id.optional))),
             ),
             Pat::Assign(a) => self.bind_pat(&a.left),
             _ => {}
@@ -1530,9 +1550,10 @@ mod tests {
         let service = "export class Draft { subtitle?: string; title: string; count?: string; }\n\
             const TOPIC = 'books';\n\
             export class BooksService {\n\
-              constructor(private client: ClientProxy, private events: EventsClient) {}\n\
-              send(draft: Draft, maybe: string | undefined) {\n\
-                this.client.emit('optional', { subtitle: draft.subtitle, title: draft.title, maybe });\n\
+              constructor(private client: ClientProxy, private events: EventsClient, private tag?: string) {}\n\
+              private label?: string;\n\
+              send(draft: Draft, maybe: string | undefined, note?: string) {\n\
+                this.client.emit('optional', { subtitle: draft.subtitle, title: draft.title, maybe, note, label: this.label, tag: this.tag });\n\
                 this.client.emit('fallback', { subtitle: 'none', count: 1, ...draft });\n\
                 let later = undefined;\n\
                 later = draft;\n\
@@ -1579,7 +1600,10 @@ mod tests {
                         "properties": {
                             "subtitle": { "type": "string" },
                             "title": { "type": "string" },
-                            "maybe": { "type": "string" }
+                            "maybe": { "type": "string" },
+                            "note": { "type": "string" },
+                            "label": { "type": "string" },
+                            "tag": { "type": "string" }
                         },
                         "required": ["title"]
                     })
