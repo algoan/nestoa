@@ -61,7 +61,8 @@ publisher's payload is what it passes, usually without the outer envelope.
 ## Sending: `publishers`
 
 Each entry describes a method call that publishes a message, found in the members of every class
-(services, controllers, …), nested callbacks included. Every matching call is a `send` operation.
+(services, controllers, …): methods, constructors, properties, private ones and static blocks,
+nested callbacks included. Every matching call is a `send` operation.
 
 | Key | Default | Effect |
 | --- | --- | --- |
@@ -87,9 +88,13 @@ types reach:
 - a parameter, a variable or a field (`this.x`) declared with a type, or a variable initialised with
   any of these;
 - a property of one of those (`book.id`), and an enum member, as its enum;
+- a parameter property, an inherited field (a receiver of `receiverTypes` too) or method;
 - a call to a function, a `const` arrow function or a method of the class declared with a return
-  type (`Promise` unwrapped);
-- object and array literals of the above, `await`, `a ? b : c`.
+  type (`Promise` unwrapped), when every overload declares the same one;
+- object and array literals of the above, `await`, `a ? b : c`. A later property or spread replaces
+  an earlier one, as in JavaScript, and an `undefined` array element is `null`.
+
+`payloadWrappers` only apply to the whole payload: an envelope nested in it is documented as is.
 
 Anything else (a method call on a value, an untyped callback parameter, …) is
 [`x-unresolved`](../cli.md#diagnostics-and---strict) with its source text, and `--strict` reports

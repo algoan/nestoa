@@ -191,21 +191,32 @@ impl ConstInit {
     }
 }
 
-/// A top-level function declaration, shared with its module.
+/// The declarations of a top-level function, its overloads included,
+/// shared with their module.
 #[derive(Clone)]
 pub struct FnDecl {
     module: Arc<Module>,
-    path: Arc<[usize]>,
+    paths: Vec<Arc<[usize]>>,
 }
 
 impl FnDecl {
-    /// The declared return type.
+    /// The return type every callable signature declares.
     pub fn return_type(&self) -> Option<&swc_ecma_ast::TsType> {
-        let item = item_at(&self.module.body, &self.path)?;
-        let Some(Decl::Fn(f)) = declaration(item) else {
-            return None;
-        };
-        f.function.return_type.as_ref().map(|t| &*t.type_ann)
+        let functions: Vec<&swc_ecma_ast::Function> = self
+            .paths
+            .iter()
+            .filter_map(
+                |path| match declaration(item_at(&self.module.body, path)?) {
+                    Some(Decl::Fn(f)) => Some(&*f.function),
+                    _ => None,
+                },
+            )
+            .collect();
+        crate::events::callable_return(
+            functions
+                .into_iter()
+                .map(|f| (f.body.is_some(), f.return_type.as_deref())),
+        )
     }
 }
 
@@ -859,20 +870,14 @@ fn declared_symbol(module: &Arc<Module>, path: &Arc<[usize]>) -> Option<(String,
 /// A `let` or `var` may be reassigned, so its initializer isn't its value.
 fn collect_consts(module: &Arc<Module>, path: &Arc<[usize]>, decl: &Decl, fs: &mut FileSymbols) {
     if let Decl::Fn(f) = decl {
-        // Of an overloaded function's declarations, the first with a return
-        // type is kept.
-        let name = f.ident.sym.to_string();
-        if !fs
-            .functions
-            .get(&name)
-            .is_some_and(|known| known.return_type().is_some())
-        {
-            let decl = FnDecl {
+        fs.functions
+            .entry(f.ident.sym.to_string())
+            .or_insert_with(|| FnDecl {
                 module: module.clone(),
-                path: path.clone(),
-            };
-            fs.functions.insert(name, decl);
-        }
+                paths: Vec::new(),
+            })
+            .paths
+            .push(path.clone());
         return;
     }
     let Decl::Var(v) = decl else { return };

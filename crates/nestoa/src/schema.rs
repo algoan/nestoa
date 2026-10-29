@@ -88,6 +88,12 @@ impl ComponentSchemas {
         }
     }
 
+    /// An object-shaped `schema` as one object, its references and `allOf`
+    /// branches merged.
+    pub fn flatten(&self, schema: &Value) -> Option<Map<String, Value>> {
+        flatten_object(&self.schemas, schema, 0)
+    }
+
     /// The schema of property `key` of an object-shaped `schema`.
     pub fn property(&self, schema: &Value, key: &str) -> Option<Value> {
         flatten_object(&self.schemas, schema, 0)?

@@ -273,6 +273,10 @@ pub(crate) fn is_name_keyed_map(key: &str) -> bool {
             | "callbacks"
             | "links"
             | "variables"
+            // AsyncAPI's channels, operations and messages, by id.
+            | "channels"
+            | "operations"
+            | "messages"
     )
 }
 

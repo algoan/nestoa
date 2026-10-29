@@ -44,6 +44,8 @@ pub struct EventOperation {
     pub payload: Value,
     /// `Class.method`.
     pub handler: String,
+    /// The file of the handler's class.
+    pub file: PathBuf,
     pub tag: String,
     pub summary: Option<String>,
     pub description: Option<String>,
@@ -122,7 +124,7 @@ impl<'a> EventExtractor<'a> {
                 }
                 if name.is_empty() || !seen.contains(&name) {
                     let handler = format!("{class_name}.{name}");
-                    self.consumer(&owner.0, &handler, &tag, m, out);
+                    self.consumer(&owner.0, file, &handler, &tag, m, out);
                 }
                 if !name.is_empty() {
                     declared.push(name);
@@ -141,9 +143,12 @@ impl<'a> EventExtractor<'a> {
         }
     }
 
+    /// The operation of a handler declared in `file`, of a class in
+    /// `class_file`.
     fn consumer(
         &mut self,
         file: &Path,
+        class_file: &Path,
         handler: &str,
         tag: &str,
         m: &swc_ecma_ast::ClassMethod,
@@ -181,6 +186,7 @@ impl<'a> EventExtractor<'a> {
                 channel,
                 payload: payload.clone(),
                 handler: handler.to_string(),
+                file: class_file.to_path_buf(),
                 tag: tag.to_string(),
                 summary: doc.summary.clone(),
                 description: doc.description.clone(),
@@ -200,17 +206,19 @@ impl<'a> EventExtractor<'a> {
                 continue;
             };
             let key = first_arg(d).and_then(|e| crate::constval::string(self.project, file, e));
-            let schema = self.param_schema(file, &p.pat);
             match key {
                 Some(key) => {
+                    let required_key = Value::String(key.clone());
                     if !matches!(&p.pat, Pat::Ident(i) if i.optional)
                         && !matches!(&p.pat, Pat::Assign(_))
+                        && !required.contains(&required_key)
                     {
-                        required.push(Value::String(key.clone()));
+                        required.push(required_key);
                     }
+                    let schema = self.param_schema(file, &p.pat, false);
                     properties.insert(key, schema);
                 }
-                None => whole = Some(schema),
+                None => whole = Some(self.param_schema(file, &p.pat, true)),
             }
         }
         if let Some(schema) = whole {
@@ -226,12 +234,12 @@ impl<'a> EventExtractor<'a> {
             return Value::Object(object);
         }
         match function.params.first() {
-            Some(p) if p.decorators.is_empty() => self.param_schema(file, &p.pat),
+            Some(p) if p.decorators.is_empty() => self.param_schema(file, &p.pat, true),
             _ => Value::Null,
         }
     }
 
-    fn param_schema(&mut self, file: &Path, pat: &Pat) -> Value {
+    fn param_schema(&mut self, file: &Path, pat: &Pat, root: bool) -> Value {
         let ty = match pat {
             Pat::Ident(i) => i.type_ann.as_deref(),
             Pat::Object(o) => o.type_ann.as_deref(),
@@ -242,14 +250,19 @@ impl<'a> EventExtractor<'a> {
             _ => None,
         };
         match ty {
-            Some(t) => self.payload_type_schema(file, &t.type_ann),
+            Some(t) => self.type_schema(file, &t.type_ann, root),
             None => json!({ "x-unresolved": "payload" }),
         }
     }
 
-    /// `ty` lowered, unwrapped from the `payloadWrappers` around it.
-    fn payload_type_schema(&mut self, file: &Path, ty: &TsType) -> Value {
-        let ty = unwrap_wrappers(ty, &self.asyncapi.payload_wrappers);
+    /// `ty` lowered; at the `root` of a message payload, unwrapped from the
+    /// `payloadWrappers` around it.
+    fn type_schema(&mut self, file: &Path, ty: &TsType, root: bool) -> Value {
+        let ty = if root {
+            unwrap_wrappers(ty, &self.asyncapi.payload_wrappers)
+        } else {
+            ty
+        };
         self.schema_ctx().ts_type_to_schema(file, ty)
     }
 
@@ -264,58 +277,57 @@ impl<'a> EventExtractor<'a> {
         if self.asyncapi.publishers.is_empty() {
             return;
         }
-        let fields = class_fields(class);
-        let methods = class_methods(class);
+        let chain = class_chain(self.project, file, class);
+        let fields = class_fields(&chain);
+        let methods = class_methods(&chain);
         let tag = strip_suffix_ci(class_name, "Controller").to_string();
         for member in &class.body {
-            let (name, function, value): (String, Option<&Function>, Option<&Expr>) = match member {
-                ClassMember::Method(m) => (prop_name_text(&m.key), Some(&m.function), None),
-                ClassMember::PrivateMethod(m) => {
-                    (format!("#{}", m.key.name), Some(&m.function), None)
+            let mut scan = MemberScan::default();
+            let (name, documented) = match member {
+                ClassMember::Method(m) => {
+                    m.function.params.visit_with(&mut scan);
+                    m.function.body.visit_with(&mut scan);
+                    (prop_name_text(&m.key), true)
                 }
-                ClassMember::ClassProp(p) => (prop_name_text(&p.key), None, p.value.as_deref()),
-                ClassMember::Constructor(_) => ("constructor".to_string(), None, None),
+                ClassMember::PrivateMethod(m) => {
+                    m.function.params.visit_with(&mut scan);
+                    m.function.body.visit_with(&mut scan);
+                    (format!("#{}", m.key.name), true)
+                }
+                ClassMember::ClassProp(p) => {
+                    p.value.visit_with(&mut scan);
+                    (prop_name_text(&p.key), false)
+                }
+                ClassMember::PrivateProp(p) => {
+                    p.value.visit_with(&mut scan);
+                    (format!("#{}", p.key.name), false)
+                }
+                ClassMember::Constructor(c) => {
+                    c.params.visit_with(&mut scan);
+                    c.body.visit_with(&mut scan);
+                    ("constructor".to_string(), true)
+                }
+                ClassMember::StaticBlock(b) => {
+                    b.body.visit_with(&mut scan);
+                    ("static".to_string(), false)
+                }
                 _ => continue,
             };
             let handler = format!("{class_name}.{name}");
-            let mut calls = CallCollector::default();
-            let mut locals = Locals::default();
-            match (member, function, value) {
-                (ClassMember::Constructor(c), _, _) => {
-                    for p in &c.params {
-                        if let ParamOrTsParamProp::Param(p) = p {
-                            locals.bind_pat(&p.pat);
-                        }
-                    }
-                    c.body.visit_with(&mut calls);
-                    c.body.visit_with(&mut locals);
-                }
-                (_, Some(f), _) => {
-                    for p in &f.params {
-                        locals.bind_pat(&p.pat);
-                    }
-                    f.body.visit_with(&mut calls);
-                    f.body.visit_with(&mut locals);
-                }
-                (_, _, Some(v)) => {
-                    v.visit_with(&mut calls);
-                    v.visit_with(&mut locals);
-                }
-                _ => continue,
-            }
-            if calls.calls.is_empty() {
+            if scan.calls.is_empty() {
                 continue;
             }
-            let doc = function
-                .and_then(|_| self.project.files.get(file))
+            let doc = documented
+                .then(|| self.project.files.get(file))
+                .flatten()
                 .and_then(|f| f.docs.jsdoc(member.span().lo))
                 .unwrap_or_default();
             let scope = Scope {
-                locals: &locals.bindings,
+                locals: &scan.bindings,
                 fields: &fields,
                 methods: &methods,
             };
-            for call in &calls.calls {
+            for call in &scan.calls {
                 let Some(publisher) = self.publisher_of(call, &fields) else {
                     continue;
                 };
@@ -337,6 +349,7 @@ impl<'a> EventExtractor<'a> {
                     channel,
                     payload,
                     handler: handler.clone(),
+                    file: file.to_path_buf(),
                     tag: tag.clone(),
                     summary: doc.summary.clone(),
                     description: doc.description.clone(),
@@ -350,7 +363,7 @@ impl<'a> EventExtractor<'a> {
     fn publisher_of(
         &self,
         call: &CallExpr,
-        fields: &HashMap<String, Option<TsType>>,
+        fields: &HashMap<String, Declared>,
     ) -> Option<&'a Publisher> {
         let Callee::Expr(callee) = &call.callee else {
             return None;
@@ -372,7 +385,7 @@ impl<'a> EventExtractor<'a> {
                 return None;
             };
             match fields.get(name.sym.as_ref())? {
-                Some(TsType::TsTypeRef(r)) => Some(entity_last(&r.type_name)),
+                Some((_, TsType::TsTypeRef(r))) => Some(entity_last(&r.type_name)),
                 _ => None,
             }
         };
@@ -396,7 +409,7 @@ impl<'a> EventExtractor<'a> {
             .type_argument
             .and_then(|i| call.type_args.as_ref()?.params.get(i))
         {
-            return self.payload_type_schema(file, ty);
+            return self.type_schema(file, ty, true);
         }
         let Some(arg) = call.args.get(publisher.payload) else {
             return Value::Null;
@@ -411,31 +424,41 @@ impl<'a> EventExtractor<'a> {
                 other => return self.unresolved_expr(file, other),
             },
         };
-        self.expr_schema(file, &expr, scope, 0)
+        self.expr_schema(file, &expr, scope, 0, true)
     }
 
     /// The type TypeScript infers for `expr`, as far as declared types reach:
     /// literals, `as` assertions, `new` expressions, locals, parameters and
-    /// fields with a type, and object and array literals of those.
-    fn expr_schema(&mut self, file: &Path, expr: &Expr, scope: &Scope, depth: usize) -> Value {
+    /// fields with a type, and object and array literals of those. `root`: the
+    /// expression is the whole message payload.
+    fn expr_schema(
+        &mut self,
+        file: &Path,
+        expr: &Expr,
+        scope: &Scope,
+        depth: usize,
+        root: bool,
+    ) -> Value {
         if depth > MAX_INFERENCE_DEPTH {
             return self.unresolved_expr(file, expr);
         }
         match expr {
-            Expr::Paren(p) => self.expr_schema(file, &p.expr, scope, depth),
-            Expr::Await(a) => self.expr_schema(file, &a.arg, scope, depth),
-            Expr::TsNonNull(n) => self.expr_schema(file, &n.expr, scope, depth),
-            Expr::TsSatisfies(s) => self.expr_schema(file, &s.expr, scope, depth),
-            Expr::TsAs(a) => self.payload_type_schema(file, &a.type_ann),
-            Expr::TsTypeAssertion(a) => self.payload_type_schema(file, &a.type_ann),
+            Expr::Paren(p) => self.expr_schema(file, &p.expr, scope, depth, root),
+            Expr::Await(a) => self.expr_schema(file, &a.arg, scope, depth, root),
+            Expr::TsNonNull(n) => self.expr_schema(file, &n.expr, scope, depth, root),
+            Expr::TsSatisfies(s) => self.expr_schema(file, &s.expr, scope, depth, root),
+            Expr::TsAs(a) => self.type_schema(file, &a.type_ann, root),
+            Expr::TsTypeAssertion(a) => self.type_schema(file, &a.type_ann, root),
             Expr::Lit(Lit::Null(_)) => json!({ "type": "null" }),
             Expr::Lit(_) | Expr::Tpl(_) | Expr::Unary(_) => {
                 self.schema_ctx().initializer_schema(file, expr)
             }
             Expr::Ident(i) if i.sym == "undefined" => Value::Null,
             Expr::Ident(i) => match scope.locals.get(i.sym.as_ref()) {
-                Some(Some(Binding::Type(ty))) => self.payload_type_schema(file, ty),
-                Some(Some(Binding::Init(init))) => self.expr_schema(file, init, scope, depth + 1),
+                Some(Some(Binding::Type(ty))) => self.type_schema(file, ty, root),
+                Some(Some(Binding::Init(init))) => {
+                    self.expr_schema(file, init, scope, depth + 1, root)
+                }
                 _ => self.unresolved_expr(file, expr),
             },
             Expr::Member(m) if matches!(&*m.obj, Expr::This(_)) => {
@@ -444,7 +467,7 @@ impl<'a> EventExtractor<'a> {
                     _ => None,
                 };
                 match ty {
-                    Some(Some(ty)) => self.payload_type_schema(file, ty),
+                    Some(Some((decl_file, ty))) => self.type_schema(decl_file, ty, root),
                     _ => self.unresolved_expr(file, expr),
                 }
             }
@@ -471,22 +494,29 @@ impl<'a> EventExtractor<'a> {
                     },
                     _ => None,
                 };
-                if let Some(Some(ty)) = method {
-                    return self.payload_type_schema(file, ty);
+                if let Some(Some((decl_file, ty))) = method {
+                    return self.type_schema(decl_file, ty, root);
                 }
                 match self.function_return(file, &c.callee, scope) {
-                    Some((decl_file, ty)) => self.payload_type_schema(&decl_file, &ty),
+                    Some((decl_file, ty)) => self.type_schema(&decl_file, &ty, root),
                     None => self.unresolved_expr(file, expr),
                 }
             }
             Expr::Object(o) => self.object_schema(file, o, scope, depth),
             Expr::Array(a) => {
                 let mut items: Vec<Value> = Vec::new();
-                for el in a.elems.iter().flatten() {
-                    if el.spread.is_some() {
-                        return self.unresolved_expr(file, expr);
-                    }
-                    let schema = self.expr_schema(file, &el.expr, scope, depth + 1);
+                for el in &a.elems {
+                    let schema = match el {
+                        Some(el) if el.spread.is_some() => return self.unresolved_expr(file, expr),
+                        Some(el) => self.expr_schema(file, &el.expr, scope, depth + 1, false),
+                        None => Value::Null,
+                    };
+                    // JSON writes a hole or `undefined` element as `null`.
+                    let schema = if schema.is_null() {
+                        json!({ "type": "null" })
+                    } else {
+                        schema
+                    };
                     if !items.contains(&schema) {
                         items.push(schema);
                     }
@@ -500,7 +530,7 @@ impl<'a> EventExtractor<'a> {
             Expr::Cond(c) => {
                 let mut branches = Vec::new();
                 for e in [&c.cons, &c.alt] {
-                    let schema = self.expr_schema(file, e, scope, depth + 1);
+                    let schema = self.expr_schema(file, e, scope, depth + 1, root);
                     if !schema.is_null() && !branches.contains(&schema) {
                         branches.push(schema);
                     }
@@ -571,11 +601,13 @@ impl<'a> EventExtractor<'a> {
         {
             return self.schema_ctx().named_type_to_schema(file, &owner);
         }
-        let object = self.expr_schema(file, obj, scope, depth + 1);
+        let object = self.expr_schema(file, obj, scope, depth + 1, false);
         key.and_then(|k| self.components.property(&object, &k))
             .unwrap_or_else(|| self.unresolved_expr(file, expr))
     }
 
+    /// An object literal, its properties in source order: a later property
+    /// or spread replaces an earlier one of the same name.
     fn object_schema(
         &mut self,
         file: &Path,
@@ -583,49 +615,72 @@ impl<'a> EventExtractor<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Value {
+        // `{ ...x }` copies `x`, whatever its shape.
+        if let [PropOrSpread::Spread(s)] = o.props.as_slice() {
+            return self.expr_schema(file, &s.expr, scope, depth + 1, false);
+        }
         let mut properties = Map::new();
-        let mut required = Vec::new();
-        let mut spreads = Vec::new();
+        let mut required: Vec<String> = Vec::new();
         for prop in &o.props {
             let (key, schema) = match prop {
                 PropOrSpread::Spread(s) => {
-                    spreads.push(self.expr_schema(file, &s.expr, scope, depth + 1));
+                    let spread = self.expr_schema(file, &s.expr, scope, depth + 1, false);
+                    if spread.is_null() {
+                        continue;
+                    }
+                    let Some(spread) = self.components.flatten(&spread) else {
+                        return self.unresolved_expr(file, &Expr::Object(o.clone()));
+                    };
+                    let spread_required: Vec<&str> = spread
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|r| r.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if let Some(Value::Object(props)) = spread.get("properties") {
+                        for (key, schema) in props {
+                            properties.insert(key.clone(), schema.clone());
+                            required.retain(|k| k != key.as_str());
+                            if spread_required.contains(&key.as_str()) {
+                                required.push(key.clone());
+                            }
+                        }
+                    }
                     continue;
                 }
                 PropOrSpread::Prop(p) => match &**p {
                     Prop::KeyValue(kv) => (
                         prop_name_text(&kv.key),
-                        self.expr_schema(file, &kv.value, scope, depth + 1),
+                        self.expr_schema(file, &kv.value, scope, depth + 1, false),
                     ),
                     Prop::Shorthand(id) => (
                         id.sym.to_string(),
-                        self.expr_schema(file, &Expr::Ident(id.clone()), scope, depth + 1),
+                        self.expr_schema(file, &Expr::Ident(id.clone()), scope, depth + 1, false),
                     ),
                     _ => continue,
                 },
             };
-            if key.is_empty() || schema.is_null() {
+            if key.is_empty() {
                 continue;
             }
-            required.push(Value::String(key.clone()));
+            required.retain(|k| *k != key);
+            if schema.is_null() {
+                properties.shift_remove(&key);
+                continue;
+            }
+            required.push(key.clone());
             properties.insert(key, schema);
         }
+        // Required in the order the properties come.
+        required.sort_by_key(|k| properties.keys().position(|p| p == k));
         let mut object = Map::new();
         object.insert("type".into(), json!("object"));
         if !properties.is_empty() {
             object.insert("properties".into(), Value::Object(properties));
         }
         if !required.is_empty() {
-            object.insert("required".into(), Value::Array(required));
+            object.insert("required".into(), json!(required));
         }
-        if spreads.is_empty() {
-            return Value::Object(object);
-        }
-        let mut branches = spreads;
-        if object.len() > 1 {
-            branches.push(Value::Object(object));
-        }
-        json!({ "allOf": branches })
+        Value::Object(object)
     }
 
     /// An expression whose type is not inferred, marked with its source text.
@@ -727,54 +782,104 @@ fn object_member(o: &swc_ecma_ast::ObjectLit, key: &str) -> Option<Expr> {
     })
 }
 
-fn class_methods(class: &Class) -> HashMap<String, Option<TsType>> {
-    let mut methods: HashMap<String, Option<TsType>> = HashMap::new();
-    for member in &class.body {
-        if let ClassMember::Method(m) = member {
-            let ty = m
-                .function
-                .return_type
-                .as_ref()
-                .map(|t| (*t.type_ann).clone());
-            // An overload signature and its implementation share the name.
-            methods
-                .entry(prop_name_text(&m.key))
-                .and_modify(|t| {
-                    if t.is_none() {
-                        t.clone_from(&ty)
-                    }
-                })
-                .or_insert(ty);
+/// A declared type, with the file it is written in.
+type Declared = Option<(PathBuf, TsType)>;
+
+/// The class and the classes it extends, the class first, with their files.
+fn class_chain(project: &Project, file: &Path, class: &Class) -> Vec<(PathBuf, Class)> {
+    let mut chain = vec![(file.to_path_buf(), class.clone())];
+    let mut walked = std::collections::HashSet::new();
+    walked.insert((file.to_path_buf(), class.span.lo));
+    while let Some((file, class)) = chain.last() {
+        let Some((base_file, base)) = class
+            .super_class
+            .as_deref()
+            .and_then(crate::constval::dotted_name)
+            .and_then(|n| project_class(project, file, &n))
+        else {
+            break;
+        };
+        if !walked.insert((base_file.clone(), base.span.lo)) {
+            break;
+        }
+        chain.push((base_file, (*base).clone()));
+    }
+    chain
+}
+
+/// The declared return type of each method of a class, inherited ones
+/// included. A method whose callable signatures return different types has
+/// none: which one a call picks is not known.
+fn class_methods(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
+    let mut methods: HashMap<String, Declared> = HashMap::new();
+    for (file, class) in chain {
+        let mut own: HashMap<String, Vec<&Function>> = HashMap::new();
+        for member in &class.body {
+            if let ClassMember::Method(m) = member {
+                own.entry(prop_name_text(&m.key))
+                    .or_default()
+                    .push(&m.function);
+            }
+        }
+        for (name, signatures) in own {
+            methods.entry(name).or_insert_with(|| {
+                let signatures = signatures
+                    .iter()
+                    .map(|f| (f.body.is_some(), f.return_type.as_deref()));
+                callable_return(signatures).map(|t| (file.clone(), t.clone()))
+            });
         }
     }
     methods
 }
 
-/// The declared type of each field of a class, constructor parameter
-/// properties included; `None` for a field declared without one.
-fn class_fields(class: &Class) -> HashMap<String, Option<TsType>> {
+/// The return type every callable signature of an overloaded function
+/// declares, given each signature's (has a body, return type). With
+/// overloads, the implementation is not callable.
+pub(crate) fn callable_return<'t>(
+    signatures: impl Iterator<Item = (bool, Option<&'t swc_ecma_ast::TsTypeAnn>)>,
+) -> Option<&'t TsType> {
+    use swc_common::EqIgnoreSpan;
+    let signatures: Vec<_> = signatures.collect();
+    let overloaded = signatures.iter().any(|(body, _)| !body);
+    let mut callable = signatures
+        .iter()
+        .filter(|(body, _)| !overloaded || !body)
+        .map(|(_, ty)| ty.map(|t| &*t.type_ann));
+    let first = callable.next()??;
+    callable
+        .all(|t| t.is_some_and(|t| t.eq_ignore_span(first)))
+        .then_some(first)
+}
+
+/// The declared type of each field of a class, inherited ones and
+/// constructor parameter properties included; `None` for a field declared
+/// without one.
+fn class_fields(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
     let mut fields = HashMap::new();
-    for member in &class.body {
-        match member {
-            ClassMember::ClassProp(p) => {
-                fields.insert(
-                    prop_name_text(&p.key),
-                    p.type_ann.as_ref().map(|t| (*t.type_ann).clone()),
-                );
-            }
-            ClassMember::Constructor(c) => {
-                for p in &c.params {
-                    if let ParamOrTsParamProp::TsParamProp(p) = p
-                        && let TsParamPropParam::Ident(i) = &p.param
-                    {
-                        fields.insert(
-                            i.id.sym.to_string(),
-                            i.type_ann.as_ref().map(|t| (*t.type_ann).clone()),
-                        );
+    for (file, class) in chain {
+        let declared =
+            |t: Option<&swc_ecma_ast::TsTypeAnn>| t.map(|t| (file.clone(), (*t.type_ann).clone()));
+        for member in &class.body {
+            match member {
+                ClassMember::ClassProp(p) => {
+                    fields
+                        .entry(prop_name_text(&p.key))
+                        .or_insert_with(|| declared(p.type_ann.as_deref()));
+                }
+                ClassMember::Constructor(c) => {
+                    for p in &c.params {
+                        if let ParamOrTsParamProp::TsParamProp(p) = p
+                            && let TsParamPropParam::Ident(i) = &p.param
+                        {
+                            fields
+                                .entry(i.id.sym.to_string())
+                                .or_insert_with(|| declared(i.type_ann.as_deref()));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     fields
@@ -783,9 +888,9 @@ fn class_fields(class: &Class) -> HashMap<String, Option<TsType>> {
 struct Scope<'s> {
     /// `None` for a name bound more than once in the member.
     locals: &'s HashMap<String, Option<Binding>>,
-    fields: &'s HashMap<String, Option<TsType>>,
+    fields: &'s HashMap<String, Declared>,
     /// The declared return type of each method of the class.
-    methods: &'s HashMap<String, Option<TsType>>,
+    methods: &'s HashMap<String, Declared>,
 }
 
 #[derive(Clone)]
@@ -794,15 +899,16 @@ enum Binding {
     Init(Expr),
 }
 
-/// The names a member binds — parameters and variables, of nested functions
-/// too — with what they are declared with. Scopes are not told apart: a name
-/// bound twice is ambiguous.
+/// The calls in a member, and the names it binds — parameters and
+/// variables, of nested functions too — with what they are declared with.
+/// Scopes are not told apart: a name bound twice is ambiguous.
 #[derive(Default)]
-struct Locals {
+struct MemberScan {
+    calls: Vec<CallExpr>,
     bindings: HashMap<String, Option<Binding>>,
 }
 
-impl Locals {
+impl MemberScan {
     fn bind(&mut self, name: String, binding: Option<Binding>) {
         self.bindings
             .entry(name)
@@ -824,7 +930,12 @@ impl Locals {
     }
 }
 
-impl Visit for Locals {
+impl Visit for MemberScan {
+    fn visit_call_expr(&mut self, c: &CallExpr) {
+        self.calls.push(c.clone());
+        c.visit_children_with(self);
+    }
+
     fn visit_var_declarator(&mut self, d: &VarDeclarator) {
         if let Pat::Ident(i) = &d.name {
             let binding = match (&i.type_ann, &d.init) {
@@ -842,23 +953,20 @@ impl Visit for Locals {
         p.visit_children_with(self);
     }
 
+    /// A constructor parameter property is a parameter too.
+    fn visit_ts_param_prop(&mut self, p: &swc_ecma_ast::TsParamProp) {
+        match &p.param {
+            TsParamPropParam::Ident(i) => self.bind_pat(&Pat::Ident(i.clone())),
+            TsParamPropParam::Assign(a) => self.bind_pat(&a.left),
+        }
+        p.visit_children_with(self);
+    }
+
     fn visit_arrow_expr(&mut self, a: &swc_ecma_ast::ArrowExpr) {
         for p in &a.params {
             self.bind_pat(p);
         }
-        a.body.visit_with(self);
-    }
-}
-
-#[derive(Default)]
-struct CallCollector {
-    calls: Vec<CallExpr>,
-}
-
-impl Visit for CallCollector {
-    fn visit_call_expr(&mut self, c: &CallExpr) {
-        self.calls.push(c.clone());
-        c.visit_children_with(self);
+        a.visit_children_with(self);
     }
 }
 
@@ -1129,6 +1237,142 @@ mod tests {
                     r#"{"cmd":"sum"}"#,
                     &json!({ "type": "array", "items": { "type": "number" } })
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_payload_key_read_twice_is_required_once() {
+        let controller = "@Controller()\n\
+            export class Listener {\n\
+              @EventPattern('book') on(@Payload('id') a: string, @Payload('id') b: string) {}\n\
+            }";
+        let (events, _) = extract("twice", &[("a.ts", controller)], AsyncApi::default());
+        assert_eq!(events[0].payload["required"], json!(["id"]));
+    }
+
+    #[test]
+    fn wrappers_are_only_unwrapped_at_the_payload_root() {
+        let service = "import { Envelope, BookDto } from './events';\n\
+            export class Base { constructor(protected client: ClientProxy) {} }\n\
+            export class BooksService extends Base {\n\
+              send(envelope: Envelope<BookDto>) {\n\
+                this.client.emit('whole', envelope);\n\
+                this.client.emit('nested', { nested: envelope });\n\
+              }\n\
+            }";
+        let asyncapi = AsyncApi {
+            payload_wrappers: vec!["Envelope".into()],
+            ..AsyncApi::default()
+        };
+        let (events, _) = extract(
+            "root-wrappers",
+            &[("events.ts", EVENTS), ("books.service.ts", service)],
+            asyncapi,
+        );
+        let payloads: Vec<(&str, &Value)> = events
+            .iter()
+            .map(|e| (e.channel.as_str(), &e.payload))
+            .collect();
+        assert_eq!(
+            payloads,
+            [
+                ("whole", &json!({ "$ref": "#/components/schemas/BookDto" })),
+                (
+                    "nested",
+                    &json!({
+                        "type": "object",
+                        "properties": { "nested": { "$ref": "#/components/schemas/EnvelopeBookDto" } },
+                        "required": ["nested"]
+                    })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_member_kind_publishes_and_inherited_fields_type_the_receiver() {
+        let base = "export class Base { constructor(protected readonly client: ClientProxy) {} }";
+        let service = "import { Base } from './base';\n\
+            import { BookDto } from './events';\n\
+            export class BooksService extends Base {\n\
+              #publish = (book: BookDto) => this.client.emit('private_prop', book);\n\
+              static { this.client.emit('static_block', 1); }\n\
+            }\n\
+            export class Seeder {\n\
+              constructor(private book: BookDto, private client: ClientProxy) {\n\
+                this.client.emit('constructor', book);\n\
+              }\n\
+            }";
+        let (events, _) = extract(
+            "members",
+            &[
+                ("events.ts", EVENTS),
+                ("base.ts", base),
+                ("books.service.ts", service),
+            ],
+            AsyncApi::default(),
+        );
+        let book = json!({ "$ref": "#/components/schemas/BookDto" });
+        let ops: Vec<(&str, &str, &Value)> = events
+            .iter()
+            .map(|e| (e.handler.as_str(), e.channel.as_str(), &e.payload))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                ("BooksService.#publish", "private_prop", &book),
+                (
+                    "BooksService.static",
+                    "static_block",
+                    &json!({ "type": "number" })
+                ),
+                ("Seeder.constructor", "constructor", &book),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_payloads_follow_javascript_semantics() {
+        let service = "import { BookDto } from './events';\n\
+            export function pick(x: string): BookDto;\n\
+            export function pick(x: number): number;\n\
+            export function pick(x: unknown): unknown { return x; }\n\
+            export class BooksService {\n\
+              constructor(private client: ClientProxy) {}\n\
+              private either: BookDto | string;\n\
+              send(book: BookDto) {\n\
+                this.client.emit('array', [1, undefined, , 2]);\n\
+                this.client.emit('spread', { id: 1, ...book, title: 2, extra: undefined });\n\
+                this.client.emit('copy', { ...this.either });\n\
+                this.client.emit('overloaded', pick(1));\n\
+                this.client.emit('method', this.own(1));\n\
+              }\n\
+              own(x: string): string;\n\
+              own(x: number): number;\n\
+              own(x: unknown): unknown { return x; }\n\
+            }";
+        let (events, _) = extract(
+            "literals",
+            &[("events.ts", EVENTS), ("books.service.ts", service)],
+            AsyncApi::default(),
+        );
+        let payloads: Vec<&Value> = events.iter().map(|e| &e.payload).collect();
+        assert_eq!(
+            payloads,
+            [
+                &json!({
+                    "type": "array",
+                    "items": { "anyOf": [{ "type": "number" }, { "type": "null" }] }
+                }),
+                &json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string" }, "title": { "type": "number" } },
+                    "required": ["id", "title"]
+                }),
+                &json!({ "anyOf": [{ "$ref": "#/components/schemas/BookDto" }, { "type": "string" }] }),
+                &json!({ "x-unresolved": "pick(1)" }),
+                &json!({ "x-unresolved": "this.own(1)" }),
             ]
         );
     }

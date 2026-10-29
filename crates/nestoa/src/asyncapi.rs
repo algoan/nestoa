@@ -26,10 +26,17 @@ pub fn to_asyncapi(
 ) -> Value {
     components.resolve_deferred();
 
-    let mut grouped: BTreeMap<(String, Action, String), Vec<&EventOperation>> = BTreeMap::new();
+    // Keyed by file too: two classes of one name are two handlers.
+    type Key = (String, std::path::PathBuf, Action, String);
+    let mut grouped: BTreeMap<Key, Vec<&EventOperation>> = BTreeMap::new();
     for e in events {
         grouped
-            .entry((e.handler.clone(), e.action, e.channel.clone()))
+            .entry((
+                e.handler.clone(),
+                e.file.clone(),
+                e.action,
+                e.channel.clone(),
+            ))
             .or_default()
             .push(e);
     }
@@ -46,7 +53,7 @@ pub fn to_asyncapi(
     let mut messages: BTreeMap<String, IndexMap<String, Value>> = BTreeMap::new();
     let mut operations = Map::new();
     let mut operation_ids = std::collections::HashSet::new();
-    for ((handler, action, address), ops) in &grouped {
+    for ((handler, _, action, address), ops) in &grouped {
         let channel_id = &channel_ids[address.as_str()];
         let channel_messages = messages.entry(channel_id.clone()).or_default();
         let mut refs: Vec<Value> = Vec::new();
@@ -192,6 +199,7 @@ mod tests {
             channel: channel.into(),
             payload,
             handler: handler.into(),
+            file: std::path::PathBuf::from("a.ts"),
             tag: handler.split('.').next().unwrap().into(),
             summary: None,
             description: None,
@@ -308,5 +316,41 @@ mod tests {
             doc["components"]["schemas"]["Point"],
             json!({ "type": "array", "items": [{ "type": "number" }], "additionalItems": false })
         );
+    }
+
+    #[test]
+    fn channel_ids_named_like_keywords_are_still_walked() {
+        let mut other_file = op(
+            Action::Receive,
+            "default",
+            "Listener.on",
+            json!({ "x-unresolved": "Mystery" }),
+        );
+        other_file.file = std::path::PathBuf::from("b.ts");
+        let doc = document(
+            &[
+                op(
+                    Action::Receive,
+                    "x-books",
+                    "Listener.on",
+                    json!({ "$ref": "#/components/schemas/Book" }),
+                ),
+                other_file,
+            ],
+            &[("Book", json!({ "type": "object" }))],
+        );
+        assert_eq!(
+            doc["components"]["schemas"]["Book"],
+            json!({ "type": "object" })
+        );
+        assert_eq!(
+            crate::diag::unresolved(&doc),
+            [(
+                "#/channels/default/messages/default/payload".to_string(),
+                "Mystery".to_string()
+            )]
+        );
+        let ids: Vec<&String> = doc["operations"].as_object().unwrap().keys().collect();
+        assert_eq!(ids, ["Listener_on", "Listener_on_2"]);
     }
 }
