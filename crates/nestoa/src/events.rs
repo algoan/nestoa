@@ -941,7 +941,11 @@ fn member_key(prop: &MemberProp) -> Option<String> {
 
 /// `a.b`, or `a?.b`.
 fn as_member(expr: &Expr) -> Option<&swc_ecma_ast::MemberExpr> {
-    match crate::constval::unwrap(expr) {
+    let mut expr = crate::constval::unwrap(expr);
+    while let Expr::TsNonNull(n) = expr {
+        expr = crate::constval::unwrap(&n.expr);
+    }
+    match expr {
         Expr::Member(m) => Some(m),
         Expr::OptChain(o) => match &*o.base {
             swc_ecma_ast::OptChainBase::Member(m) => Some(m),
@@ -2059,6 +2063,7 @@ mod tests {
               async send(args: [BookDto], draft: Draft, p: Promise<string | undefined>) {\n\
                 this.client?.emit('optional_receiver', 1);\n\
                 this.client.emit?.('optional_call', 1);\n\
+                this.client!.emit('non_null', 1);\n\
                 this.client.emit('spread_args', ...args);\n\
                 this.client.emit('typed_new', new Box<number>(1));\n\
                 class BookDto { count = 1; }\n\
@@ -2082,6 +2087,7 @@ mod tests {
             [
                 ("optional_receiver", &json!({ "type": "number" })),
                 ("optional_call", &json!({ "type": "number" })),
+                ("non_null", &json!({ "type": "number" })),
                 ("spread_args", &json!({ "x-unresolved": "...arguments" })),
                 (
                     "typed_new",
