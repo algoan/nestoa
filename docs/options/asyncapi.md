@@ -98,7 +98,12 @@ types reach:
 - object and array literals of the above, `await`, `a ? b : c`. A later property or spread replaces
   an earlier one, as in JavaScript (an optional spread property may also leave the earlier one), a
   property whose value may be `undefined` (`book.subtitle?`, `x: T | undefined`) is optional, a lone
-  `{ ...x }` copies an object `x`, and an `undefined` array element is `null`.
+  `{ ...x }` copies an object `x`, and an `undefined` array element is `null`. An object with a key
+  that cannot be evaluated, or with a spread of a dictionary (`Record<string, T>`), is unresolved: it
+  may override any property.
+
+`this` is the instance: static fields and methods are not read. A name the member declares (a
+parameter, a destructured variable, a local function or class) shadows a module one of that name.
 
 `payloadWrappers` only apply to the whole payload: an envelope nested in it is documented as is.
 

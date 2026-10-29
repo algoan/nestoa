@@ -432,11 +432,14 @@ impl<'a> EventExtractor<'a> {
         let expr = match &publisher.payload_property {
             None => (*arg.expr).clone(),
             Some(key) => match crate::constval::unwrap(&arg.expr) {
-                // A spread may supply or override the property.
-                Expr::Object(o) if o.props.iter().any(|p| matches!(p, PropOrSpread::Spread(_))) => {
+                // A spread or an unknown key may supply or override the property.
+                Expr::Object(o)
+                    if o.props.iter().any(|p| matches!(p, PropOrSpread::Spread(_)))
+                        || !keys_known(self.project, file, o) =>
+                {
                     return self.unresolved_expr(file, &arg.expr);
                 }
-                Expr::Object(o) => match object_member(o, key) {
+                Expr::Object(o) => match object_member(self.project, file, o, key) {
                     Some(e) => e,
                     None => return Value::Null,
                 },
@@ -527,7 +530,15 @@ impl<'a> EventExtractor<'a> {
                 for el in &a.elems {
                     let schema = match el {
                         Some(el) if el.spread.is_some() => return self.unresolved_expr(file, expr),
-                        Some(el) => self.expr_schema(file, &el.expr, scope, depth + 1, false),
+                        Some(el) => {
+                            if self.may_be_undefined(file, &el.expr, scope, depth + 1) {
+                                let null = json!({ "type": "null" });
+                                if !items.contains(&null) {
+                                    items.push(null);
+                                }
+                            }
+                            self.expr_schema(file, &el.expr, scope, depth + 1, false)
+                        }
                         None => Value::Null,
                     };
                     // JSON writes a hole or `undefined` element as `null`.
@@ -652,6 +663,9 @@ impl<'a> EventExtractor<'a> {
                 self.unresolved_expr(file, &Expr::Object(o.clone()))
             };
         }
+        if !keys_known(self.project, file, o) {
+            return self.unresolved_expr(file, &Expr::Object(o.clone()));
+        }
         let mut properties = Map::new();
         let mut required: Vec<String> = Vec::new();
         for prop in &o.props {
@@ -661,7 +675,12 @@ impl<'a> EventExtractor<'a> {
                     if spread.is_null() {
                         continue;
                     }
-                    let Some(spread) = self.components.flatten(&spread) else {
+                    // A dictionary may override any property, which one is unknown.
+                    let Some(spread) = self
+                        .components
+                        .flatten(&spread)
+                        .filter(|s| !is_dictionary(s))
+                    else {
                         return self.unresolved_expr(file, &Expr::Object(o.clone()));
                     };
                     let spread_required: Vec<&str> = spread
@@ -692,7 +711,7 @@ impl<'a> EventExtractor<'a> {
                 }
                 PropOrSpread::Prop(p) => match &**p {
                     Prop::KeyValue(kv) => (
-                        prop_name_text(&kv.key),
+                        key_text(self.project, file, &kv.key).unwrap_or_default(),
                         self.expr_schema(file, &kv.value, scope, depth + 1, false),
                         self.may_be_undefined(file, &kv.value, scope, depth + 1),
                     ),
@@ -823,7 +842,7 @@ fn object_pattern(project: &Project, file: &Path, expr: &Expr, depth: usize) -> 
         let Prop::KeyValue(kv) = &**p else {
             return None;
         };
-        let key = prop_name_text(&kv.key);
+        let key = key_text(project, file, &kv.key)?;
         let value = match object_pattern(project, file, &kv.value, depth + 1) {
             Some(nested) => nested,
             None => match crate::constval::value(project, file, &kv.value)? {
@@ -841,6 +860,13 @@ fn object_pattern(project: &Project, file: &Path, expr: &Expr, depth: usize) -> 
         .map(|(k, v)| format!("\"{k}\":{v}"))
         .collect();
     Some(format!("{{{}}}", fields.join(",")))
+}
+
+/// Whether an object schema admits properties it does not name.
+fn is_dictionary(object: &Map<String, Value>) -> bool {
+    ["additionalProperties", "patternProperties"]
+        .iter()
+        .any(|k| object.get(*k).is_some_and(|v| v != &Value::Bool(false)))
 }
 
 /// Whether `expr` reads any of `locals`, which shadow the module's names.
@@ -892,11 +918,41 @@ fn project_class(
     }
 }
 
+/// The name a property key gives, a computed one evaluated; `None` when it
+/// cannot be.
+fn key_text(project: &Project, file: &Path, key: &swc_ecma_ast::PropName) -> Option<String> {
+    match key {
+        swc_ecma_ast::PropName::Computed(c) => crate::constval::string(project, file, &c.expr),
+        key => Some(prop_name_text(key)).filter(|k| !k.is_empty()),
+    }
+}
+
+/// Whether every key of an object literal can be named.
+fn keys_known(project: &Project, file: &Path, o: &swc_ecma_ast::ObjectLit) -> bool {
+    o.props.iter().all(|p| match p {
+        PropOrSpread::Prop(p) => match &**p {
+            Prop::KeyValue(kv) => key_text(project, file, &kv.key).is_some(),
+            Prop::Method(m) => key_text(project, file, &m.key).is_some(),
+            Prop::Getter(g) => key_text(project, file, &g.key).is_some(),
+            Prop::Setter(s) => key_text(project, file, &s.key).is_some(),
+            _ => true,
+        },
+        PropOrSpread::Spread(_) => true,
+    })
+}
+
 /// The value of `key` in an object literal, a shorthand property included.
-fn object_member(o: &swc_ecma_ast::ObjectLit, key: &str) -> Option<Expr> {
+fn object_member(
+    project: &Project,
+    file: &Path,
+    o: &swc_ecma_ast::ObjectLit,
+    key: &str,
+) -> Option<Expr> {
     o.props.iter().rev().find_map(|p| match p {
         PropOrSpread::Prop(p) => match &**p {
-            Prop::KeyValue(kv) if prop_name_text(&kv.key) == key => Some((*kv.value).clone()),
+            Prop::KeyValue(kv) if key_text(project, file, &kv.key).as_deref() == Some(key) => {
+                Some((*kv.value).clone())
+            }
             Prop::Shorthand(id) if id.sym == key => Some(Expr::Ident(id.clone())),
             _ => None,
         },
@@ -956,7 +1012,10 @@ fn class_methods(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
     for (file, class) in chain {
         let mut own: HashMap<String, Vec<&Function>> = HashMap::new();
         for member in &class.body {
-            if let ClassMember::Method(m) = member {
+            // `this` in an instance member: statics live on the class.
+            if let ClassMember::Method(m) = member
+                && !m.is_static
+            {
                 own.entry(prop_name_text(&m.key))
                     .or_default()
                     .push(&m.function);
@@ -1004,7 +1063,7 @@ fn class_fields(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
         };
         for member in &class.body {
             match member {
-                ClassMember::ClassProp(p) => {
+                ClassMember::ClassProp(p) if !p.is_static => {
                     fields
                         .entry(prop_name_text(&p.key))
                         .or_insert_with(|| declared(p.type_ann.as_deref(), p.is_optional));
@@ -1052,14 +1111,15 @@ struct MemberScan {
 
 impl MemberScan {
     fn declarator(&mut self, d: &VarDeclarator, constant: bool) {
-        if let Pat::Ident(i) = &d.name {
-            let binding = match (&i.type_ann, &d.init) {
-                (Some(t), _) => Some(Binding::Type((*t.type_ann).clone())),
-                (None, Some(init)) if constant => Some(Binding::Init((**init).clone())),
-                _ => None,
-            };
-            self.bind(i.id.sym.to_string(), binding);
-        }
+        let Pat::Ident(i) = &d.name else {
+            return self.bind_pat(&d.name);
+        };
+        let binding = match (&i.type_ann, &d.init) {
+            (Some(t), _) => Some(Binding::Type((*t.type_ann).clone())),
+            (None, Some(init)) if constant => Some(Binding::Init((**init).clone())),
+            _ => None,
+        };
+        self.bind(i.id.sym.to_string(), binding);
     }
 
     fn bind(&mut self, name: String, binding: Option<Binding>) {
@@ -1078,6 +1138,20 @@ impl MemberScan {
                     .map(|t| Binding::Type(declared_type(&t.type_ann, i.id.optional))),
             ),
             Pat::Assign(a) => self.bind_pat(&a.left),
+            // Destructured names shadow too, of a type not inferred.
+            Pat::Array(a) => a.elems.iter().flatten().for_each(|p| self.bind_pat(p)),
+            Pat::Rest(r) => self.bind_pat(&r.arg),
+            Pat::Object(o) => {
+                for prop in &o.props {
+                    match prop {
+                        swc_ecma_ast::ObjectPatProp::KeyValue(kv) => self.bind_pat(&kv.value),
+                        swc_ecma_ast::ObjectPatProp::Assign(a) => {
+                            self.bind(a.key.sym.to_string(), None)
+                        }
+                        swc_ecma_ast::ObjectPatProp::Rest(r) => self.bind_pat(&r.arg),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1096,6 +1170,16 @@ impl Visit for MemberScan {
             self.declarator(d, constant);
         }
         v.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, f: &swc_ecma_ast::FnDecl) {
+        self.bind(f.ident.sym.to_string(), None);
+        f.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, c: &swc_ecma_ast::ClassDecl) {
+        self.bind(c.ident.sym.to_string(), None);
+        c.visit_children_with(self);
     }
 
     fn visit_param(&mut self, p: &swc_ecma_ast::Param) {
@@ -1631,6 +1715,88 @@ mod tests {
         assert_eq!(
             crate::diag::take_warnings(),
             ["BooksService.shadowed: cannot evaluate the channel of a `emit` call; it is left out"]
+        );
+    }
+
+    #[test]
+    fn unknown_keys_dictionaries_and_shadowing_names_are_not_guessed() {
+        crate::diag::take_warnings();
+        let controller = "const KEY = 'cmd';\n\
+            @Controller()\n\
+            export class Listener {\n\
+              @MessagePattern({ [KEY]: 'sum' }) sum(@Payload() n: number) {}\n\
+              @MessagePattern({ [dynamicKey()]: 'sum' }) other(@Payload() n: number) {}\n\
+            }";
+        let service = "import { BookDto } from './events';\n\
+            const TOPIC = 'books';\n\
+            export function toBook(): BookDto { return null as any; }\n\
+            export class BooksService {\n\
+              static client: EventEmitter;\n\
+              client: ClientProxy;\n\
+              constructor(private events: EventsClient) {}\n\
+              send(key: string, labels: Record<string, string>, maybe: string | undefined, { TOPIC: renamed }: { TOPIC: string }) {\n\
+                this.client.emit('computed', { id: 'a', [key]: 1 });\n\
+                this.events.publish('computed_data', { data: 1, [key]: 2 });\n\
+                this.client.emit('dictionary', { id: 1, ...labels });\n\
+                this.client.emit('array', [maybe]);\n\
+                function toBook(): number { return 1; }\n\
+                this.client.emit('local_function', toBook());\n\
+                const { TOPIC } = { TOPIC: 'other' };\n\
+                this.client.emit(TOPIC, 1);\n\
+              }\n\
+            }";
+        let asyncapi = AsyncApi {
+            publishers: [publisher("publish")]
+                .into_iter()
+                .chain(AsyncApi::default().publishers)
+                .collect(),
+            ..AsyncApi::default()
+        };
+        let (events, _) = extract(
+            "unknown",
+            &[
+                ("events.ts", EVENTS),
+                ("listener.ts", controller),
+                ("books.service.ts", service),
+            ],
+            asyncapi,
+        );
+        let ops: Vec<(&str, &Value)> = events
+            .iter()
+            .map(|e| (e.channel.as_str(), &e.payload))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                (r#"{"cmd":"sum"}"#, &json!({ "type": "number" })),
+                (
+                    "computed",
+                    &json!({ "x-unresolved": "{ id: 'a', [key]: 1 }" })
+                ),
+                (
+                    "computed_data",
+                    &json!({ "x-unresolved": "{ data: 1, [key]: 2 }" })
+                ),
+                (
+                    "dictionary",
+                    &json!({ "x-unresolved": "{ id: 1, ...labels }" })
+                ),
+                (
+                    "array",
+                    &json!({
+                        "type": "array",
+                        "items": { "anyOf": [{ "type": "null" }, { "type": "string" }] }
+                    })
+                ),
+                ("local_function", &json!({ "x-unresolved": "toBook()" })),
+            ]
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            [
+                "Listener.other: cannot evaluate its MessagePattern pattern; it is left out",
+                "BooksService.send: cannot evaluate the channel of a `emit` call; it is left out",
+            ]
         );
     }
 }
