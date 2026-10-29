@@ -203,7 +203,9 @@ impl<'a> EventExtractor<'a> {
             let schema = self.param_schema(file, &p.pat);
             match key {
                 Some(key) => {
-                    if !matches!(&p.pat, Pat::Ident(i) if i.optional) {
+                    if !matches!(&p.pat, Pat::Ident(i) if i.optional)
+                        && !matches!(&p.pat, Pat::Assign(_))
+                    {
                         required.push(Value::String(key.clone()));
                     }
                     properties.insert(key, schema);
@@ -926,7 +928,7 @@ mod tests {
               @MessagePattern({ role: 'book', cmd: 'count' })\n\
               count(data: { shelf: string }, @Ctx() ctx: unknown) {}\n\
               @EventPattern('book_archived')\n\
-              onArchived(@Payload('id') id: string, @Payload('reason') reason?: string) {}\n\
+              onArchived(@Payload('id') id: string, @Payload('reason') reason?: string, @Payload('by') by: string = 'staff') {}\n\
               notAHandler() {}\n\
             }\n\
             export class NotAController {\n\
@@ -970,7 +972,11 @@ mod tests {
                     "BookListenerController.onArchived",
                     &json!({
                         "type": "object",
-                        "properties": { "id": { "type": "string" }, "reason": { "type": "string" } },
+                        "properties": {
+                            "id": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "by": { "type": "string" }
+                        },
                         "required": ["id"]
                     })
                 ),
