@@ -20,7 +20,7 @@ the service's message events, next to the OpenAPI document, from the same analys
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `output` | `asyncapi.json` | Output file, relative to the project. JSON or YAML from its extension. `--asyncapi-output` overrides it. |
+| `output` | `asyncapi.json` | Output file, relative to the project. JSON or YAML from its extension. `--asyncapi-output` overrides it. The OpenAPI document's file is an error. |
 | `info` | the top-level [`info`](info.md) | The document's `info`. |
 | `defaultContentType` | `application/json` | The document's `defaultContentType`. |
 | `payloadWrappers` | `[]` | Generic envelopes a payload type is unwrapped from (see below). |
@@ -98,7 +98,8 @@ types reach:
 - object and array literals of the above, `await`, `a ? b : c`. A later property or spread replaces
   an earlier one, as in JavaScript (an optional spread property may also leave the earlier one), a
   property whose value may be `undefined` (`book.subtitle?`, `x: T | undefined`) is optional, a lone
-  `{ ...x }` copies an object `x`, and an `undefined` array element is `null`. An object with a key
+  `{ ...x }` copies an object `x` (or is `{}` when `x` may be `undefined`), a call is `undefined`
+  when its declared return type admits it, and an `undefined` array element is `null`. An object with a key
   that cannot be evaluated, or with a spread of a dictionary (`Record<string, T>`), is unresolved: it
   may override any property.
 

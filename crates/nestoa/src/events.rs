@@ -399,10 +399,8 @@ impl<'a> EventExtractor<'a> {
             let MemberProp::Ident(name) = &field.prop else {
                 return None;
             };
-            match fields.get(name.sym.as_ref())? {
-                Some((_, TsType::TsTypeRef(r))) => Some(entity_last(&r.type_name)),
-                _ => None,
-            }
+            let (_, ty) = fields.get(name.sym.as_ref())?.as_ref()?;
+            defined_type_name(ty)
         };
         self.asyncapi.publishers.iter().find(|p| {
             p.method == method.sym.as_ref()
@@ -435,11 +433,11 @@ impl<'a> EventExtractor<'a> {
                 // A spread or an unknown key may supply or override the property.
                 Expr::Object(o)
                     if o.props.iter().any(|p| matches!(p, PropOrSpread::Spread(_)))
-                        || !keys_known(self.project, file, o) =>
+                        || !keys_known(self.project, file, o, scope.locals) =>
                 {
                     return self.unresolved_expr(file, &arg.expr);
                 }
-                Expr::Object(o) => match object_member(self.project, file, o, key) {
+                Expr::Object(o) => match object_member(self.project, file, o, key, scope.locals) {
                     Some(e) => e,
                     None => return Value::Null,
                 },
@@ -645,25 +643,31 @@ impl<'a> EventExtractor<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Value {
-        // `{ ...x }` copies an object `x`, whatever its shape.
+        // `{ ...x }` copies an object `x`, whatever its shape, and an
+        // `undefined` one gives `{}`.
         if let [PropOrSpread::Spread(s)] = o.props.as_slice() {
+            let empty = json!({ "type": "object", "maxProperties": 0 });
             let spread = self.expr_schema(file, &s.expr, scope, depth + 1, false);
             if spread.is_null() {
-                return json!({ "type": "object" });
+                return empty;
             }
-            let objects = match spread.get("anyOf").and_then(Value::as_array) {
-                Some(branches) => branches
-                    .iter()
-                    .all(|b| self.components.flatten(b).is_some()),
-                None => self.components.flatten(&spread).is_some(),
+            let mut branches = match spread.get("anyOf").and_then(Value::as_array) {
+                Some(branches) => branches.clone(),
+                None => vec![spread.clone()],
             };
-            return if objects {
-                spread
-            } else {
-                self.unresolved_expr(file, &Expr::Object(o.clone()))
-            };
+            if !branches
+                .iter()
+                .all(|b| self.components.flatten(b).is_some())
+            {
+                return self.unresolved_expr(file, &Expr::Object(o.clone()));
+            }
+            if !self.may_be_undefined(file, &s.expr, scope, depth + 1) {
+                return spread;
+            }
+            branches.push(empty);
+            return json!({ "anyOf": branches });
         }
-        if !keys_known(self.project, file, o) {
+        if !keys_known(self.project, file, o, scope.locals) {
             return self.unresolved_expr(file, &Expr::Object(o.clone()));
         }
         let mut properties = Map::new();
@@ -675,6 +679,8 @@ impl<'a> EventExtractor<'a> {
                     if spread.is_null() {
                         continue;
                     }
+                    // An `undefined` operand spreads nothing: none of its properties is sure.
+                    let sure = !self.may_be_undefined(file, &s.expr, scope, depth + 1);
                     // A dictionary may override any property, which one is unknown.
                     let Some(spread) = self
                         .components
@@ -686,6 +692,7 @@ impl<'a> EventExtractor<'a> {
                     let spread_required: Vec<&str> = spread
                         .get("required")
                         .and_then(Value::as_array)
+                        .filter(|_| sure)
                         .map(|r| r.iter().filter_map(Value::as_str).collect())
                         .unwrap_or_default();
                     if let Some(Value::Object(props)) = spread.get("properties") {
@@ -711,7 +718,7 @@ impl<'a> EventExtractor<'a> {
                 }
                 PropOrSpread::Prop(p) => match &**p {
                     Prop::KeyValue(kv) => (
-                        key_text(self.project, file, &kv.key).unwrap_or_default(),
+                        key_text(self.project, file, &kv.key, scope.locals).unwrap_or_default(),
                         self.expr_schema(file, &kv.value, scope, depth + 1, false),
                         self.may_be_undefined(file, &kv.value, scope, depth + 1),
                     ),
@@ -776,6 +783,28 @@ impl<'a> EventExtractor<'a> {
                     || self.may_be_undefined(file, &c.alt, scope, depth + 1)
             }
             Expr::OptChain(_) => true,
+            Expr::Call(c) => {
+                let method = match &c.callee {
+                    Callee::Expr(callee) => match crate::constval::unwrap(callee) {
+                        Expr::Member(m) if matches!(&*m.obj, Expr::This(_)) => match &m.prop {
+                            MemberProp::Ident(name) => {
+                                scope.methods.get(name.sym.as_ref()).cloned()
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let returned = match method {
+                    Some(declared) => declared,
+                    None => self.function_return(file, &c.callee, scope),
+                };
+                returned.is_some_and(|(decl_file, ty)| {
+                    self.schema_ctx()
+                        .admits_undefined(&decl_file, awaited(&ty), 0)
+                })
+            }
             Expr::Member(m) => match (&*m.obj, &m.prop) {
                 (Expr::This(_), MemberProp::Ident(name)) => {
                     match scope.fields.get(name.sym.as_ref()) {
@@ -842,7 +871,7 @@ fn object_pattern(project: &Project, file: &Path, expr: &Expr, depth: usize) -> 
         let Prop::KeyValue(kv) = &**p else {
             return None;
         };
-        let key = key_text(project, file, &kv.key)?;
+        let key = key_text(project, file, &kv.key, &HashMap::new())?;
         let value = match object_pattern(project, file, &kv.value, depth + 1) {
             Some(nested) => nested,
             None => match crate::constval::value(project, file, &kv.value)? {
@@ -888,7 +917,11 @@ fn unwrap_wrappers<'t>(mut ty: &'t TsType, wrappers: &[String]) -> &'t TsType {
     loop {
         match ty {
             TsType::TsParenthesizedType(p) => ty = &p.type_ann,
-            TsType::TsTypeRef(r) if wrappers.contains(&entity_last(&r.type_name)) => {
+            // What an awaited call returns, lowering unwraps it anyway.
+            TsType::TsTypeRef(r)
+                if wrappers.contains(&entity_last(&r.type_name))
+                    || entity_last(&r.type_name) == "Promise" =>
+            {
                 match r.type_params.as_ref().and_then(|a| a.params.first()) {
                     Some(arg) => ty = arg,
                     None => return ty,
@@ -896,6 +929,38 @@ fn unwrap_wrappers<'t>(mut ty: &'t TsType, wrappers: &[String]) -> &'t TsType {
             }
             _ => return ty,
         }
+    }
+}
+
+/// The type a `Promise<T>` resolves to, else `ty`.
+fn awaited(ty: &TsType) -> &TsType {
+    match ty {
+        TsType::TsTypeRef(r) if entity_last(&r.type_name) == "Promise" => r
+            .type_params
+            .as_ref()
+            .and_then(|a| a.params.first())
+            .map_or(ty, |t| awaited(t)),
+        _ => ty,
+    }
+}
+
+/// The name of the type `ty` refers to, `| undefined` and `| null` aside.
+fn defined_type_name(ty: &TsType) -> Option<String> {
+    use swc_ecma_ast::{TsKeywordTypeKind, TsUnionOrIntersectionType};
+    match ty {
+        TsType::TsTypeRef(r) => Some(entity_last(&r.type_name)),
+        TsType::TsParenthesizedType(p) => defined_type_name(&p.type_ann),
+        TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
+            let mut defined = u.types.iter().filter(|t| {
+                !matches!(&***t, TsType::TsKeywordType(k)
+                    if matches!(k.kind, TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsNullKeyword))
+            });
+            match (defined.next(), defined.next()) {
+                (Some(only), None) => defined_type_name(only),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -920,21 +985,32 @@ fn project_class(
 
 /// The name a property key gives, a computed one evaluated; `None` when it
 /// cannot be.
-fn key_text(project: &Project, file: &Path, key: &swc_ecma_ast::PropName) -> Option<String> {
+fn key_text(
+    project: &Project,
+    file: &Path,
+    key: &swc_ecma_ast::PropName,
+    locals: &HashMap<String, Option<Binding>>,
+) -> Option<String> {
     match key {
+        swc_ecma_ast::PropName::Computed(c) if reads_any(&c.expr, locals) => None,
         swc_ecma_ast::PropName::Computed(c) => crate::constval::string(project, file, &c.expr),
         key => Some(prop_name_text(key)).filter(|k| !k.is_empty()),
     }
 }
 
 /// Whether every key of an object literal can be named.
-fn keys_known(project: &Project, file: &Path, o: &swc_ecma_ast::ObjectLit) -> bool {
+fn keys_known(
+    project: &Project,
+    file: &Path,
+    o: &swc_ecma_ast::ObjectLit,
+    locals: &HashMap<String, Option<Binding>>,
+) -> bool {
     o.props.iter().all(|p| match p {
         PropOrSpread::Prop(p) => match &**p {
-            Prop::KeyValue(kv) => key_text(project, file, &kv.key).is_some(),
-            Prop::Method(m) => key_text(project, file, &m.key).is_some(),
-            Prop::Getter(g) => key_text(project, file, &g.key).is_some(),
-            Prop::Setter(s) => key_text(project, file, &s.key).is_some(),
+            Prop::KeyValue(kv) => key_text(project, file, &kv.key, locals).is_some(),
+            Prop::Method(m) => key_text(project, file, &m.key, locals).is_some(),
+            Prop::Getter(g) => key_text(project, file, &g.key, locals).is_some(),
+            Prop::Setter(s) => key_text(project, file, &s.key, locals).is_some(),
             _ => true,
         },
         PropOrSpread::Spread(_) => true,
@@ -947,10 +1023,13 @@ fn object_member(
     file: &Path,
     o: &swc_ecma_ast::ObjectLit,
     key: &str,
+    locals: &HashMap<String, Option<Binding>>,
 ) -> Option<Expr> {
     o.props.iter().rev().find_map(|p| match p {
         PropOrSpread::Prop(p) => match &**p {
-            Prop::KeyValue(kv) if key_text(project, file, &kv.key).as_deref() == Some(key) => {
+            Prop::KeyValue(kv)
+                if key_text(project, file, &kv.key, locals).as_deref() == Some(key) =>
+            {
                 Some((*kv.value).clone())
             }
             Prop::Shorthand(id) if id.sym == key => Some(Expr::Ident(id.clone())),
@@ -1070,9 +1149,14 @@ fn class_fields(chain: &[(PathBuf, Class)]) -> HashMap<String, Declared> {
                 }
                 ClassMember::Constructor(c) => {
                     for p in &c.params {
-                        if let ParamOrTsParamProp::TsParamProp(p) = p
-                            && let TsParamPropParam::Ident(i) = &p.param
-                        {
+                        let ident = match p {
+                            ParamOrTsParamProp::TsParamProp(p) => match &p.param {
+                                TsParamPropParam::Ident(i) => Some(i),
+                                TsParamPropParam::Assign(a) => a.left.as_ident(),
+                            },
+                            ParamOrTsParamProp::Param(_) => None,
+                        };
+                        if let Some(i) = ident {
                             fields
                                 .entry(i.id.sym.to_string())
                                 .or_insert_with(|| declared(i.type_ann.as_deref(), i.id.optional));
@@ -1170,6 +1254,13 @@ impl Visit for MemberScan {
             self.declarator(d, constant);
         }
         v.visit_children_with(self);
+    }
+
+    fn visit_catch_clause(&mut self, c: &swc_ecma_ast::CatchClause) {
+        if let Some(p) = &c.param {
+            self.bind_pat(p);
+        }
+        c.visit_children_with(self);
     }
 
     fn visit_fn_decl(&mut self, f: &swc_ecma_ast::FnDecl) {
@@ -1616,7 +1707,7 @@ mod tests {
                     }
                 ] }),
                 &json!({ "x-unresolved": "{ ...this.many }" }),
-                &json!({ "type": "object" }),
+                &json!({ "type": "object", "maxProperties": 0 }),
                 &json!({ "x-unresolved": "pick(1)" }),
                 &json!({ "x-unresolved": "this.own(1)" }),
             ]
@@ -1797,6 +1888,90 @@ mod tests {
                 "Listener.other: cannot evaluate its MessagePattern pattern; it is left out",
                 "BooksService.send: cannot evaluate the channel of a `emit` call; it is left out",
             ]
+        );
+    }
+
+    #[test]
+    fn optional_operands_and_calls_may_be_undefined() {
+        crate::diag::take_warnings();
+        let service = "import { BookDto, Envelope } from './events';\n\
+            const KEY = 'id';\n\
+            export function note(): string | undefined { return undefined; }\n\
+            export class BooksService {\n\
+              constructor(private client?: ClientProxy, private other: ClientProxy = make()) {}\n\
+              async envelope(): Promise<Envelope<BookDto>> { return null as any; }\n\
+              async send(book: BookDto | undefined, KEY: string) {\n\
+                this.client.emit('lone', { ...book });\n\
+                this.other.emit('mixed', { ...book, extra: 1 });\n\
+                this.client.emit('call', { note: note(), list: [note()] });\n\
+                this.client.emit('awaited', await this.envelope());\n\
+                this.client.emit('shadowed_key', { id: 'a', [KEY]: 1 });\n\
+                try {} catch (TOPIC) { this.client.emit(TOPIC as string, 1); }\n\
+              }\n\
+            }\n\
+            const TOPIC = 'books';";
+        let asyncapi = AsyncApi {
+            payload_wrappers: vec!["Envelope".into()],
+            ..AsyncApi::default()
+        };
+        let (events, _) = extract(
+            "optional-operands",
+            &[("events.ts", EVENTS), ("books.service.ts", service)],
+            asyncapi,
+        );
+        let ops: Vec<(&str, &Value)> = events
+            .iter()
+            .map(|e| (e.channel.as_str(), &e.payload))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                (
+                    "lone",
+                    &json!({ "anyOf": [
+                        { "$ref": "#/components/schemas/BookDto" },
+                        { "type": "object", "maxProperties": 0 }
+                    ] })
+                ),
+                (
+                    "mixed",
+                    &json!({
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "title": { "type": "string" },
+                            "extra": { "type": "number" }
+                        },
+                        "required": ["extra"]
+                    })
+                ),
+                (
+                    "call",
+                    &json!({
+                        "type": "object",
+                        "properties": {
+                            "note": { "type": "string" },
+                            "list": {
+                                "type": "array",
+                                "items": { "anyOf": [{ "type": "null" }, { "type": "string" }] }
+                            }
+                        },
+                        "required": ["list"]
+                    })
+                ),
+                (
+                    "awaited",
+                    &json!({ "$ref": "#/components/schemas/BookDto" })
+                ),
+                (
+                    "shadowed_key",
+                    &json!({ "x-unresolved": "{ id: 'a', [KEY]: 1 }" })
+                ),
+            ]
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["BooksService.send: cannot evaluate the channel of a `emit` call; it is left out"]
         );
     }
 }

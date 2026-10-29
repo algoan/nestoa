@@ -261,6 +261,12 @@ fn main() -> Result<()> {
     );
 
     if let Some((asyncapi, events, components)) = events {
+        if same_file(&project_root, &cfg.output, &asyncapi.output) {
+            anyhow::bail!(
+                "the AsyncAPI document would overwrite the OpenAPI one at {}; set a different asyncapi.output",
+                output_path.display()
+            );
+        }
         let doc = to_asyncapi(&cfg, asyncapi, &events, components);
         let output_path = write_document(
             &project_root,
@@ -317,6 +323,25 @@ fn nothing_found(routes: usize, events: Option<usize>) -> Option<&'static str> {
     }
 }
 
+/// Whether two outputs, relative to the project when relative, are one file.
+fn same_file(project_root: &std::path::Path, a: &std::path::Path, b: &std::path::Path) -> bool {
+    // Lexically, since neither file need exist yet.
+    let resolve = |p: &std::path::Path| {
+        let mut out = PathBuf::new();
+        for c in project_root.join(p).components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                c => out.push(c),
+            }
+        }
+        out
+    };
+    resolve(a) == resolve(b)
+}
+
 /// Write `doc` to `output`, relative to the project when relative, and return
 /// the path written.
 fn write_document(
@@ -359,6 +384,26 @@ fn plural(n: usize, noun: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outputs_naming_one_file_are_detected() {
+        let root = std::env::temp_dir();
+        assert!(same_file(
+            &root,
+            "api.json".as_ref(),
+            &root.join("api.json")
+        ));
+        assert!(same_file(
+            &root,
+            "a/../api.json".as_ref(),
+            "api.json".as_ref()
+        ));
+        assert!(!same_file(
+            &root,
+            "api.json".as_ref(),
+            "events.json".as_ref()
+        ));
+    }
 
     #[test]
     fn an_event_only_service_is_not_reported_empty() {
