@@ -383,16 +383,12 @@ impl<'a> EventExtractor<'a> {
         let Callee::Expr(callee) = &call.callee else {
             return None;
         };
-        let Expr::Member(member) = crate::constval::unwrap(callee) else {
-            return None;
-        };
+        let member = as_member(callee)?;
         let MemberProp::Ident(method) = &member.prop else {
             return None;
         };
         let receiver_type = || {
-            let Expr::Member(field) = crate::constval::unwrap(&member.obj) else {
-                return None;
-            };
+            let field = as_member(&member.obj)?;
             if !matches!(&*field.obj, Expr::This(_)) {
                 return None;
             }
@@ -423,6 +419,15 @@ impl<'a> EventExtractor<'a> {
             .and_then(|i| call.type_args.as_ref()?.params.get(i))
         {
             return self.type_schema(file, ty, true);
+        }
+        // A spread argument supplies positions that are not known.
+        if call
+            .args
+            .iter()
+            .take(publisher.payload + 1)
+            .any(|a| a.spread.is_some())
+        {
+            return json!({ "x-unresolved": "...arguments" });
         }
         let Some(arg) = call.args.get(publisher.payload) else {
             return Value::Null;
@@ -499,8 +504,24 @@ impl<'a> EventExtractor<'a> {
                 swc_ecma_ast::OptChainBase::Call(_) => self.unresolved_expr(file, expr),
             },
             Expr::New(n) => match crate::constval::dotted_name(&n.callee) {
+                Some(_) if reads_any(&n.callee, scope.locals) => self.unresolved_expr(file, expr),
                 Some(name) if name == "Date" => self.schema_ctx().initializer_schema(file, expr),
-                Some(name) => self.schema_ctx().named_type_to_schema(file, &name),
+                Some(_) => match (&*n.callee, &n.type_args) {
+                    (_, None) => {
+                        let name = crate::constval::dotted_name(&n.callee).unwrap_or_default();
+                        self.schema_ctx().named_type_to_schema(file, &name)
+                    }
+                    // `new Box<number>(1)`: the type argument written is kept.
+                    (Expr::Ident(id), Some(args)) => {
+                        let ty = TsType::TsTypeRef(swc_ecma_ast::TsTypeRef {
+                            span: n.span,
+                            type_name: TsEntityName::Ident(id.clone()),
+                            type_params: Some(args.clone()),
+                        });
+                        self.schema_ctx().ts_type_to_schema(file, &ty)
+                    }
+                    _ => self.unresolved_expr(file, expr),
+                },
                 None => self.unresolved_expr(file, expr),
             },
             Expr::Call(c) => {
@@ -612,14 +633,7 @@ impl<'a> EventExtractor<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Value {
-        let key = match prop {
-            MemberProp::Ident(i) => Some(i.sym.to_string()),
-            MemberProp::Computed(c) => match crate::constval::unwrap(&c.expr) {
-                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-                _ => None,
-            },
-            MemberProp::PrivateName(_) => None,
-        };
+        let key = member_key(prop);
         // An enum member in a mutable position widens to its enum.
         if let Some(owner) = crate::constval::dotted_name(obj)
             && !scope
@@ -759,6 +773,21 @@ impl<'a> EventExtractor<'a> {
         Value::Object(object)
     }
 
+    /// The type a local or field `expr` is declared with, with its file.
+    fn declared_of(&self, file: &Path, expr: &Expr, scope: &Scope) -> Option<(PathBuf, TsType)> {
+        match crate::constval::unwrap(expr) {
+            Expr::Ident(i) => match scope.locals.get(i.sym.as_ref()) {
+                Some(Some(Binding::Type(ty))) => Some((file.to_path_buf(), ty.clone())),
+                _ => None,
+            },
+            Expr::Member(m) if matches!(&*m.obj, Expr::This(_)) => match &m.prop {
+                MemberProp::Ident(name) => scope.fields.get(name.sym.as_ref())?.clone(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether `expr` may evaluate to `undefined`, which leaves the property
     /// holding it out of the message.
     fn may_be_undefined(&mut self, file: &Path, expr: &Expr, scope: &Scope, depth: usize) -> bool {
@@ -767,7 +796,13 @@ impl<'a> EventExtractor<'a> {
         }
         match expr {
             Expr::Paren(p) => self.may_be_undefined(file, &p.expr, scope, depth),
-            Expr::Await(a) => self.may_be_undefined(file, &a.arg, scope, depth),
+            Expr::Await(a) => match self.declared_of(file, &a.arg, scope) {
+                Some((decl_file, ty)) => {
+                    self.schema_ctx()
+                        .admits_undefined(&decl_file, awaited(&ty), 0)
+                }
+                None => self.may_be_undefined(file, &a.arg, scope, depth),
+            },
             Expr::TsSatisfies(s) => self.may_be_undefined(file, &s.expr, scope, depth),
             Expr::TsAs(a) => self.schema_ctx().admits_undefined(file, &a.type_ann, 0),
             Expr::Ident(i) if i.sym == "undefined" => true,
@@ -814,18 +849,19 @@ impl<'a> EventExtractor<'a> {
                         _ => false,
                     }
                 }
-                (obj, MemberProp::Ident(name)) => {
+                (obj, prop) => {
+                    let Some(name) = member_key(prop) else {
+                        return false;
+                    };
                     let object = self.expr_schema(file, obj, scope, depth + 1, false);
                     self.components.flatten(&object).is_some_and(|o| {
-                        o.get("properties")
-                            .is_some_and(|p| p.get(name.sym.as_ref()).is_some())
+                        o.get("properties").is_some_and(|p| p.get(&name).is_some())
                             && !o
                                 .get("required")
                                 .and_then(Value::as_array)
-                                .is_some_and(|r| r.iter().any(|k| k == name.sym.as_ref()))
+                                .is_some_and(|r| r.iter().any(|k| k == name.as_str()))
                     })
                 }
-                _ => false,
             },
             _ => false,
         }
@@ -889,6 +925,30 @@ fn object_pattern(project: &Project, file: &Path, expr: &Expr, depth: usize) -> 
         .map(|(k, v)| format!("\"{k}\":{v}"))
         .collect();
     Some(format!("{{{}}}", fields.join(",")))
+}
+
+/// The property `.b` or `['b']` names.
+fn member_key(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(i) => Some(i.sym.to_string()),
+        MemberProp::Computed(c) => match crate::constval::unwrap(&c.expr) {
+            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+            _ => None,
+        },
+        MemberProp::PrivateName(_) => None,
+    }
+}
+
+/// `a.b`, or `a?.b`.
+fn as_member(expr: &Expr) -> Option<&swc_ecma_ast::MemberExpr> {
+    match crate::constval::unwrap(expr) {
+        Expr::Member(m) => Some(m),
+        Expr::OptChain(o) => match &*o.base {
+            swc_ecma_ast::OptChainBase::Member(m) => Some(m),
+            swc_ecma_ast::OptChainBase::Call(_) => None,
+        },
+        _ => None,
+    }
 }
 
 /// Whether an object schema admits properties it does not name.
@@ -998,7 +1058,8 @@ fn key_text(
     }
 }
 
-/// Whether every key of an object literal can be named.
+/// Whether every entry of an object literal is a property whose key can be
+/// named, or a spread.
 fn keys_known(
     project: &Project,
     file: &Path,
@@ -1008,10 +1069,9 @@ fn keys_known(
     o.props.iter().all(|p| match p {
         PropOrSpread::Prop(p) => match &**p {
             Prop::KeyValue(kv) => key_text(project, file, &kv.key, locals).is_some(),
-            Prop::Method(m) => key_text(project, file, &m.key, locals).is_some(),
-            Prop::Getter(g) => key_text(project, file, &g.key, locals).is_some(),
-            Prop::Setter(s) => key_text(project, file, &s.key, locals).is_some(),
-            _ => true,
+            Prop::Shorthand(_) => true,
+            // Their values, and what they overwrite, are not inferred.
+            _ => false,
         },
         PropOrSpread::Spread(_) => true,
     })
@@ -1247,6 +1307,18 @@ impl Visit for MemberScan {
         c.visit_children_with(self);
     }
 
+    /// `a?.b(…)` and `a.b?.(…)`, as a plain call.
+    fn visit_opt_call(&mut self, c: &swc_ecma_ast::OptCall) {
+        self.calls.push(CallExpr {
+            span: c.span,
+            ctxt: c.ctxt,
+            callee: Callee::Expr(c.callee.clone()),
+            args: c.args.clone(),
+            type_args: c.type_args.clone(),
+        });
+        c.visit_children_with(self);
+    }
+
     fn visit_var_decl(&mut self, v: &swc_ecma_ast::VarDecl) {
         // A `let` or `var` may be reassigned: its initializer isn't its value.
         let constant = v.kind == swc_ecma_ast::VarDeclKind::Const;
@@ -1270,8 +1342,10 @@ impl Visit for MemberScan {
 
     fn visit_class_decl(&mut self, c: &swc_ecma_ast::ClassDecl) {
         self.bind(c.ident.sym.to_string(), None);
-        c.visit_children_with(self);
     }
+
+    /// A nested class has its own `this`, whose fields are not read.
+    fn visit_class(&mut self, _: &Class) {}
 
     fn visit_param(&mut self, p: &swc_ecma_ast::Param) {
         self.bind_pat(&p.pat);
@@ -1972,6 +2046,67 @@ mod tests {
         assert_eq!(
             crate::diag::take_warnings(),
             ["BooksService.send: cannot evaluate the channel of a `emit` call; it is left out"]
+        );
+    }
+
+    #[test]
+    fn optional_calls_nested_classes_and_constructors() {
+        let service = "import { BookDto } from './events';\n\
+            export class Box<T = string> { constructor(public value: T) {} }\n\
+            export class Draft { subtitle?: string; }\n\
+            export class BooksService {\n\
+              constructor(private client: ClientProxy) {}\n\
+              async send(args: [BookDto], draft: Draft, p: Promise<string | undefined>) {\n\
+                this.client?.emit('optional_receiver', 1);\n\
+                this.client.emit?.('optional_call', 1);\n\
+                this.client.emit('spread_args', ...args);\n\
+                this.client.emit('typed_new', new Box<number>(1));\n\
+                class BookDto { count = 1; }\n\
+                this.client.emit('local_new', new BookDto());\n\
+                this.client.emit('bracket', { subtitle: draft['subtitle'], note: await p });\n\
+                this.client.emit('getter', { get id() { return 1; } });\n\
+                class Inner { client: EventEmitter; run() { this.client.emit('inner', 1); } }\n\
+              }\n\
+            }";
+        let (events, components) = extract(
+            "optional-calls",
+            &[("events.ts", EVENTS), ("books.service.ts", service)],
+            AsyncApi::default(),
+        );
+        let ops: Vec<(&str, &Value)> = events
+            .iter()
+            .map(|e| (e.channel.as_str(), &e.payload))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                ("optional_receiver", &json!({ "type": "number" })),
+                ("optional_call", &json!({ "type": "number" })),
+                ("spread_args", &json!({ "x-unresolved": "...arguments" })),
+                (
+                    "typed_new",
+                    &json!({ "$ref": "#/components/schemas/BoxNumber" })
+                ),
+                ("local_new", &json!({ "x-unresolved": "new BookDto()" })),
+                (
+                    "bracket",
+                    &json!({
+                        "type": "object",
+                        "properties": {
+                            "subtitle": { "type": "string" },
+                            "note": { "type": "string" }
+                        }
+                    })
+                ),
+                (
+                    "getter",
+                    &json!({ "x-unresolved": "{ get id() { return 1; } }" })
+                ),
+            ]
+        );
+        assert_eq!(
+            components.schemas["BoxNumber"]["properties"]["value"],
+            json!({ "type": "number" })
         );
     }
 }

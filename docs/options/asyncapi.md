@@ -100,11 +100,13 @@ types reach:
   property whose value may be `undefined` (`book.subtitle?`, `x: T | undefined`) is optional, a lone
   `{ ...x }` copies an object `x` (or is `{}` when `x` may be `undefined`), a call is `undefined`
   when its declared return type admits it, and an `undefined` array element is `null`. An object with a key
-  that cannot be evaluated, or with a spread of a dictionary (`Record<string, T>`), is unresolved: it
+  that cannot be evaluated, a method or accessor, or with a spread of a dictionary (`Record<string, T>`), is unresolved: it
   may override any property.
 
 `this` is the instance: static fields and methods are not read. A name the member declares (a
 parameter, a destructured variable, a local function or class) shadows a module one of that name.
+Optional calls (`this.client?.emit(…)`) publish too; calls in a nested class do not, since its
+`this` is another object. A spread argument at or before the payload leaves it unresolved.
 
 `payloadWrappers` only apply to the whole payload: an envelope nested in it is documented as is.
 
