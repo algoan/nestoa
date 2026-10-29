@@ -320,7 +320,9 @@ impl<'a> EventExtractor<'a> {
                 let Some(arg) = call.args.get(publisher.channel) else {
                     continue;
                 };
-                let Some(channel) = crate::constval::string(self.project, file, &arg.expr) else {
+                let Some(channel) = object_pattern(self.project, file, &arg.expr)
+                    .or_else(|| crate::constval::string(self.project, file, &arg.expr))
+                else {
                     crate::diag::warn(format!(
                         "{handler}: cannot evaluate the channel of a `{}` call; it is left out",
                         publisher.method
@@ -1089,6 +1091,7 @@ mod tests {
               create(book: BookDto) {\n\
                 this.client.emit<void, BookDto>('book_created', book);\n\
                 this.client.send('book_count', { shelf: 'a' });\n\
+                this.client.send({ cmd: 'sum' }, [1, 2]);\n\
                 this.bus.emit('in_process', book);\n\
               }\n\
             }";
@@ -1115,6 +1118,10 @@ mod tests {
                         "properties": { "shelf": { "type": "string" } },
                         "required": ["shelf"]
                     })
+                ),
+                (
+                    r#"{"cmd":"sum"}"#,
+                    &json!({ "type": "array", "items": { "type": "number" } })
                 ),
             ]
         );
