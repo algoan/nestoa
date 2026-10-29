@@ -1878,11 +1878,15 @@ impl<'a> SchemaCtx<'a> {
                                 obj.insert("type".into(), json!(types));
                             }
                         }
-                        if !values.is_empty() {
-                            obj.insert(
-                                "enum".into(),
-                                Value::Array(values.iter().map(enum_value_json).collect()),
-                            );
+                        // Members may share a value, which `enum` lists once.
+                        let mut unique: Vec<Value> = Vec::new();
+                        for v in values.iter().map(enum_value_json) {
+                            if !unique.contains(&v) {
+                                unique.push(v);
+                            }
+                        }
+                        if !unique.is_empty() {
+                            obj.insert("enum".into(), Value::Array(unique));
                         }
                     }
                     // A member whose value nestoa cannot compute: listing the
@@ -3268,6 +3272,21 @@ mod tests {
         .unwrap();
         assert_eq!(ambient, json!({ "x-unresolved": "Ambient" }));
         assert_eq!(constant, json!({ "type": "number", "enum": [1, 2] }));
+    }
+
+    #[test]
+    fn enum_members_sharing_a_value_list_it_once() {
+        let [format] = lower_all(
+            "export enum Format { HARDCOVER = 'print', PAPERBACK = 'print', EBOOK = 'digital' }",
+            "export { Format } from './dto';",
+            &["Format"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            format,
+            json!({ "type": "string", "enum": ["print", "digital"] })
+        );
     }
 
     #[test]
@@ -4772,7 +4791,7 @@ mod tests {
         .unwrap();
         assert_eq!(flags["enum"], json!([0, 1, 2, 3, 4, -1]));
         assert_eq!(aliases["type"], json!(["string", "number"]));
-        assert_eq!(aliases["enum"], json!(["first", "first", 3, 4]));
+        assert_eq!(aliases["enum"], json!(["first", 3, 4]));
     }
 
     #[test]
