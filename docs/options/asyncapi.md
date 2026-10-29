@@ -38,7 +38,8 @@ object pattern (`{ cmd: 'sum' }`) is the address NestJS matches it by, its keys 
 `{"cmd":"sum"}`. A pattern nestoa cannot evaluate is a warning, and the handler is left out.
 
 The message payload is the type of the `@Payload()` parameter. Several `@Payload('key')` parameters
-form an object of those properties. Without `@Payload`, it is the first undecorated parameter, as
+form an object of those properties, required unless the parameter is optional (`?`, a default, or a
+type admitting `undefined`). Without `@Payload`, it is the first undecorated parameter, as
 NestJS passes it.
 
 ```ts
@@ -77,7 +78,10 @@ The default is NestJS's `ClientProxy.emit(pattern, data)` and `send(pattern, dat
 `ClientProxy` type (`ClientKafka`, `ClientRMQ`, … included), with the payload from the second type
 argument. Setting `publishers` replaces the list; repeat those entries to keep them.
 
-A channel that cannot be evaluated is a warning, and the call is left out.
+A channel that cannot be evaluated is a warning, and the call is left out. So is one reading a
+parameter or variable of the member, which shadows a module constant of the same name. An object
+pattern may also be a constant (`const SUM = { cmd: 'sum' }`), for handlers too. With
+`payloadProperty`, an object with a spread is `x-unresolved`: the spread may supply the property.
 
 ### Inferred payloads
 
@@ -85,14 +89,16 @@ Without the type argument, the payload's type is inferred from the expression, a
 types reach:
 
 - literals and templates, `x as T`, `<T>x`, `new T()`;
-- a parameter, a variable or a field (`this.x`) declared with a type, or a variable initialised with
-  any of these;
+- a parameter, a variable or a field (`this.x`) declared with a type, or a `const` initialised with
+  any of these (a `let` or `var` may be reassigned, so its initializer is not followed);
 - a property of one of those (`book.id`), and an enum member, as its enum;
 - a parameter property, an inherited field (a receiver of `receiverTypes` too) or method;
 - a call to a function, a `const` arrow function or a method of the class declared with a return
   type (`Promise` unwrapped), when every overload declares the same one;
 - object and array literals of the above, `await`, `a ? b : c`. A later property or spread replaces
-  an earlier one, as in JavaScript, and an `undefined` array element is `null`.
+  an earlier one, as in JavaScript (an optional spread property may also leave the earlier one), a
+  property whose value may be `undefined` (`book.subtitle?`, `x: T | undefined`) is optional, a lone
+  `{ ...x }` copies an object `x`, and an `undefined` array element is `null`.
 
 `payloadWrappers` only apply to the whole payload: an envelope nested in it is documented as is.
 

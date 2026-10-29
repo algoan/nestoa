@@ -163,7 +163,7 @@ impl<'a> EventExtractor<'a> {
             return;
         };
         let Some(channels) = first_arg(pattern).and_then(|e| {
-            object_pattern(self.project, file, e)
+            object_pattern(self.project, file, e, 0)
                 .map(|p| vec![p])
                 .or_else(|| crate::constval::strings(self.project, file, e))
         }) else {
@@ -211,6 +211,7 @@ impl<'a> EventExtractor<'a> {
                     let required_key = Value::String(key.clone());
                     if !matches!(&p.pat, Pat::Ident(i) if i.optional)
                         && !matches!(&p.pat, Pat::Assign(_))
+                        && !self.pat_admits_undefined(file, &p.pat)
                         && !required.contains(&required_key)
                     {
                         required.push(required_key);
@@ -237,6 +238,16 @@ impl<'a> EventExtractor<'a> {
             Some(p) if p.decorators.is_empty() => self.param_schema(file, &p.pat, true),
             _ => Value::Null,
         }
+    }
+
+    /// Whether a parameter's declared type admits `undefined`.
+    fn pat_admits_undefined(&mut self, file: &Path, pat: &Pat) -> bool {
+        let Pat::Ident(i) = pat else {
+            return false;
+        };
+        i.type_ann
+            .as_ref()
+            .is_some_and(|t| self.schema_ctx().admits_undefined(file, &t.type_ann, 0))
     }
 
     fn param_schema(&mut self, file: &Path, pat: &Pat, root: bool) -> Value {
@@ -334,8 +345,12 @@ impl<'a> EventExtractor<'a> {
                 let Some(arg) = call.args.get(publisher.channel) else {
                     continue;
                 };
-                let Some(channel) = object_pattern(self.project, file, &arg.expr)
-                    .or_else(|| crate::constval::string(self.project, file, &arg.expr))
+                let Some(channel) = (!reads_any(&arg.expr, scope.locals))
+                    .then(|| {
+                        object_pattern(self.project, file, &arg.expr, 0)
+                            .or_else(|| crate::constval::string(self.project, file, &arg.expr))
+                    })
+                    .flatten()
                 else {
                     crate::diag::warn(format!(
                         "{handler}: cannot evaluate the channel of a `{}` call; it is left out",
@@ -417,6 +432,10 @@ impl<'a> EventExtractor<'a> {
         let expr = match &publisher.payload_property {
             None => (*arg.expr).clone(),
             Some(key) => match crate::constval::unwrap(&arg.expr) {
+                // A spread may supply or override the property.
+                Expr::Object(o) if o.props.iter().any(|p| matches!(p, PropOrSpread::Spread(_))) => {
+                    return self.unresolved_expr(file, &arg.expr);
+                }
                 Expr::Object(o) => match object_member(o, key) {
                     Some(e) => e,
                     None => return Value::Null,
@@ -615,14 +634,28 @@ impl<'a> EventExtractor<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Value {
-        // `{ ...x }` copies `x`, whatever its shape.
+        // `{ ...x }` copies an object `x`, whatever its shape.
         if let [PropOrSpread::Spread(s)] = o.props.as_slice() {
-            return self.expr_schema(file, &s.expr, scope, depth + 1, false);
+            let spread = self.expr_schema(file, &s.expr, scope, depth + 1, false);
+            if spread.is_null() {
+                return json!({ "type": "object" });
+            }
+            let objects = match spread.get("anyOf").and_then(Value::as_array) {
+                Some(branches) => branches
+                    .iter()
+                    .all(|b| self.components.flatten(b).is_some()),
+                None => self.components.flatten(&spread).is_some(),
+            };
+            return if objects {
+                spread
+            } else {
+                self.unresolved_expr(file, &Expr::Object(o.clone()))
+            };
         }
         let mut properties = Map::new();
         let mut required: Vec<String> = Vec::new();
         for prop in &o.props {
-            let (key, schema) = match prop {
+            let (key, schema, absent) = match prop {
                 PropOrSpread::Spread(s) => {
                     let spread = self.expr_schema(file, &s.expr, scope, depth + 1, false);
                     if spread.is_null() {
@@ -638,11 +671,21 @@ impl<'a> EventExtractor<'a> {
                         .unwrap_or_default();
                     if let Some(Value::Object(props)) = spread.get("properties") {
                         for (key, schema) in props {
-                            properties.insert(key.clone(), schema.clone());
-                            required.retain(|k| k != key.as_str());
                             if spread_required.contains(&key.as_str()) {
-                                required.push(key.clone());
+                                properties.insert(key.clone(), schema.clone());
+                                if !required.contains(key) {
+                                    required.push(key.clone());
+                                }
+                                continue;
                             }
+                            // An optional property may leave the earlier one.
+                            let merged = match properties.get(key) {
+                                Some(earlier) if earlier != schema => {
+                                    json!({ "anyOf": [earlier, schema] })
+                                }
+                                _ => schema.clone(),
+                            };
+                            properties.insert(key.clone(), merged);
                         }
                     }
                     continue;
@@ -651,11 +694,16 @@ impl<'a> EventExtractor<'a> {
                     Prop::KeyValue(kv) => (
                         prop_name_text(&kv.key),
                         self.expr_schema(file, &kv.value, scope, depth + 1, false),
+                        self.may_be_undefined(file, &kv.value, scope, depth + 1),
                     ),
-                    Prop::Shorthand(id) => (
-                        id.sym.to_string(),
-                        self.expr_schema(file, &Expr::Ident(id.clone()), scope, depth + 1, false),
-                    ),
+                    Prop::Shorthand(id) => {
+                        let value = Expr::Ident(id.clone());
+                        (
+                            id.sym.to_string(),
+                            self.expr_schema(file, &value, scope, depth + 1, false),
+                            self.may_be_undefined(file, &value, scope, depth + 1),
+                        )
+                    }
                     _ => continue,
                 },
             };
@@ -667,7 +715,9 @@ impl<'a> EventExtractor<'a> {
                 properties.shift_remove(&key);
                 continue;
             }
-            required.push(key.clone());
+            if !absent {
+                required.push(key.clone());
+            }
             properties.insert(key, schema);
         }
         // Required in the order the properties come.
@@ -681,6 +731,56 @@ impl<'a> EventExtractor<'a> {
             object.insert("required".into(), json!(required));
         }
         Value::Object(object)
+    }
+
+    /// Whether `expr` may evaluate to `undefined`, which leaves the property
+    /// holding it out of the message.
+    fn may_be_undefined(&mut self, file: &Path, expr: &Expr, scope: &Scope, depth: usize) -> bool {
+        if depth > MAX_INFERENCE_DEPTH {
+            return false;
+        }
+        match expr {
+            Expr::Paren(p) => self.may_be_undefined(file, &p.expr, scope, depth),
+            Expr::Await(a) => self.may_be_undefined(file, &a.arg, scope, depth),
+            Expr::TsSatisfies(s) => self.may_be_undefined(file, &s.expr, scope, depth),
+            Expr::TsAs(a) => self.schema_ctx().admits_undefined(file, &a.type_ann, 0),
+            Expr::Ident(i) if i.sym == "undefined" => true,
+            Expr::Ident(i) => match scope.locals.get(i.sym.as_ref()) {
+                Some(Some(Binding::Type(ty))) => self.schema_ctx().admits_undefined(file, ty, 0),
+                Some(Some(Binding::Init(init))) => {
+                    self.may_be_undefined(file, init, scope, depth + 1)
+                }
+                _ => false,
+            },
+            Expr::Cond(c) => {
+                self.may_be_undefined(file, &c.cons, scope, depth + 1)
+                    || self.may_be_undefined(file, &c.alt, scope, depth + 1)
+            }
+            Expr::OptChain(_) => true,
+            Expr::Member(m) => match (&*m.obj, &m.prop) {
+                (Expr::This(_), MemberProp::Ident(name)) => {
+                    match scope.fields.get(name.sym.as_ref()) {
+                        Some(Some((decl_file, ty))) => {
+                            self.schema_ctx().admits_undefined(decl_file, ty, 0)
+                        }
+                        _ => false,
+                    }
+                }
+                (obj, MemberProp::Ident(name)) => {
+                    let object = self.expr_schema(file, obj, scope, depth + 1, false);
+                    self.components.flatten(&object).is_some_and(|o| {
+                        o.get("properties")
+                            .is_some_and(|p| p.get(name.sym.as_ref()).is_some())
+                            && !o
+                                .get("required")
+                                .and_then(Value::as_array)
+                                .is_some_and(|r| r.iter().any(|k| k == name.sym.as_ref()))
+                    })
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// An expression whose type is not inferred, marked with its source text.
@@ -702,9 +802,18 @@ impl<'a> EventExtractor<'a> {
 
 /// The route NestJS matches an object pattern by: its keys sorted, values
 /// written as JSON (`{ cmd: 'sum' }` is `{"cmd":"sum"}`).
-fn object_pattern(project: &Project, file: &Path, expr: &Expr) -> Option<String> {
-    let Expr::Object(o) = crate::constval::unwrap(expr) else {
+fn object_pattern(project: &Project, file: &Path, expr: &Expr, depth: usize) -> Option<String> {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
         return None;
+    }
+    let o = match crate::constval::unwrap(expr) {
+        Expr::Object(o) => o,
+        Expr::Ident(i) => {
+            let (decl_file, c) = project.resolve_const(file, &i.sym)?;
+            return object_pattern(project, &decl_file, c.init(), depth + 1);
+        }
+        _ => return None,
     };
     let mut entries = Vec::new();
     for prop in &o.props {
@@ -715,7 +824,7 @@ fn object_pattern(project: &Project, file: &Path, expr: &Expr) -> Option<String>
             return None;
         };
         let key = prop_name_text(&kv.key);
-        let value = match object_pattern(project, file, &kv.value) {
+        let value = match object_pattern(project, file, &kv.value, depth + 1) {
             Some(nested) => nested,
             None => match crate::constval::value(project, file, &kv.value)? {
                 crate::symbols::EnumValue::Str(s) => format!("\"{s}\""),
@@ -732,6 +841,19 @@ fn object_pattern(project: &Project, file: &Path, expr: &Expr) -> Option<String>
         .map(|(k, v)| format!("\"{k}\":{v}"))
         .collect();
     Some(format!("{{{}}}", fields.join(",")))
+}
+
+/// Whether `expr` reads any of `locals`, which shadow the module's names.
+fn reads_any(expr: &Expr, locals: &HashMap<String, Option<Binding>>) -> bool {
+    struct Reads<'l>(&'l HashMap<String, Option<Binding>>, bool);
+    impl Visit for Reads<'_> {
+        fn visit_ident(&mut self, i: &swc_ecma_ast::Ident) {
+            self.1 |= self.0.contains_key(i.sym.as_ref());
+        }
+    }
+    let mut reads = Reads(locals, false);
+    expr.visit_with(&mut reads);
+    reads.1
 }
 
 /// `ty` with every `wrappers` envelope around it replaced by its first type
@@ -909,6 +1031,17 @@ struct MemberScan {
 }
 
 impl MemberScan {
+    fn declarator(&mut self, d: &VarDeclarator, constant: bool) {
+        if let Pat::Ident(i) = &d.name {
+            let binding = match (&i.type_ann, &d.init) {
+                (Some(t), _) => Some(Binding::Type((*t.type_ann).clone())),
+                (None, Some(init)) if constant => Some(Binding::Init((**init).clone())),
+                _ => None,
+            };
+            self.bind(i.id.sym.to_string(), binding);
+        }
+    }
+
     fn bind(&mut self, name: String, binding: Option<Binding>) {
         self.bindings
             .entry(name)
@@ -936,16 +1069,13 @@ impl Visit for MemberScan {
         c.visit_children_with(self);
     }
 
-    fn visit_var_declarator(&mut self, d: &VarDeclarator) {
-        if let Pat::Ident(i) = &d.name {
-            let binding = match (&i.type_ann, &d.init) {
-                (Some(t), _) => Some(Binding::Type((*t.type_ann).clone())),
-                (None, Some(init)) => Some(Binding::Init((**init).clone())),
-                (None, None) => None,
-            };
-            self.bind(i.id.sym.to_string(), binding);
+    fn visit_var_decl(&mut self, v: &swc_ecma_ast::VarDecl) {
+        // A `let` or `var` may be reassigned: its initializer isn't its value.
+        let constant = v.kind == swc_ecma_ast::VarDeclKind::Const;
+        for d in &v.decls {
+            self.declarator(d, constant);
         }
-        d.visit_children_with(self);
+        v.visit_children_with(self);
     }
 
     fn visit_param(&mut self, p: &swc_ecma_ast::Param) {
@@ -1340,11 +1470,14 @@ mod tests {
             export function pick(x: unknown): unknown { return x; }\n\
             export class BooksService {\n\
               constructor(private client: ClientProxy) {}\n\
-              private either: BookDto | string;\n\
+              private either: BookDto | { extra: string };\n\
+              private many: BookDto[];\n\
               send(book: BookDto) {\n\
                 this.client.emit('array', [1, undefined, , 2]);\n\
                 this.client.emit('spread', { id: 1, ...book, title: 2, extra: undefined });\n\
                 this.client.emit('copy', { ...this.either });\n\
+                this.client.emit('copy_array', { ...this.many });\n\
+                this.client.emit('copy_undefined', { ...undefined });\n\
                 this.client.emit('overloaded', pick(1));\n\
                 this.client.emit('method', this.own(1));\n\
               }\n\
@@ -1370,10 +1503,110 @@ mod tests {
                     "properties": { "id": { "type": "string" }, "title": { "type": "number" } },
                     "required": ["id", "title"]
                 }),
-                &json!({ "anyOf": [{ "$ref": "#/components/schemas/BookDto" }, { "type": "string" }] }),
+                &json!({ "anyOf": [
+                    { "$ref": "#/components/schemas/BookDto" },
+                    {
+                        "type": "object",
+                        "properties": { "extra": { "type": "string" } },
+                        "required": ["extra"]
+                    }
+                ] }),
+                &json!({ "x-unresolved": "{ ...this.many }" }),
+                &json!({ "type": "object" }),
                 &json!({ "x-unresolved": "pick(1)" }),
                 &json!({ "x-unresolved": "this.own(1)" }),
             ]
+        );
+    }
+
+    #[test]
+    fn properties_that_may_be_undefined_are_optional() {
+        crate::diag::take_warnings();
+        let controller = "@Controller()\n\
+            export class Listener {\n\
+              @EventPattern(PATTERN) on(@Payload('id') id: string, @Payload('note') note: string | undefined) {}\n\
+            }\n\
+            const PATTERN = { cmd: 'note' };";
+        let service = "export class Draft { subtitle?: string; title: string; count?: string; }\n\
+            const TOPIC = 'books';\n\
+            export class BooksService {\n\
+              constructor(private client: ClientProxy, private events: EventsClient) {}\n\
+              send(draft: Draft, maybe: string | undefined) {\n\
+                this.client.emit('optional', { subtitle: draft.subtitle, title: draft.title, maybe });\n\
+                this.client.emit('fallback', { subtitle: 'none', count: 1, ...draft });\n\
+                let later = undefined;\n\
+                later = draft;\n\
+                this.client.emit('reassigned', later);\n\
+                this.events.publish('spread', { data: draft, ...{ data: 2 } });\n\
+                this.client.send(PATTERN, 1);\n\
+              }\n\
+              shadowed(TOPIC: string, draft: Draft) {\n\
+                this.client.emit(TOPIC, draft);\n\
+              }\n\
+            }\n\
+            const PATTERN = { cmd: 'note' };";
+        let asyncapi = AsyncApi {
+            publishers: [publisher("publish")]
+                .into_iter()
+                .chain(AsyncApi::default().publishers)
+                .collect(),
+            ..AsyncApi::default()
+        };
+        let (events, _) = extract(
+            "optional",
+            &[("listener.ts", controller), ("books.service.ts", service)],
+            asyncapi,
+        );
+        let ops: Vec<(&str, &Value)> = events
+            .iter()
+            .map(|e| (e.channel.as_str(), &e.payload))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                (
+                    r#"{"cmd":"note"}"#,
+                    &json!({
+                        "type": "object",
+                        "properties": { "id": { "type": "string" }, "note": { "type": "string" } },
+                        "required": ["id"]
+                    })
+                ),
+                (
+                    "optional",
+                    &json!({
+                        "type": "object",
+                        "properties": {
+                            "subtitle": { "type": "string" },
+                            "title": { "type": "string" },
+                            "maybe": { "type": "string" }
+                        },
+                        "required": ["title"]
+                    })
+                ),
+                (
+                    "fallback",
+                    &json!({
+                        "type": "object",
+                        "properties": {
+                            "subtitle": { "type": "string" },
+                            "count": { "anyOf": [{ "type": "number" }, { "type": "string" }] },
+                            "title": { "type": "string" }
+                        },
+                        "required": ["subtitle", "count", "title"]
+                    })
+                ),
+                ("reassigned", &json!({ "x-unresolved": "later" })),
+                (
+                    "spread",
+                    &json!({ "x-unresolved": "{ data: draft, ...{ data: 2 } }" })
+                ),
+                (r#"{"cmd":"note"}"#, &json!({ "type": "number" })),
+            ]
+        );
+        assert_eq!(
+            crate::diag::take_warnings(),
+            ["BooksService.shadowed: cannot evaluate the channel of a `emit` call; it is left out"]
         );
     }
 }

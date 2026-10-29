@@ -1501,7 +1501,7 @@ impl<'a> SchemaCtx<'a> {
 
     /// Whether a property's declared type admits `undefined`, directly or
     /// through type aliases, which makes it optional on the wire like a `?`.
-    fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+    pub(crate) fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
         self.admits_undefined_in(self.type_env.as_ref(), file, ty, depth)
     }
 
