@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Build helper invoked from CI: takes a target triple + a path to a freshly
-// built `nestoa` binary and produces an `@nestoa/<tag>` npm package ready to
+// built `nestoa` binary and produces an `@algoan/nestoa-<tag>` npm package ready to
 // publish. Run once per target the release matrix builds for.
 //
 // Usage:
@@ -41,7 +41,7 @@ function main() {
   const version = require("./nestoa/package.json").version;
 
   const pkg = {
-    name: `@nestoa/${tag}`,
+    name: `@algoan/nestoa-${tag}`,
     version,
     description: `Prebuilt nestoa binary for ${tag}`,
     license: "MIT",
@@ -63,7 +63,7 @@ function main() {
   fs.chmodSync(dest, 0o755);
   fs.writeFileSync(
     path.join(outDir, "README.md"),
-    `# @nestoa/${tag}\n\nPlatform-specific binary for nestoa. Installed automatically by the \`nestoa\` package on matching systems.\n`,
+    `# @algoan/nestoa-${tag}\n\nPlatform-specific binary for nestoa. Installed automatically by the \`nestoa\` package on matching systems.\n`,
   );
   console.log(`built ${pkg.name}@${version} -> ${outDir}`);
 }
