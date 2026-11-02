@@ -1,20 +1,27 @@
 name: Release
 
-# Publishes the platform binaries + the `nestoa` launcher to the GitHub
-# Packages npm registry (under the @algoan scope) on a version tag.
+# Builds the binary for every supported platform, publishes the npm packages to
+# npmjs.com (`nestoa`) and to GitHub Packages (`@algoan/nestoa`), tags the
+# released commit and creates the GitHub release with its notes and binaries.
 #
-#   git tag v0.1.0 && git push origin v0.1.0
-#
-# or trigger manually from the Actions tab (workflow_dispatch) with a version.
+# Run it from the Actions tab (workflow_dispatch) with a version, or push a
+# `v<version>` tag. Every publishing step skips what is already done, so a
+# failed run can be re-run.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (without leading v), e.g. 0.1.0"
+        description: "Version to release (without leading v), e.g. 0.3.0"
         required: true
         type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,9 +40,11 @@ jobs:
       - name: Resolve and validate version
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
@@ -47,13 +56,12 @@ jobs:
           fi
           # For manual runs, refuse to re-release a version that already has a
           # tag. (Tag pushes are exempt: the tag IS the trigger, so it exists.)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && \
              git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
             echo "::error::Tag v$VERSION already exists — version $VERSION has already been released. Bump the version."
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Release version validated: $VERSION"
 
   build:
     name: Build ${{ matrix.tag }}
@@ -63,19 +71,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The oldest supported Ubuntu, so that the binary runs on older glibc.
           - tag: linux-x64-gnu
             target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
           - tag: linux-arm64-gnu
             target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - tag: linux-x64-musl
+            target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            cross-linker: gcc-aarch64-linux-gnu
+            musl: true
+          - tag: linux-arm64-musl
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
           - tag: darwin-x64
             target: x86_64-apple-darwin
             os: macos-14-large
           - tag: darwin-arm64
             target: aarch64-apple-darwin
             os: macos-14
+          - tag: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            exe: .exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - uses: actions/checkout@v7
 
@@ -89,88 +114,152 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Stamp Cargo version
-        run: node npm/stamp-cargo-version.js "${{ needs.validate.outputs.version }}"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
 
-      - name: Install cross linker
-        if: matrix.cross-linker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.cross-linker }}
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Stamp Cargo version
+        run: node npm/stamp-cargo-version.js "$VERSION"
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --package nestoa
 
       - name: Package platform npm package
         working-directory: npm
-        run: node build-platform-packages.js ${{ matrix.tag }} ../target/${{ matrix.target }}/release/nestoa
+        run: node build-platform-packages.js ${{ matrix.tag }} ../target/${{ matrix.target }}/release/nestoa${{ matrix.exe }}
 
-      - name: Upload platform package
+      - name: Smoke test the npm packages
+        if: ${{ !matrix.musl }}
+        working-directory: npm
+        run: node smoke-test.js platforms/${{ matrix.tag }}
+
+      # npm only installs a musl package on a musl system.
+      - name: Smoke test the npm packages (Alpine)
+        if: matrix.musl
+        run: docker run --rm -v "$PWD:/repo" -w /repo/npm node:lts-alpine node smoke-test.js platforms/${{ matrix.tag }}
+
+      # upload-artifact drops file permissions: the tarballs keep the exec bit.
+      - name: Archive the platform package and the binary
+        run: |
+          mkdir dist
+          tar -cf "dist/platform-${{ matrix.tag }}.tar" -C npm/platforms "${{ matrix.tag }}"
+          tar -czf "dist/nestoa-v$VERSION-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" "nestoa${{ matrix.exe }}"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.tag }}
-          path: npm/platforms/${{ matrix.tag }}
+          path: dist
           if-no-files-found: error
 
   publish:
-    name: Publish to GitHub Packages
+    name: Publish and release
     needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
-      contents: write # push the release tag on manual runs
-      packages: write
+      contents: write # push the tag and create the release
+      packages: write # publish to GitHub Packages
+      id-token: write # npm trusted publishing and provenance
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Only needed until npm trusted publishing is configured for every
+      # package, which npm only allows once a package exists. With it, npm
+      # authenticates with the workflow's OIDC token instead.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags, for the release notes
 
-      - name: Set up Node.js (GitHub Packages registry)
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 26
-          registry-url: "https://npm.pkg.github.com"
-          scope: "@algoan"
 
-      - name: Download platform packages
+      - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          path: npm/platforms
+          path: dist
+          merge-multiple: true
 
-      - name: Rewrite packages for GitHub Packages (@algoan scope)
-        working-directory: npm
-        run: node prepare-github-publish.js "${{ needs.validate.outputs.version }}"
-
-      - name: Publish platform packages
-        working-directory: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Unpack platform packages
         run: |
-          for dir in platforms/*/; do
-            echo "::group::publish $dir"
-            npm publish "$dir"
-            echo "::endgroup::"
+          mkdir -p npm/platforms
+          for archive in dist/platform-*.tar; do
+            tar -xf "$archive" -C npm/platforms
+            rm "$archive"
+          done
+          cat > "$RUNNER_TEMP/.npmrc" <<'EOF'
+          //npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
+          //registry.npmjs.org/:_authToken=${NPM_TOKEN}
+          EOF
+          echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/.npmrc" >> "$GITHUB_ENV"
+
+      - name: Publish to npmjs.com and GitHub Packages
+        working-directory: npm
+        run: |
+          case "$VERSION" in *-*) DIST_TAG=next ;; *) DIST_TAG=latest ;; esac
+          # The registry flags override the @algoan scope's registry, if any.
+          publish() { # <registry> <package dir> [npm publish flags...]
+            local registry=$1 dir=$2
+            shift 2
+            local name
+            name=$(node -p "require('./$dir/package.json').name")
+            if npm view "$name@$VERSION" version --registry="$registry" --@algoan:registry="$registry" >/dev/null 2>&1; then
+              echo "$name@$VERSION is already published on $registry"
+              return
+            fi
+            npm publish "$dir" --registry="$registry" --@algoan:registry="$registry" --tag "$DIST_TAG" "$@"
+          }
+          node prepare-publish.js npm "$VERSION"
+          for dir in platforms/*/ nestoa/; do
+            publish https://registry.npmjs.org "$dir" --access public --provenance
+          done
+          node prepare-publish.js github "$VERSION"
+          for dir in platforms/*/ nestoa/; do
+            publish https://npm.pkg.github.com "$dir"
           done
 
-      - name: Publish nestoa launcher
-        working-directory: npm/nestoa
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm publish
-
-      # Tag the released commit on manual (workflow_dispatch) runs. Tag pushes
-      # already carry the tag, so this only runs for manual releases — and only
-      # after publishing succeeds, so a failed release leaves no tag behind.
+      # Only after publishing succeeds, so that a failed release leaves no tag.
       - name: Tag release
         if: github.event_name == 'workflow_dispatch'
         run: |
-          VERSION="${{ needs.validate.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "v$VERSION is already tagged"
+            exit 0
+          fi
           git config user.name "algoanbot"
           git config user.email "bot@algoan.com"
           git tag -a "v$VERSION" -m "Release v$VERSION"
           git push origin "v$VERSION"
 
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "The v$VERSION release already exists"
+            exit 0
+          fi
+          git fetch --tags --force
+          # The notes list the pull requests merged since the previous version.
+          previous=$(git -c versionsort.suffix=- tag --list 'v[0-9]*' --sort=v:refname \
+            | grep -B1 -x "v$VERSION" | grep -vx "v$VERSION" || true)
+          (cd dist && sha256sum nestoa-*.tar.gz > SHA256SUMS)
+          flags=()
+          [ -n "$previous" ] && flags+=(--notes-start-tag "$previous")
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "v$VERSION" dist/nestoa-*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "v$VERSION" --generate-notes "${flags[@]}"
+
       # Ask the benchmark (algoan/nestjs-openapi-generation-benchmark) to re-run its `nestoa` variant
       # on the published version; it opens a pull request with the results. A failure only warns: the
-      # release is published, and re-running this job would publish it again.
+      # release is published.
       - name: Refresh the benchmark results
         env:
           GH_TOKEN: ${{ secrets.BENCHMARK_TOKEN }}
@@ -180,5 +269,5 @@ jobs:
             exit 0
           fi
           gh api repos/algoan/nestjs-openapi-generation-benchmark/dispatches \
-            -f event_type=nestoa-release -f "client_payload[version]=${{ needs.validate.outputs.version }}" \
+            -f event_type=nestoa-release -f "client_payload[version]=$VERSION" \
             || echo "::warning::The benchmark refresh dispatch failed; the release itself succeeded"

@@ -8,20 +8,12 @@ code always gives the same document.
 
 ## Install
 
-GitHub Packages requires a token even to install: a personal access token
-(classic) with `read:packages`, exported as `GITHUB_TOKEN` (never committed).
-
-```ini
-# .npmrc
-@algoan:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
-```
-
 ```sh
-npm install --save-dev @algoan/nestoa
+npm install --save-dev nestoa
 ```
 
-The right prebuilt binary for your platform is picked automatically.
+The right prebuilt binary for your platform is picked automatically: Linux
+(x64 and arm64, glibc and musl), macOS (x64 and arm64) and Windows (x64).
 
 With npm on macOS and Linux, `node_modules/.bin/nestoa` is that binary itself.
 On Windows, with pnpm or Yarn, or when install scripts are disabled, it goes

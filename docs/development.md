@@ -100,19 +100,41 @@ The code is organised so that most changes touch one file. See
 
 ## Release
 
-The release workflow (`.github/workflows/release.yml`) builds the binary for
-each target in its matrix: currently `linux-x64-gnu`, `linux-arm64-gnu`,
-`darwin-x64` and `darwin-arm64`. It runs `npm/build-platform-packages.js`
-once per target to create the `@nestoa/<tag>` packages. That script also
-knows `linux-*-musl` and `win32-x64-msvc`, but those are not built until they
-are added to the matrix.
+Run the **Release** workflow (`.github/workflows/release.yml`) from the Actions
+tab with the version to release, e.g. `0.3.0`; pushing a `v0.3.0` tag does the
+same. It:
 
-`npm/prepare-github-publish.js` then renames the packages for the GitHub
-Packages registry (`@algoan/nestoa`, `@algoan/nestoa-<tag>`). It also keeps
-only the platform packages that were actually built in the main package's
-`optionalDependencies`, and publishes them all at the same version. A user
-only downloads the platform package that matches their machine. On a platform
-without a platform package, there is no bundled binary to run. Set
+1. builds the binary for each target in its matrix: `linux-{x64,arm64}-{gnu,musl}`,
+   `darwin-{x64,arm64}` and `win32-x64-msvc`. The glibc builds run on the oldest
+   supported Ubuntu, so that they run on older glibc;
+2. creates each `@algoan/nestoa-<tag>` platform package with
+   `npm/build-platform-packages.js`, and smoke tests it with
+   `npm/smoke-test.js`: packs it with the launcher, installs both with and
+   without install scripts (in Alpine for musl) and runs the CLI;
+3. publishes the packages to npmjs.com and to GitHub Packages.
+   `npm/prepare-publish.js` stamps the version, names the launcher (`nestoa` on
+   npmjs.com, `@algoan/nestoa` on GitHub Packages, which only accepts the
+   owner's scope) and keeps only the built platform packages in its
+   `optionalDependencies`. A prerelease version is published under the `next`
+   dist-tag;
+4. tags the commit (on a manual run), creates the GitHub release with the
+   notes generated from the pull requests merged since the previous tag and
+   the binaries attached, and asks the benchmark to refresh its results.
+
+Each publishing step skips what is already done, so a failed run can be
+re-run. Artifacts are uploaded as tarballs, since `actions/upload-artifact`
+drops the binaries' exec bit.
+
+npmjs.com authenticates the workflow by trusted publishing (OIDC), configured
+in each package's settings, and the packages carry a provenance attestation.
+npm only allows configuring trusted publishing once a package exists, so the
+workflow falls back to the `NPM_TOKEN` secret until it is.
+
+A user only downloads the platform package that matches their machine. On a
+platform without a platform package, there is no bundled binary to run. Set
 `NESTOA_BINARY` to point the shim at a separately built executable; set it
 during `npm install` too, since the shim is otherwise replaced by the binary
 (see [npm distribution](architecture.md#npm-distribution)).
+
+`make smoke` (part of `make ci`) runs the smoke test on the current machine,
+and the CI's `npm install` job runs it on Linux, macOS and Windows.

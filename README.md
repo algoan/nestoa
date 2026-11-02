@@ -65,27 +65,17 @@ scheme are omitted here.
 
 ## Install
 
-nestoa is published on the GitHub Packages npm registry, which requires a token
-even to install. Create a personal access token (classic) with the
-`read:packages` scope, export it as `GITHUB_TOKEN`, and point the `@algoan`
-scope at the registry in the project's `.npmrc`:
-
-```ini
-@algoan:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
-```
-
-The `.npmrc` only references the variable, so it is safe to commit. Never commit
-the token itself. In GitHub Actions, the workflow's own `GITHUB_TOKEN` works
-when the job has `packages: read` permission.
-
-Then install it as a dev dependency:
+Install it as a dev dependency from npm:
 
 ```sh
-npm install --save-dev @algoan/nestoa
+npm install --save-dev nestoa
 ```
 
-The right prebuilt binary for your platform is picked automatically.
+The right prebuilt binary for your platform is picked automatically: Linux
+(x64 and arm64, glibc and musl), macOS (x64 and arm64) and Windows (x64). Each
+release is also published on the GitHub Packages npm registry as
+`@algoan/nestoa`, and its binaries are attached to the
+[GitHub release](https://github.com/algoan/nestoa/releases).
 
 ## Use
 
