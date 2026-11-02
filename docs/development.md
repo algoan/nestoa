@@ -43,7 +43,7 @@ The `Makefile` mirrors `.github/workflows/ci.yml`, so CI can be reproduced
 locally. `make help` lists every target.
 
 ```sh
-make ci          # what CI runs: fmt check + clippy -D warnings + tests + npm tests + release build
+make ci          # what CI runs: fmt check + clippy -D warnings + tests + npm tests + release build + npm smoke test
 make test        # cargo test --workspace --locked
 make build       # cargo build --release --workspace --locked
 make lint        # fmt check + clippy
