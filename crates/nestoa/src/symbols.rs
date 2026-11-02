@@ -1072,16 +1072,16 @@ fn memo<K: Eq + Hash, V: Clone>(
 pub(crate) fn module_file(candidate: &Path) -> Option<PathBuf> {
     substituted_file(candidate)
         .or_else(|| {
-            [
-                ".ts",
-                ".tsx",
-                ".d.ts",
-                "/index.ts",
-                "/index.tsx",
-                "/index.d.ts",
-            ]
-            .into_iter()
-            .find_map(|ext| existing(with_suffix(candidate, ext)))
+            [".ts", ".tsx", ".d.ts"]
+                .into_iter()
+                .find_map(|ext| existing(with_suffix(candidate, ext)))
+        })
+        .or_else(|| {
+            // Joined, not suffixed: a verbatim `\\?\` Windows path takes `/`
+            // literally.
+            ["index.ts", "index.tsx", "index.d.ts"]
+                .into_iter()
+                .find_map(|index| existing(candidate.join(index)))
         })
         .or_else(|| existing(candidate.to_path_buf()))
 }
@@ -1505,6 +1505,28 @@ mod tests {
     /// The name of the declaration `name` resolves to from `file`.
     fn resolved_name(project: &Project, file: &Path, name: &str) -> Option<String> {
         project.resolve(file, name).map(|(_, s)| s.name())
+    }
+
+    #[test]
+    fn directory_imports_resolve_to_their_index_from_a_canonical_path() {
+        let (dir, project) = project(
+            "directory-index",
+            &[
+                ("src/app.ts", "import { Author } from './models';"),
+                (
+                    "src/models/index.ts",
+                    "export class Author { name: string; }",
+                ),
+            ],
+        );
+        assert_eq!(
+            module_file(&dir.join("src").join("models")),
+            Some(dir.join("src").join("models").join("index.ts"))
+        );
+        assert_eq!(
+            resolved_name(&project, &dir.join("src").join("app.ts"), "Author").as_deref(),
+            Some("Author")
+        );
     }
 
     #[test]
