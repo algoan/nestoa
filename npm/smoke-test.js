@@ -29,13 +29,13 @@ const PROJECT = {
     "  @Get()\n  list(): Book[] {\n    return [];\n  }\n}\n",
 };
 
+// npm and npx are batch files on Windows, which only run through a shell that
+// joins the arguments unquoted: a temporary directory may contain spaces.
+const WINDOWS = process.platform === "win32";
+const quote = (arg) => (WINDOWS && /\s/.test(arg) ? `"${arg}"` : arg);
+
 function run(cmd, args, cwd) {
-  const result = spawnSync(cmd, args, {
-    cwd,
-    encoding: "utf8",
-    // npm and npx are batch files on Windows.
-    shell: process.platform === "win32",
-  });
+  const result = spawnSync(cmd, args.map(quote), { cwd, encoding: "utf8", shell: WINDOWS });
   const output = `${result.stdout}${result.stderr}`;
   if (result.status !== 0) {
     throw new Error(`${cmd} ${args.join(" ")} failed (${result.status ?? result.signal}):\n${output}`);
