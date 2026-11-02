@@ -205,7 +205,7 @@ jobs:
       - name: Publish to npmjs.com and GitHub Packages
         working-directory: npm
         run: |
-          case "$VERSION" in *-*) DIST_TAG=next ;; *) DIST_TAG=latest ;; esac
+          case "${VERSION%%+*}" in *-*) DIST_TAG=next ;; *) DIST_TAG=latest ;; esac
           # The registry flags override the @algoan scope's registry, if any.
           publish() { # <registry> <package dir> [npm publish flags...]
             local registry=$1 dir=$2
@@ -213,6 +213,13 @@ jobs:
             local name
             name=$(node -p "require('./$dir/package.json').name")
             if npm view "$name@$VERSION" version --registry="$registry" --@algoan:registry="$registry" >/dev/null 2>&1; then
+              # A re-run from another commit must not mix two builds in one version.
+              local published
+              published=$(npm view "$name@$VERSION" gitHead --registry="$registry" --@algoan:registry="$registry")
+              if [ -n "$published" ] && [ "$published" != "$GITHUB_SHA" ]; then
+                echo "::error::$name@$VERSION was published from $published, not $GITHUB_SHA. Bump the version."
+                exit 1
+              fi
               echo "$name@$VERSION is already published on $registry"
               return
             fi
@@ -258,7 +265,7 @@ jobs:
             | grep -B1 -x "v$VERSION" | grep -vx "v$VERSION" || true)
           flags=()
           [ -n "$previous" ] && flags+=(--notes-start-tag "$previous")
-          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          case "${VERSION%%+*}" in *-*) flags+=(--prerelease) ;; esac
           gh release create "v$VERSION" dist/nestoa-*.tar.gz dist/SHA256SUMS \
             --verify-tag --title "v$VERSION" --generate-notes "${flags[@]}"
 
