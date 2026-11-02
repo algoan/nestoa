@@ -18,7 +18,7 @@ serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 walkdir = "2"
 globset = "0.4"
-swc_common = { version = "23", features = ["tty-emitter"] }
-swc_ecma_ast = "25"
-swc_ecma_parser = "41"
-swc_ecma_visit = "25"
+swc_common = { version = "27", features = ["tty-emitter"] }
+swc_ecma_ast = "30"
+swc_ecma_parser = "47"
+swc_ecma_visit = "30"
