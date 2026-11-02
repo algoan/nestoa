@@ -54,11 +54,13 @@ jobs:
             echo "::error::Invalid version '$VERSION'. Expected semver X.Y.Z (git tags must be vX.Y.Z, e.g. v0.1.3)."
             exit 1
           fi
-          # For manual runs, refuse to re-release a version that already has a
-          # tag. (Tag pushes are exempt: the tag IS the trigger, so it exists.)
+          # For manual runs, refuse to re-release a version tagged on another
+          # commit. A tag on this commit is a re-run of a failed release. (Tag
+          # pushes are exempt: the tag IS the trigger, so it exists.)
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && \
-             git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
-            echo "::error::Tag v$VERSION already exists — version $VERSION has already been released. Bump the version."
+             tagged=$(git rev-parse -q --verify "refs/tags/v$VERSION^{commit}") && \
+             [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag v$VERSION already exists on $tagged — version $VERSION has already been released. Bump the version."
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -242,15 +244,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          (cd dist && sha256sum nestoa-*.tar.gz > SHA256SUMS)
+          # gh creates a draft, uploads the assets, then publishes it: a failed
+          # run may leave a draft with some assets missing.
           if gh release view "v$VERSION" >/dev/null 2>&1; then
-            echo "The v$VERSION release already exists"
+            gh release upload "v$VERSION" dist/nestoa-*.tar.gz dist/SHA256SUMS --clobber
+            gh release edit "v$VERSION" --draft=false
             exit 0
           fi
           git fetch --tags --force
           # The notes list the pull requests merged since the previous version.
           previous=$(git -c versionsort.suffix=- tag --list 'v[0-9]*' --sort=v:refname \
             | grep -B1 -x "v$VERSION" | grep -vx "v$VERSION" || true)
-          (cd dist && sha256sum nestoa-*.tar.gz > SHA256SUMS)
           flags=()
           [ -n "$previous" ] && flags+=(--notes-start-tag "$previous")
           case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
