@@ -86,9 +86,13 @@ function main() {
   }
   const platform = JSON.parse(fs.readFileSync(path.join(platformDir, "package.json"), "utf8"));
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nestoa-smoke-"));
-  const tarballs = [launcherTarball(platform, tmp), pack(path.resolve(platformDir), tmp)];
-  checkInstall(tarballs, tmp, "with-scripts", []);
-  checkInstall(tarballs, tmp, "without-scripts", ["--ignore-scripts"]);
+  try {
+    const tarballs = [launcherTarball(platform, tmp), pack(path.resolve(platformDir), tmp)];
+    checkInstall(tarballs, tmp, "with-scripts", []);
+    checkInstall(tarballs, tmp, "without-scripts", ["--ignore-scripts"]);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 main();
