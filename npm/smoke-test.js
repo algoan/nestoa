@@ -30,9 +30,10 @@ const PROJECT = {
 };
 
 // npm and npx are batch files on Windows, which only run through a shell that
-// joins the arguments unquoted: a temporary directory may contain spaces.
+// joins the arguments unquoted: a temporary directory may contain spaces or
+// `&`. No argument contains a double quote.
 const WINDOWS = process.platform === "win32";
-const quote = (arg) => (WINDOWS && /\s/.test(arg) ? `"${arg}"` : arg);
+const quote = (arg) => (WINDOWS ? `"${arg}"` : arg);
 
 function run(cmd, args, cwd) {
   const result = spawnSync(cmd, args.map(quote), { cwd, encoding: "utf8", shell: WINDOWS });
