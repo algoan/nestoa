@@ -25,7 +25,7 @@ same PR as the change.
 Run `cargo` from the repository root.
 
 ```sh
-make ci                                # mirrors the CI jobs: fmt check, clippy -D warnings, tests, npm tests, release build
+make ci                                # mirrors the CI jobs: fmt check, clippy -D warnings, tests, npm tests, release build, npm smoke test
 cargo test --package nestoa routes     # tests of one module
 cargo test test_name                   # one test
 cargo build --release

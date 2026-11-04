@@ -124,10 +124,10 @@ function main() {
   const binName = process.platform === "win32" ? "nestoa.exe" : "nestoa";
   let source;
   try {
-    source = require.resolve(`@nestoa/${tag}/${binName}`);
+    source = require.resolve(`@algoan/nestoa-${tag}/${binName}`);
   } catch {
     console.warn(
-      `nestoa: optional dependency @nestoa/${tag} was not installed; ` +
+      `nestoa: optional dependency @algoan/nestoa-${tag} was not installed; ` +
         "binary will be located at runtime if available.",
     );
     return;

@@ -2,6 +2,12 @@
   "name": "nestoa",
   "version": "0.1.0",
   "description": "Static OpenAPI / AsyncAPI generator for NestJS / TypeScript codebases",
+  "homepage": "https://github.com/algoan/nestoa#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algoan/nestoa.git"
+  },
+  "bugs": "https://github.com/algoan/nestoa/issues",
   "bin": {
     "nestoa": "bin/nestoa.js"
   },
@@ -17,13 +23,13 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@nestoa/linux-x64-gnu": "0.1.0",
-    "@nestoa/linux-arm64-gnu": "0.1.0",
-    "@nestoa/linux-x64-musl": "0.1.0",
-    "@nestoa/linux-arm64-musl": "0.1.0",
-    "@nestoa/darwin-x64": "0.1.0",
-    "@nestoa/darwin-arm64": "0.1.0",
-    "@nestoa/win32-x64-msvc": "0.1.0"
+    "@algoan/nestoa-linux-x64-gnu": "0.1.0",
+    "@algoan/nestoa-linux-arm64-gnu": "0.1.0",
+    "@algoan/nestoa-linux-x64-musl": "0.1.0",
+    "@algoan/nestoa-linux-arm64-musl": "0.1.0",
+    "@algoan/nestoa-darwin-x64": "0.1.0",
+    "@algoan/nestoa-darwin-arm64": "0.1.0",
+    "@algoan/nestoa-win32-x64-msvc": "0.1.0"
   },
   "keywords": [
     "nestjs",
