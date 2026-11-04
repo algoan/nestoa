@@ -76,8 +76,9 @@ a build of the base commit. To accept more differences or a `--strict` failure o
 in the pull request and add the `benchmark-regression` label; the script exits 1 for those, and 2 for
 what is never accepted (non-determinism, no document written, a benchmark that cannot run). On a merge to main, and in the release workflow, it dispatches the
 benchmark's refresh workflow, which opens a pull request there with the results of `nestoa-main` or of
-the released version. Both need the `BENCHMARK_TOKEN` secret, a token with read and write access to the
-contents of the benchmark repository; without it the jobs are skipped with a warning.
+the released version. The pull request check needs no secret, since the benchmark repository is public;
+only these refresh dispatches need the `BENCHMARK_TOKEN` secret, a token with read and write access to
+the contents of the benchmark repository. Without it, the refresh is skipped with a warning.
 
 ## Where to make a change
 
