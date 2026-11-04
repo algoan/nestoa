@@ -74,11 +74,12 @@ make bench BENCHMARK_DIR=path/to/the/benchmark    # another checkout
 The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs it on every pull request, against
 a build of the base commit. To accept more differences or a `--strict` failure on purpose, explain it
 in the pull request and add the `benchmark-regression` label; the script exits 1 for those, and 2 for
-what is never accepted (non-determinism, no document written, a benchmark that cannot run). On a merge to main, and in the release workflow, it dispatches the
-benchmark's refresh workflow, which opens a pull request there with the results of `nestoa-main` or of
-the released version. The pull request check needs no secret, since the benchmark repository is public;
-only these refresh dispatches need the `BENCHMARK_TOKEN` secret, a token with read and write access to
-the contents of the benchmark repository. Without it, the refresh is skipped with a warning.
+what is never accepted (non-determinism, no document written, a benchmark that cannot run).
+
+The benchmark refreshes its results by itself: its refresh workflow polls nestoa every hour and, when
+main has a new commit or `nestoa` a new version on npmjs.com, opens a pull request there with the results
+of `nestoa-main` or of the released version. nestoa needs no secret for it, since both repositories and
+the npm packages are public.
 
 ## Where to make a change
 
@@ -120,7 +121,8 @@ same. It:
    dist-tag;
 4. tags the commit (on a manual run), creates the GitHub release with the
    notes generated from the pull requests merged since the previous tag and
-   the binaries attached, and asks the benchmark to refresh its results.
+   the binaries attached. The benchmark picks up the new version by itself
+   (see [Benchmark](#benchmark)).
 
 Each publishing step skips what is already done, so a failed run can be
 re-run. Artifacts are uploaded as tarballs, since `actions/upload-artifact`
