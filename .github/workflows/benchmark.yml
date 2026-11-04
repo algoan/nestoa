@@ -8,7 +8,8 @@ name: Benchmark
 #   --strict where the base passes. Label the pull request `benchmark-regression` to accept more
 #   differences or a --strict failure on purpose (explain it in the description); non-determinism and
 #   errors are never accepted.
-# - Push to main: asks the benchmark to refresh its `nestoa-main` results (it opens a pull request).
+#
+# Nothing here refreshes the benchmark's results: the benchmark polls nestoa for new commits and releases.
 #
 # Needs the BENCHMARK_TOKEN secret: a token with read and write access to the contents of the benchmark
 # repository. Without it, the job is skipped with a warning.
@@ -16,8 +17,6 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
-  push:
-    branches: [main]
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -30,7 +29,6 @@ env:
 jobs:
   check:
     name: Check against the benchmark
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Missing token
@@ -99,21 +97,3 @@ jobs:
             echo "::error::The benchmark could not run, see the job summary"
             exit "$status"
           fi
-
-  refresh:
-    name: Refresh the benchmark results
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch nestoa-main to the benchmark
-        if: env.HAS_TOKEN == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.BENCHMARK_TOKEN }}
-        run: |
-          gh api repos/algoan/nestjs-openapi-generation-benchmark/dispatches \
-            -f event_type=nestoa-main -f "client_payload[sha]=$GITHUB_SHA" \
-            || echo "::warning::The benchmark refresh dispatch failed"
-
-      - name: Missing token
-        if: env.HAS_TOKEN != 'true'
-        run: echo "::warning::BENCHMARK_TOKEN is not set, the benchmark results are not refreshed"

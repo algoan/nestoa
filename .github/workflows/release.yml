@@ -268,18 +268,3 @@ jobs:
           case "${VERSION%%+*}" in *-*) flags+=(--prerelease) ;; esac
           gh release create "v$VERSION" dist/nestoa-*.tar.gz dist/SHA256SUMS \
             --verify-tag --title "v$VERSION" --generate-notes "${flags[@]}"
-
-      # Ask the benchmark (algoan/nestjs-openapi-generation-benchmark) to re-run its `nestoa` variant
-      # on the published version; it opens a pull request with the results. A failure only warns: the
-      # release is published.
-      - name: Refresh the benchmark results
-        env:
-          GH_TOKEN: ${{ secrets.BENCHMARK_TOKEN }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::BENCHMARK_TOKEN is not set, the benchmark results are not refreshed"
-            exit 0
-          fi
-          gh api repos/algoan/nestjs-openapi-generation-benchmark/dispatches \
-            -f event_type=nestoa-release -f "client_payload[version]=$VERSION" \
-            || echo "::warning::The benchmark refresh dispatch failed; the release itself succeeded"
