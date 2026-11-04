@@ -11,8 +11,7 @@ name: Benchmark
 #
 # Nothing here refreshes the benchmark's results: the benchmark polls nestoa for new commits and releases.
 #
-# Needs the BENCHMARK_TOKEN secret: a token with read and write access to the contents of the benchmark
-# repository. Without it, the job is skipped with a warning.
+# Needs no secret: the benchmark repository is public.
 on:
   pull_request:
     branches: [main]
@@ -24,53 +23,42 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  HAS_TOKEN: ${{ secrets.BENCHMARK_TOKEN != '' }}
 
 jobs:
   check:
     name: Check against the benchmark
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Missing token
-        if: env.HAS_TOKEN != 'true'
-        run: echo "::warning::BENCHMARK_TOKEN is not set (or not available to this pull request), benchmark skipped"
-
       # Neither checkout keeps its token in .git/config: the build and the binaries run the pull
-      # request's code, which must not reuse BENCHMARK_TOKEN
+      # request's code
       - uses: actions/checkout@v7
-        if: env.HAS_TOKEN == 'true'
         with:
           fetch-depth: 0 # the base commit is built too
           persist-credentials: false
 
       - name: Check out the benchmark
-        if: env.HAS_TOKEN == 'true'
         uses: actions/checkout@v7
         with:
           repository: algoan/nestjs-openapi-generation-benchmark
-          token: ${{ secrets.BENCHMARK_TOKEN }}
           path: .benchmark
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: env.HAS_TOKEN == 'true'
         with:
           node-version: 26
 
       - name: Install the benchmark harness
-        if: env.HAS_TOKEN == 'true'
         run: npm --prefix .benchmark/bench ci --no-audit --no-fund
 
       - name: Install Rust toolchain
-        if: env.HAS_TOKEN == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        if: env.HAS_TOKEN == 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Build the pull request and its base
-        if: env.HAS_TOKEN == 'true'
         run: |
           cargo build --release --locked --package nestoa
           git worktree add "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
@@ -79,7 +67,6 @@ jobs:
             --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir target/base
 
       - name: Compare with the base
-        if: env.HAS_TOKEN == 'true'
         env:
           BENCHMARK_DIR: .benchmark
           ACCEPTED: ${{ contains(github.event.pull_request.labels.*.name, 'benchmark-regression') }}
