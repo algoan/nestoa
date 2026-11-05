@@ -87,6 +87,33 @@ pub fn downgrade_to_30(doc: &mut Value) {
     }
 }
 
+/// Rewrite the 2020-12 constructs of a schema into JSON Schema draft-07,
+/// which AsyncAPI 3.0 schemas are based on, in place: a tuple's `prefixItems`
+/// becomes an `items` array, and its tail `additionalItems`. Nothing is lost.
+pub fn to_draft07(schema: &mut Value) {
+    match schema {
+        Value::Array(items) => items.iter_mut().for_each(to_draft07),
+        Value::Object(map) => {
+            if let Some(prefix) = map.remove("prefixItems") {
+                if let Some(tail) = map.remove("items") {
+                    map.insert("additionalItems".into(), tail);
+                }
+                map.insert("items".into(), prefix);
+            }
+            for (key, value) in map.iter_mut() {
+                if is_name_keyed_map(key) {
+                    if let Value::Object(entries) = value {
+                        entries.values_mut().for_each(to_draft07);
+                    }
+                } else if !is_instance_data(key) {
+                    to_draft07(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `type: [T, "null"]` -> `type: T` + `nullable: true`.
 ///
 /// 3.0.3 allows only a single string `type`, so any array has to go. The
@@ -246,6 +273,10 @@ pub(crate) fn is_name_keyed_map(key: &str) -> bool {
             | "callbacks"
             | "links"
             | "variables"
+            // AsyncAPI's channels, operations and messages, by id.
+            | "channels"
+            | "operations"
+            | "messages"
     )
 }
 
@@ -429,6 +460,33 @@ fn is_null_schema(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn draft_07_spells_tuples_with_an_items_array() {
+        let mut schema = json!({
+            "properties": {
+                "closed": { "type": "array", "prefixItems": [{ "type": "string" }], "items": false },
+                "open": { "type": "array", "prefixItems": [{ "type": "string" }], "items": { "type": "number" } },
+                "bare": { "prefixItems": [{ "type": "string" }] },
+                "list": { "type": "array", "items": { "type": "string" } }
+            },
+            "example": { "prefixItems": [] }
+        });
+        to_draft07(&mut schema);
+        assert_eq!(
+            schema,
+            json!({
+                "properties": {
+                    "closed": { "type": "array", "items": [{ "type": "string" }], "additionalItems": false },
+                    "open": { "type": "array", "items": [{ "type": "string" }], "additionalItems": { "type": "number" } },
+                    "bare": { "items": [{ "type": "string" }] },
+                    "list": { "type": "array", "items": { "type": "string" } }
+                },
+                "example": { "prefixItems": [] }
+            })
+        );
+    }
+
     use super::*;
 
     fn down(mut v: Value) -> Value {

@@ -240,27 +240,7 @@ impl<'a> Extractor<'a> {
                 continue;
             }
             let parsed = &self.project.files[file];
-            for item in &parsed.module.body {
-                use swc_ecma_ast::{Decl, DefaultDecl, ModuleDecl, ModuleItem, Stmt};
-                let (name, class) = match item {
-                    ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => match &e.decl {
-                        Decl::Class(c) => (c.ident.sym.to_string(), &*c.class),
-                        _ => continue,
-                    },
-                    ModuleItem::Stmt(Stmt::Decl(Decl::Class(c))) => {
-                        (c.ident.sym.to_string(), &*c.class)
-                    }
-                    ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
-                        DefaultDecl::Class(c) => (
-                            c.ident
-                                .as_ref()
-                                .map_or_else(|| anonymous_class_name(file), |i| i.sym.to_string()),
-                            &*c.class,
-                        ),
-                        _ => continue,
-                    },
-                    _ => continue,
-                };
+            for (name, class) in module_classes(file, &parsed.module) {
                 if let Some(base_paths) = self.controller_base_paths(file, &name, class) {
                     let class_tag = strip_suffix_ci(&name, "Controller").to_string();
                     self.extract_class(file, &name, class, &base_paths, &class_tag, &mut routes);
@@ -1883,7 +1863,7 @@ fn collect_interceptors(decorators: &[swc_ecma_ast::Decorator]) -> Vec<String> {
 }
 
 /// A decorator call's first argument.
-fn first_arg(d: &Decorator) -> Option<&Expr> {
+pub(crate) fn first_arg(d: &Decorator) -> Option<&Expr> {
     let Expr::Call(call) = &*d.expr else {
         return None;
     };
@@ -2086,7 +2066,7 @@ fn anonymous_class_name(file: &Path) -> String {
     format!("{pascal}Controller")
 }
 
-fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
+pub(crate) fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
     if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
         &s[..s.len() - suffix.len()]
     } else {
@@ -2334,7 +2314,7 @@ fn warn_param_name_conflicts<'a>(paths: impl Iterator<Item = &'a String>) {
 /// A property's static name, numbers spelled as JavaScript keys them; a
 /// computed key counts when it is a literal (`['list']`, `[1]`). Empty
 /// otherwise.
-fn prop_name_text(key: &PropName) -> String {
+pub(crate) fn prop_name_text(key: &PropName) -> String {
     match key {
         PropName::Ident(i) => i.sym.to_string(),
         PropName::Str(s) => s.value.to_string_lossy().into_owned(),
@@ -2625,6 +2605,38 @@ fn ref_target(value: &Value) -> Option<&str> {
         .and_then(|s| s.strip_prefix("#/components/schemas/"))
 }
 
+/// The classes a module declares at its top level, exported or not, with their
+/// names (a default-exported anonymous class is named after its file).
+pub(crate) fn module_classes<'m>(
+    file: &Path,
+    module: &'m swc_ecma_ast::Module,
+) -> Vec<(String, &'m Class)> {
+    use swc_ecma_ast::{Decl, DefaultDecl, ModuleDecl, ModuleItem, Stmt};
+    module
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => match &e.decl {
+                Decl::Class(c) => Some((c.ident.sym.to_string(), &*c.class)),
+                _ => None,
+            },
+            ModuleItem::Stmt(Stmt::Decl(Decl::Class(c))) => {
+                Some((c.ident.sym.to_string(), &*c.class))
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(e)) => match &e.decl {
+                DefaultDecl::Class(c) => Some((
+                    c.ident
+                        .as_ref()
+                        .map_or_else(|| anonymous_class_name(file), |i| i.sym.to_string()),
+                    &*c.class,
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// Collect every component-schema name referenced by a `$ref` anywhere within
 /// `value` (recursing through objects and arrays). An `example` and other
 /// instance data are skipped, as in `dialect`: a `$ref` there is data.
@@ -2658,7 +2670,7 @@ fn collect_refs(value: &Value, out: &mut Vec<String>) {
 /// every `$ref` used by an operation, then transitively follow `$ref`s found
 /// inside the referenced schemas. A missing target (dangling `$ref`) is simply
 /// skipped — tree-shaking never invents schemas.
-fn reachable_schemas(
+pub(crate) fn reachable_schemas(
     paths: &Map<String, Value>,
     schemas: &IndexMap<String, Value>,
 ) -> std::collections::HashSet<String> {

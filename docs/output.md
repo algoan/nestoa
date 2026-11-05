@@ -94,7 +94,7 @@ applies to a route with a `@Body`.
 | `A \| B` | `anyOf`, or one merged `enum` for literals |
 | `A & B` | `allOf` |
 | `class B extends A`, `interface B extends A` | `allOf` with the base |
-| `enum`, `Enum.MEMBER`, `keyof typeof Enum` | `enum`, with computed members (`1 << 2`, `A \| B`, `B = A`) evaluated |
+| `enum`, `Enum.MEMBER`, `keyof typeof Enum` | `enum`, with computed members (`1 << 2`, `A \| B`, `B = A`) evaluated, and a value several members share listed once |
 | `Partial`, `Required`, `Pick`, `Omit`, `Readonly` | the reshaped object |
 | `NonNullable<T>` | `T` without its `null` member |
 | `Record<'a' \| 'b', V>` | `properties` `a` and `b`, both required |

@@ -142,6 +142,8 @@ pub struct FileSymbols {
     /// `const ROUTES = { LIST: 'list' }`), so decorator arguments that name
     /// them (`@HttpCode(MULTI_STATUS)`, `@Get(ROUTES.LIST)`) can be evaluated.
     pub consts: HashMap<String, ConstInit>,
+    /// Top-level function declarations, by name.
+    pub functions: HashMap<String, FnDecl>,
     pub imports: HashMap<String, ImportBinding>,
     /// `export { Foo } from "./other"` re-exports: local-name -> ImportBinding
     pub re_exports: HashMap<String, ImportBinding>,
@@ -186,6 +188,35 @@ impl ConstInit {
             .init
             .as_deref()
             .expect("a const has an initializer")
+    }
+}
+
+/// The declarations of a top-level function, its overloads included,
+/// shared with their module.
+#[derive(Clone)]
+pub struct FnDecl {
+    module: Arc<Module>,
+    paths: Vec<Arc<[usize]>>,
+}
+
+impl FnDecl {
+    /// The return type every callable signature declares.
+    pub fn return_type(&self) -> Option<&swc_ecma_ast::TsType> {
+        let functions: Vec<&swc_ecma_ast::Function> = self
+            .paths
+            .iter()
+            .filter_map(
+                |path| match declaration(item_at(&self.module.body, path)?) {
+                    Some(Decl::Fn(f)) => Some(&*f.function),
+                    _ => None,
+                },
+            )
+            .collect();
+        crate::events::callable_return(
+            functions
+                .into_iter()
+                .map(|f| (f.body.is_some(), f.return_type.as_deref())),
+        )
     }
 }
 
@@ -513,8 +544,15 @@ impl Project {
         }
     }
 
-    /// `from_importer`: `name` is looked up as an export of `file`, so a
-    /// declaration or import it doesn't export is skipped.
+    /// The function `name` refers to in `file`, following imports and
+    /// re-exports, with the file declaring it.
+    pub fn resolve_function(&self, file: &Path, name: &str) -> Option<(PathBuf, FnDecl)> {
+        let mut visited = std::collections::HashSet::new();
+        self.resolve_value_inner(file, name, false, &mut visited, &|fs, n| {
+            fs.functions.get(n).cloned()
+        })
+    }
+
     fn resolve_const_inner(
         &self,
         file: &Path,
@@ -522,16 +560,33 @@ impl Project {
         from_importer: bool,
         visited: &mut std::collections::HashSet<(PathBuf, String)>,
     ) -> Option<(PathBuf, ConstInit)> {
+        self.resolve_value_inner(file, name, from_importer, visited, &|fs, n| {
+            fs.consts.get(n).cloned()
+        })
+    }
+
+    /// The value `get` finds for `name` in `file`, or in the module an import
+    /// or re-export of it leads to. `from_importer`: `name` is looked up as an
+    /// export of `file`, so a declaration or import it doesn't export is
+    /// skipped.
+    fn resolve_value_inner<T>(
+        &self,
+        file: &Path,
+        name: &str,
+        from_importer: bool,
+        visited: &mut std::collections::HashSet<(PathBuf, String)>,
+        get: &dyn Fn(&FileSymbols, &str) -> Option<T>,
+    ) -> Option<(PathBuf, T)> {
         if !visited.insert((file.to_path_buf(), name.to_string())) {
             return None;
         }
         let fs = self.symbols.get(file)?;
         let visible = !from_importer || fs.exports(name);
-        if visible && let Some(c) = fs.consts.get(name) {
-            return Some((file.to_path_buf(), c.clone()));
+        if visible && let Some(c) = get(fs, name) {
+            return Some((file.to_path_buf(), c));
         }
         if let Some(local) = fs.local_exports.get(name) {
-            return self.resolve_const_inner(file, local, false, visited);
+            return self.resolve_value_inner(file, local, false, visited, get);
         }
         if let Some(binding) = fs
             .re_exports
@@ -540,13 +595,13 @@ impl Project {
             && let Some(target) = self.resolve_module(file, &binding.specifier)
         {
             let next_name = binding.imported.clone().unwrap_or_else(|| name.to_string());
-            if let Some(found) = self.resolve_const_inner(&target, &next_name, true, visited) {
+            if let Some(found) = self.resolve_value_inner(&target, &next_name, true, visited, get) {
                 return Some(found);
             }
         }
         for spec in &fs.star_re_exports {
             if let Some(target) = self.resolve_module(file, spec)
-                && let Some(found) = self.resolve_const_inner(&target, name, true, visited)
+                && let Some(found) = self.resolve_value_inner(&target, name, true, visited, get)
             {
                 return Some(found);
             }
@@ -708,6 +763,7 @@ fn declared_names(decl: &Decl) -> Vec<String> {
         Decl::TsInterface(i) => vec![i.id.sym.to_string()],
         Decl::TsTypeAlias(t) => vec![t.id.sym.to_string()],
         Decl::TsEnum(e) => vec![e.id.sym.to_string()],
+        Decl::Fn(f) => vec![f.ident.sym.to_string()],
         Decl::TsModule(m) => {
             m.id.as_ident()
                 .map(|i| i.sym.to_string())
@@ -813,6 +869,17 @@ fn declared_symbol(module: &Arc<Module>, path: &Arc<[usize]>) -> Option<(String,
 /// Record each `const NAME = <init>` of the variable declaration at `path`.
 /// A `let` or `var` may be reassigned, so its initializer isn't its value.
 fn collect_consts(module: &Arc<Module>, path: &Arc<[usize]>, decl: &Decl, fs: &mut FileSymbols) {
+    if let Decl::Fn(f) = decl {
+        fs.functions
+            .entry(f.ident.sym.to_string())
+            .or_insert_with(|| FnDecl {
+                module: module.clone(),
+                paths: Vec::new(),
+            })
+            .paths
+            .push(path.clone());
+        return;
+    }
     let Decl::Var(v) = decl else { return };
     if v.kind != swc_ecma_ast::VarDeclKind::Const {
         return;

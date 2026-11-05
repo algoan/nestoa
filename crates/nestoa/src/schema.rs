@@ -88,6 +88,20 @@ impl ComponentSchemas {
         }
     }
 
+    /// An object-shaped `schema` as one object, its references and `allOf`
+    /// branches merged.
+    pub fn flatten(&self, schema: &Value) -> Option<Map<String, Value>> {
+        flatten_object(&self.schemas, schema, 0)
+    }
+
+    /// The schema of property `key` of an object-shaped `schema`.
+    pub fn property(&self, schema: &Value, key: &str) -> Option<Value> {
+        flatten_object(&self.schemas, schema, 0)?
+            .get("properties")?
+            .get(key)
+            .cloned()
+    }
+
     /// The name of a component `schema` references, directly or through an
     /// `allOf` branch, that is reserved but not yet lowered.
     fn pending_ref(&self, schema: &Value) -> Option<String> {
@@ -1487,7 +1501,7 @@ impl<'a> SchemaCtx<'a> {
 
     /// Whether a property's declared type admits `undefined`, directly or
     /// through type aliases, which makes it optional on the wire like a `?`.
-    fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
+    pub(crate) fn admits_undefined(&self, file: &Path, ty: &TsType, depth: usize) -> bool {
         self.admits_undefined_in(self.type_env.as_ref(), file, ty, depth)
     }
 
@@ -1756,7 +1770,7 @@ impl<'a> SchemaCtx<'a> {
 
     /// The type TypeScript infers for an unannotated field from its
     /// initialiser, widened as for a mutable field (`a = 1` is a `number`).
-    fn initializer_schema(&mut self, file: &Path, init: &Expr) -> Value {
+    pub(crate) fn initializer_schema(&mut self, file: &Path, init: &Expr) -> Value {
         match init {
             Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) => json!({ "type": "string" }),
             Expr::Lit(Lit::Num(_)) => json!({ "type": "number" }),
@@ -1878,11 +1892,15 @@ impl<'a> SchemaCtx<'a> {
                                 obj.insert("type".into(), json!(types));
                             }
                         }
-                        if !values.is_empty() {
-                            obj.insert(
-                                "enum".into(),
-                                Value::Array(values.iter().map(enum_value_json).collect()),
-                            );
+                        // Members may share a value, which `enum` lists once.
+                        let mut unique: Vec<Value> = Vec::new();
+                        for v in values.iter().map(enum_value_json) {
+                            if !unique.contains(&v) {
+                                unique.push(v);
+                            }
+                        }
+                        if !unique.is_empty() {
+                            obj.insert("enum".into(), Value::Array(unique));
                         }
                     }
                     // A member whose value nestoa cannot compute: listing the
@@ -3268,6 +3286,21 @@ mod tests {
         .unwrap();
         assert_eq!(ambient, json!({ "x-unresolved": "Ambient" }));
         assert_eq!(constant, json!({ "type": "number", "enum": [1, 2] }));
+    }
+
+    #[test]
+    fn enum_members_sharing_a_value_list_it_once() {
+        let [format] = lower_all(
+            "export enum Format { HARDCOVER = 'print', PAPERBACK = 'print', EBOOK = 'digital' }",
+            "export { Format } from './dto';",
+            &["Format"],
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            format,
+            json!({ "type": "string", "enum": ["print", "digital"] })
+        );
     }
 
     #[test]
@@ -4772,7 +4805,7 @@ mod tests {
         .unwrap();
         assert_eq!(flags["enum"], json!([0, 1, 2, 3, 4, -1]));
         assert_eq!(aliases["type"], json!(["string", "number"]));
-        assert_eq!(aliases["enum"], json!(["first", "first", 3, 4]));
+        assert_eq!(aliases["enum"], json!(["first", 3, 4]));
     }
 
     #[test]
