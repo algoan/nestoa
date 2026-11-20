@@ -106,6 +106,7 @@ To customise it, add a `nestoa.config.json` at the project root:
 - [JSDoc tags](docs/jsdoc.md)
 - [Output conventions](docs/output.md)
 - [Architecture](docs/architecture.md) and [development](docs/development.md)
+- [Dependency updates (Renovate)](docs/RENOVATE.md)
 
 ## License
 

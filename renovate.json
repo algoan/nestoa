@@ -2,5 +2,47 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "timezone": "Europe/Paris",
+  "labels": ["dependencies"],
+  "automerge": false,
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "Security fixes (RustSec advisories of the crates through OSV, GitHub advisories) are opened immediately at the lowest fixing version and labelled by renovate-triage.yml. The triage scores no Rust crate: such a PR always gets a human review.",
+    "labels": ["dependencies", "security"],
+    "schedule": ["at any time"],
+    "prCreation": "immediate",
+    "vulnerabilityFixStrategy": "lowest",
+    "minimumReleaseAge": null,
+    "automerge": false
+  },
+  "lockFileMaintenance": {
+    "description": "Cargo.lock decides what the released binary contains (cargo build --locked): a weekly re-lock keeps the transitive crates fresh.",
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Batch routine updates once a week.",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-minor-patch",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "The platform packages are nestoa's own, built and stamped with the released version by npm/prepare-publish.js: not dependencies to update.",
+      "matchPackageNames": ["@algoan/nestoa-*"],
+      "enabled": false
+    },
+    {
+      "description": "algoan/renovate-security-actions runs the Renovate triage: its updates come in their own PR, for a human review.",
+      "matchPackageNames": ["algoan/renovate-security-actions"],
+      "groupName": "algoan renovate-security-actions",
+      "groupSlug": "algoan-renovate-security-actions"
+    }
   ]
 }
